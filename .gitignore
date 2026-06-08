@@ -1,0 +1,62 @@
+# Build output
+build/
+build-cmake/
+out/
+*.obj
+*.o
+*.d
+
+# Recompiler output (regenerated from the ROM)
+RecompiledFuncs/*.c
+RecompiledFuncs/*.cpp
+RecompiledFuncs/*.h
+RecompiledFuncs/*.inl
+RecompiledPatches/*.c
+RecompiledPatches/*.cpp
+RecompiledPatches/*.h
+RecompiledPatches/*.inl
+
+# Patch build artifacts
+patches/*.elf
+patches/*.bin
+patches/*.map
+patches/*.o
+patches/*.d
+
+# RSP recompiler output
+rsp/*.cpp
+
+# Recompiler binaries copied into the repo
+N64Recomp
+N64Recomp.exe
+RSPRecomp
+RSPRecomp.exe
+file_to_c
+file_to_c.exe
+
+# ROMs and assets — NEVER commit these
+*.z64
+*.n64
+*.v64
+wcw.z64
+
+# Generated symbol dumps live under syms/ but are produced by tooling; keep the dir,
+# decide per-file whether to track once they stabilize.
+
+# Disassembly project (Phase 1) — generated/large; keep configs + symbol files only
+disasm/.venv/
+disasm/asm/
+disasm/assets/
+disasm/build/
+disasm/wcw.z64
+disasm/*.cache
+disasm/.splat_cache*
+disasm/undefined_funcs_auto.txt
+disasm/undefined_syms_auto.txt
+
+# OS / editor
+.vs/
+.vscode/
+*.user
+Thumbs.db
+.DS_Store

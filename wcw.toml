@@ -1,0 +1,83 @@
+# Config file for the WCW vs. nWo World Tour recompilation.
+#
+# TEMPLATE adapted from BMHero's bmhero.toml. Values below are placeholders until
+# symbol metadata is generated (see CLAUDE.md, Phase 1/2).
+#
+# Two input modes are supported (see CLAUDE.md "How N64Recomp works"):
+#   * symbol-TOML mode: symbols_file_path + rom_file_path   (this template uses this)
+#   * ELF mode:         elf_path                            (richer; enables reference syms)
+# Paths are relative to the location of this config file.
+
+[input]
+entrypoint = 0x80000400
+# Players supply a standard ROM; if WCW needs decompression, point this at the
+# decompressed output instead (see src/game/rom_decompression.cpp, TODO).
+rom_file_path = "wcw.z64"
+bss_section_suffix = "_bss"
+
+# GENERATED in Phase 1/2. Until syms/dump.toml exists, the recompiler cannot run.
+symbols_file_path = "syms/dump.toml"
+
+output_func_path = "RecompiledFuncs"
+trace_mode = false
+
+[patches]
+# libultra / OS functions to replace with no-op stubs (handled by the runtime instead).
+# Populate as boot issues surface; mirror BMHero's list as a starting point.
+#
+# NOTE: the func_800134AC..func_80013918 cluster is a compiler softfloat / 64-bit
+# FP<->int conversion helper library (uses trunc.l.d / cvt.*.l etc. that N64Recomp
+# doesn't emit). Stubbed for the first proof-of-concept recompile; these need real
+# implementations (runtime-provided or recompiler support) before the game runs. TODO.
+stubs = [
+    #"__osSiDeviceBusy",
+    "func_800134AC", "func_800134E8", "func_80013550", "func_8001358C",
+    "func_800135E8", "func_80013618", "func_80013678", "func_80013740",
+    "func_8001375C", "func_80013778", "func_80013818", "func_800138B4",
+    "func_800138CC", "func_800138E4", "func_80013918",
+]
+
+# Functions the recompiler should not emit (runtime provides its own version).
+ignored = [
+    #"__osPfsReleasePages",
+]
+
+# Replace the MIPS `cache` instructions (cache management) with nop. The recompiler
+# can't emit `cache`, and cache coherency is a no-op on the host, so this is correct
+# while preserving each function's real copy/DMA logic. (9 sites, 4 functions.)
+[[patches.instruction]]
+func = "func_80011D70"
+vram = 0x80011DAC
+value = 0x00000000
+[[patches.instruction]]
+func = "func_80011D70"
+vram = 0x80011DD0
+value = 0x00000000
+[[patches.instruction]]
+func = "func_80011D70"
+vram = 0x80011DE0
+value = 0x00000000
+[[patches.instruction]]
+func = "func_80011D70"
+vram = 0x80011E04
+value = 0x00000000
+[[patches.instruction]]
+func = "func_80012040"
+vram = 0x80012078
+value = 0x00000000
+[[patches.instruction]]
+func = "func_80012040"
+vram = 0x8001209C
+value = 0x00000000
+[[patches.instruction]]
+func = "func_800128B0"
+vram = 0x800128C0
+value = 0x00000000
+[[patches.instruction]]
+func = "func_80013C80"
+vram = 0x80013CB8
+value = 0x00000000
+[[patches.instruction]]
+func = "func_80013C80"
+vram = 0x80013CDC
+value = 0x00000000

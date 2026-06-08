@@ -1,0 +1,11 @@
+// Visit https://github.com/ethteck/splat/wiki/Adding-Symbols for documentation about this file
+entrypoint = 0x80000400; // type:func
+main = 0x80000450; // type:func
+
+// --- Overlay system (found Phase 1) ---
+ovl_load_sections = 0x8000075C; // type:func  DMAs overlay text/data + clears bss
+ovl_load_and_enter = 0x800007C8; // type:func  loads then calls overlay entry (0x80090000)
+ovl_swap_loop = 0x80011134;      // type:func  swaps overlay A/B at 0x80090000
+ovl_a_descriptor = 0x80032BA0;   // 9-word overlay descriptor (ROM 0xA21750)
+ovl_b_descriptor = 0x80032BC4;   // 9-word overlay descriptor (ROM 0xA69570)
+ovl_entry = 0x80090000;          // type:func  overlay entry point (shared load vram)

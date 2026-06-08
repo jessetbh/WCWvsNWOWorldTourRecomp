@@ -1,0 +1,25 @@
+# Config file for recompiling the C patches for WCW vs. nWo World Tour: Recompiled.
+# Adapted from BMHero's patches.toml. See CLAUDE.md, Phase 4.
+#
+# This runs N64Recomp in single-file-output mode over the MIPS-compiled patches.elf so
+# that patched functions override the originals at link time.
+# Paths are relative to the location of this config file.
+
+[input]
+elf_path = "patches/patches.elf"
+output_func_path = "RecompiledPatches"
+single_file_output = true
+# Allow absolute symbols to be used as jump targets.
+use_absolute_symbols = true
+# Reference syms so the recompiler can resolve relocations against the base game.
+# These are produced alongside the recompile in Phase 2 (ELF/dump pass).
+func_reference_syms_file = "syms/dump.toml"
+data_reference_syms_files = [ "syms/data_dump.toml" ]
+# Write the output binary directly (lets the recompiler patch MIPS32 relocs).
+output_binary_path = "patches/patches.bin"
+# clang emits many unpaired LO16s; silence those warnings.
+unpaired_lo16_warnings = false
+# Allow exporting functions/events for mods to use.
+allow_exports = true
+# Validate that patched symbols exist and non-patch funcs aren't symbols.
+strict_patch_mode = true

@@ -1,0 +1,16 @@
+# Submodules for the runtime stack. These are NOT yet added to the working tree —
+# this file documents the intended layout (mirrors BMHero). To actually add them:
+#   git submodule add <url> <path>
+# and then `git submodule update --init --recursive`.
+#
+# Note: unlike BMHero (which adds lib/bmhero, a decomp), WCW has no decomp library to add.
+
+[submodule "lib/N64ModernRuntime"]
+	path = lib/N64ModernRuntime
+	url = https://github.com/N64Recomp/N64ModernRuntime.git
+[submodule "lib/RecompFrontend"]
+	path = lib/RecompFrontend
+	url = https://github.com/N64Recomp/RecompFrontend.git
+[submodule "lib/rt64"]
+	path = lib/rt64
+	url = https://github.com/rt64/rt64.git

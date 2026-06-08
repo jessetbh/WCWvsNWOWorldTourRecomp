@@ -1,0 +1,104 @@
+name: WCW vs. nWo World Tour (USA)
+sha1: 5ad2d8359058c8bb71f08e3d3433b7a50d3bb645
+options:
+  basename: wcw
+  target_path: wcw.z64
+  elf_path: build/wcw.elf
+  base_path: .
+  platform: n64
+  compiler: IDO
+
+  asm_path: asm
+  data_path: asm/data
+  ld_script_path: wcw.ld
+  ld_dependencies: True
+
+  find_file_boundaries: True
+  header_encoding: ASCII
+
+  o_as_suffix: True
+  use_legacy_include_asm: False
+  mips_abi_float_regs: o32
+
+  symbol_addrs_path:
+    - symbol_addrs.txt
+  reloc_addrs_path:
+    - reloc_addrs.txt
+
+  undefined_funcs_auto_path: undefined_funcs_auto.txt
+  undefined_syms_auto_path: undefined_syms_auto.txt
+
+  # Label known SDK symbols so we can see how much is "free" vs game-specific.
+  libultra_symbols: True
+  hardware_regs: True
+
+  rodata_string_guesser_level: 2
+  data_string_guesser_level: 2
+  # gfx_ucode: # one of [f3d, f3db, f3dex, f3dexb, f3dex2] - TBD once graphics ucode is identified
+
+segments:
+  - name: header
+    type: header
+    start: 0x0
+
+  - name: ipl3
+    type: bin
+    start: 0x40
+
+  - name: entry
+    type: code
+    start: 0x1000
+    vram: 0x80000400
+    subsegments:
+      - [0x1000, hasm]
+
+  - name: main
+    type: code
+    start: 0x1050
+    vram: 0x80000450
+    follows_vram: entry
+    bss_size: 0x298A0
+    subsegments:
+      - [0x1050, asm]
+      - [0x2A9B0, data]
+      - { type: bss, vram: 0x800387F0 }
+
+  # ~10 MB of assets (textures/audio/models/data) between the fixed segment and the
+  # overlay code region. No code here (confirmed by jr-ra density scan).
+  - name: assets
+    type: bin
+    start: 0x393F0
+    follows_vram: main
+
+  # Two CPU overlays, BOTH loaded to vram 0x80090000 (mutually-exclusive swap, driven
+  # by func_80011134; loaded by func_8000075C, entered via func_800007C8). Section
+  # boundaries derived from the 9-word descriptors at D_80032BA0 / D_80032BC4.
+  # exclusive_ram_id ties them together as alternate occupants of the same RAM.
+  - name: ovl_a
+    type: code
+    start: 0xA21750
+    vram: 0x80090000
+    exclusive_ram_id: ovl_90000
+    bss_size: 0x16000
+    subsegments:
+      - [0xA21750, asm]
+      - [0xA55310, data]
+      - { type: bss, vram: 0x800D7E20 }
+
+  - name: ovl_b
+    type: code
+    start: 0xA69570
+    vram: 0x80090000
+    exclusive_ram_id: ovl_90000
+    bss_size: 0xF6C0
+    subsegments:
+      - [0xA69570, asm]
+      - [0xABF4E0, data]
+      - { type: bss, vram: 0x800E9400 }
+
+  # Tail: remaining assets/padding after the overlay region.
+  - name: assets_tail
+    type: bin
+    start: 0xAC2970
+
+  - [0xC00000]
