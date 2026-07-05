@@ -71,7 +71,7 @@ index 4d6a01d..9e2dc24 100644
 +    ctx->f0.d = ret;
 +}
 diff --git a/librecomp/src/pi.cpp b/librecomp/src/pi.cpp
-index 62656ad..e49b5b5 100644
+index 62656ad..99b67eb 100644
 --- a/librecomp/src/pi.cpp
 +++ b/librecomp/src/pi.cpp
 @@ -8,6 +8,7 @@
@@ -101,7 +101,23 @@ index 62656ad..e49b5b5 100644
  
      // TODO handle misaligned DMA
      assert((physical_addr & 0x1) == 0 && "Only PI DMA from aligned ROM addresses is currently supported");
-@@ -266,6 +279,31 @@ void ultramodern::join_saving_thread() {
+@@ -195,6 +208,15 @@ void save_read(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t coun
+     }
+ }
+ 
++// [wcw] Host-pointer variant of save_read, for the raw-SI Controller Pak emulation in
++// si.cpp (which needs to copy into PIF RAM, not rdram).
++void save_read_ptr(void* out, uint32_t offset, uint32_t count) {
++    assert(offset + count <= save_context.save_buffer.size());
++
++    std::lock_guard lock { save_context.save_buffer_mutex };
++    memcpy(out, save_context.save_buffer.data() + offset, count);
++}
++
+ void save_clear(uint32_t start, uint32_t size, char value) {
+     assert(start + size < save_context.save_buffer.size());
+ 
+@@ -266,6 +288,31 @@ void ultramodern::join_saving_thread() {
      }
  }
  
@@ -133,7 +149,7 @@ index 62656ad..e49b5b5 100644
  void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_addr, uint32_t size, uint32_t direction) {
      // TODO asynchronous transfer
      // TODO implement unaligned DMA correctly
-@@ -273,6 +311,7 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
+@@ -273,6 +320,7 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
          if (physical_addr >= recomp::rom_base) {
              // read cart rom
              recomp::do_rom_read(rdram, rdram_address, physical_addr, size);
@@ -143,10 +159,10 @@ index 62656ad..e49b5b5 100644
              ultramodern::enqueue_external_message(mq, 0, false, true);
 diff --git a/librecomp/src/si.cpp b/librecomp/src/si.cpp
 new file mode 100644
-index 0000000..0780049
+index 0000000..d1c0266
 --- /dev/null
 +++ b/librecomp/src/si.cpp
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,163 @@
 +// [wcw] SI / PIF (joybus) emulation for games that use the RAW libultra SI primitives
 +// (__osSiRawStartDma / __osSiDeviceBusy) instead of the high-level osCont* API.
 +//
@@ -164,11 +180,37 @@ index 0000000..0780049
 +#include "ultramodern/ultra64.h"
 +#include "ultramodern/input.hpp"
 +
++#include <cstdio>
++#include <cstring>
++
 +#include "helpers.hpp"
 +
 +#define MAXCONTROLLERS 4
 +
 +static uint8_t pif_ram[64];
++
++// [wcw] Controller Pak emulation. WCW saves to the Controller Pak in port 1 (no cart
++// EEPROM/SRAM), and its homegrown raw-SI driver accesses it with joybus commands 0x02
++// (read 32-byte block) / 0x03 (write 32-byte block) through the same PIF path as the
++// controller reads. We back the pak's 32 KB with librecomp's save subsystem: the game's
++// SaveType is Sram (also exactly 0x8000 bytes), so the pak contents live in the standard
++// save buffer / save file (saves/<game id>.bin) with async persistence + backup for free.
++void save_write_ptr(const void* in, uint32_t offset, uint32_t count);
++void save_read_ptr(void* out, uint32_t offset, uint32_t count);
++
++// Standard joybus mempak data CRC (poly 0x85 over the 32 data bytes + one zero byte).
++static uint8_t wcw_pak_data_crc(const uint8_t* data) {
++    uint8_t crc = 0;
++    for (int i = 0; i <= 32; i++) {
++        for (int bit = 7; bit >= 0; bit--) {
++            uint8_t xor_tap = (crc & 0x80) ? 0x85 : 0;
++            crc <<= 1;
++            if (i < 32 && (data[i] & (1 << bit))) crc |= 1;
++            crc ^= xor_tap;
++        }
++    }
++    return crc;
++}
 +
 +extern "C" void __osSiDeviceBusy_recomp(uint8_t* rdram, recomp_context* ctx) {
 +    // The host SI is never busy.
@@ -213,7 +255,8 @@ index 0000000..0780049
 +            pif_ram[i + 1] |= 0x80;                      // CHNL_ERR_NORESP: no device
 +        }
 +        else if (cmd == 0x00 || cmd == 0xFF) {           // request status
-+            if (rx >= 3) { res[0] = 0x05; res[1] = 0x00; res[2] = 0x00; } // CONT_TYPE_NORMAL
++            // status byte 0x01 = Controller Pak present (port 1 only; see pak emulation above).
++            if (rx >= 3) { res[0] = 0x05; res[1] = 0x00; res[2] = (channel == 0) ? 0x01 : 0x00; }
 +        }
 +        else if (cmd == 0x01) {                          // read button
 +            if (rx >= 4) {
@@ -224,9 +267,34 @@ index 0000000..0780049
 +                res[3] = (uint8_t)pads[channel].stick_y;
 +            }
 +        }
++        else if (cmd == 0x02 && channel == 0 && t >= 3 && rx >= 33) {   // pak read block
++            // tx = cmd, addr_hi, addr_lo; low 5 address bits are an address CRC (ignored).
++            uint16_t addr = (uint16_t)((pif_ram[i + 3] << 8) | pif_ram[i + 4]);
++            uint32_t offset = addr & 0xFFE0u;
++            if (offset < 0x8000) {
++                save_read_ptr(res, offset, 32);          // pak RAM <- save buffer
++            }
++            else {
++                memset(res, 0, 32);                      // bank-select/ID region: reads as zeros
++            }                                            // (a Rumble Pak would return 0x80s here)
++            res[32] = wcw_pak_data_crc(res);
++            static bool logged = false;
++            if (!logged) { logged = true; fprintf(stderr, "[wcw] first Controller Pak read (addr=0x%04X)\n", addr); }
++        }
++        else if (cmd == 0x03 && channel == 0 && t >= 35 && rx >= 1) {   // pak write block
++            uint16_t addr = (uint16_t)((pif_ram[i + 3] << 8) | pif_ram[i + 4]);
++            uint32_t offset = addr & 0xFFE0u;
++            const uint8_t* data = &pif_ram[i + 5];
++            if (offset < 0x8000) {
++                save_write_ptr(data, offset, 32);        // persists asynchronously (librecomp)
++            }
++            // Writes to the bank-select region (>= 0x8000) are acknowledged but not stored.
++            res[0] = wcw_pak_data_crc(data);
++            static bool logged = false;
++            if (!logged) { logged = true; fprintf(stderr, "[wcw] first Controller Pak write (addr=0x%04X)\n", addr); }
++        }
 +        else {
-+            // Controller Pak / EEPROM-over-SI etc. not emulated yet: report no device so the
-+            // game falls back gracefully instead of hanging.
++            // Unsupported joybus command: report no device so the game falls back gracefully.
 +            pif_ram[i + 1] |= 0x80;
 +        }
 +

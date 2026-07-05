@@ -391,7 +391,11 @@ int main(int argc, char** argv) {
     game.display_name = "WCW vs. nWo World Tour";
     game.game_id = u8"wcw.nwo.worldtour.us";
     game.mod_game_id = "wcwnwoworldtour";
-    game.save_type = recomp::SaveType::AllowAll;
+    // Sram = a 32 KB save buffer — the exact size of a Controller Pak, which is WCW's only
+    // save medium (no cart EEPROM/SRAM). The raw-SI PIF emulation (librecomp si.cpp) maps
+    // joybus pak reads/writes onto this buffer, so pak contents persist via librecomp's
+    // standard save file (saves/<game id>.bin).
+    game.save_type = recomp::SaveType::Sram;
     game.is_enabled = true;
     // Must be SIGN-EXTENDED: entrypoint_address is a gpr (int64) and librecomp's MEM_*
     // macros compute `rdram + (addr - 0xFFFFFFFF80000000)`. The bare literal 0x80000400 is
