@@ -14,10 +14,21 @@ There are **two separate toolchains**, by design:
 - MinGW-w64 GCC 16.1.0 at `C:\Users\selki\toolchains\mingw64` (WinLibs UCRT, portable).
 - VS Build Tools 2022: clang-cl 19.1.5, MSVC 14.44, CMake 3.31, Ninja, lld-link.
 - Python 3.11 + splat64 in `disasm/.venv` (for disassembly).
+- **For the patches build (Phase 4)** — both portable, no admin:
+  - **Zig 0.14.0** at `C:\Users\selki\toolchains\zig-windows-x86_64-0.14.0`: `zig cc` is
+    the MIPS cross-compiler. (Neither VS BuildTools' LLVM nor the official llvm.org
+    *Windows* clang binaries include the MIPS backend — both are trimmed to x86/ARM.
+    Zig bundles a full LLVM.)
+  - **LLVM 19.1.5** (llvm.org release archive) at
+    `C:\Users\selki\toolchains\clang+llvm-19.1.5-x86_64-pc-windows-msvc`: provides
+    `ld.lld` for linking patches.elf (lld's MIPS support is unconditional) plus
+    `llvm-readelf`/`llvm-objdump` for inspecting the MIPS ELF.
 
 Reinstall references, if ever needed:
 ```powershell
 # MinGW (portable, no admin): download WinLibs UCRT GCC zip, extract to C:\Users\<you>\toolchains
+# Zig: https://ziglang.org/download/ zip, extract to toolchains
+# LLVM: clang+llvm-<ver>-x86_64-pc-windows-msvc.tar.xz from llvm-project GitHub releases
 # VS Build Tools (needs UAC):
 winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--passive --wait --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.Llvm.Clang --add Microsoft.VisualStudio.Component.VC.Llvm.ClangToolset --add Microsoft.VisualStudio.Component.VC.CMake.Project --includeRecommended"
 ```
@@ -70,6 +81,24 @@ joybus and backed by the standard recomp save file). **All of these are checked 
 changing anything under `lib/`, run `.\lib-patches\export.ps1` and commit. Manifest of
 repo URLs + pinned commits: `lib-patches/README.md`.
 
+## 4b. Patches build  (Phase 4 foundation — WORKS)
+Game-behavior patches live in `patches/*.c` as C compiled to MIPS (`RECOMP_PATCH`
+overrides a base-game function by its `syms/dump.toml` name; extern data resolves via
+`syms/data_dump.toml`). The normal `cmake --build` drives the whole pipeline via the
+`PatchesBin` target (zig cc → ld.lld → `N64Recomp patches.toml` → `file_to_c` →
+PatchesLib); to run just the MIPS step:
+```powershell
+cd patches
+C:\Users\selki\toolchains\mingw64\bin\mingw32-make.exe    # -> patches.elf
+```
+Gotchas (details in CLAUDE.md's "PATCHES BUILD" bullet):
+- **Build twice after editing a patch** — the first build regenerates RecompiledPatches
+  but links the previous table (same quirk BMHero documents).
+- PatchesLib must stay listed **before** RecompiledFuncs in `target_link_libraries`;
+  that ordering IS the patch mechanism.
+- Any runtime API a patch calls needs an address entry in `patches/syms.ld` AND a real
+  implementation in the link (librecomp `*_recomp` or `src/game/recomp_api.cpp`).
+
 ## 5. Run the game
 ```powershell
 cd build-msvc
@@ -104,9 +133,10 @@ was wired (`run/README.md`). Superseded by the real port; kept for reference:
 ```
 
 ## Remaining work (in order)
-1. **Phase 4** via `patches/`: generate `syms/data_dump.toml`, stand up the patches
-   build, then widescreen / input options; real high-FPS interpolation additionally
-   needs RT64 multi-workload frame detection + matrix-group tagging.
+1. **Phase 4 enhancements** via `patches/` (the foundation — data symbols + patches
+   build — is done and runtime-verified, 2026-07-05): widescreen, input options; real
+   high-FPS interpolation additionally needs RT64 multi-workload frame detection +
+   matrix-group tagging.
 2. **Rendering polish** (deferred, still planned): crop the overscan-edge garbage rows
    (thin line at frame top).
 

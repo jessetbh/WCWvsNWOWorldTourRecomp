@@ -43,8 +43,13 @@ Framerate now defaults to Original), and **saves** (WCW saves ONLY to Controller
 si.cpp now emulates a 32 KB pak in port 1 backed by librecomp's save file). Work is now
 committed (was: one giant uncommitted tree) and all lib/ fixes are checked in as
 `lib-patches/*.patch` (apply.ps1 / export.ps1 — run export after ANY lib/ edit).
-Next up: **Phase 4** (`syms/data_dump.toml` + patches build → widescreen,
-input options; real high-FPS interpolation needs RT64 multi-workload frame detection +
+**Phase-4 foundation is DONE (2026-07-05, runtime-verified)**: `syms/data_dump.toml`
+generated (3,952 data symbols; `gen_symbols.py --data`) and the **patches build works
+end to end** — `patches/*.c` → MIPS (zig cc) → `patches.elf` (ld.lld) → `N64Recomp
+patches.toml` → PatchesLib in the exe; a RECOMP_PATCH'd sqrtf printed its one-shot
+marker in-game. See the ✅ "PATCHES BUILD" bullet below for the sharp edges (zig, link
+order, two-build quirk). Next up: **first real Phase-4 patches** (widescreen, input
+options; real high-FPS interpolation needs RT64 multi-workload frame detection +
 matrix-group patches). Deferred but still owed: **overscan-edge crop** (thin garbage
 line at frame top) — come back to it after Phase 4 is under way. Dropped permanently
 (decision 2026-07-05): upstreaming the general runtime bugs — the drafts in `upstream/`
@@ -199,8 +204,8 @@ symbols = [
   called by unnamed libultra, so it must stay stubbed, not named.)
 
 Still NOT done (later phases):
-- ❌ `syms/data_dump.toml` (data symbols) — not needed yet for the code recompile; needed
-  for patches and for naming data refs.
+- ✅ ~~`syms/data_dump.toml`~~ — GENERATED (2026-07-05): `tools/gen_symbols.py --data`
+  parses the splat data/bss dlabels → 3,952 symbols / 6 sections. See `syms/README.md`.
 - ✅ **RT64 builds** with clang-cl (`build-rt64/rt64.lib`, 22 MB; configure standalone with
   `-DRT64_STATIC=TRUE`). Full DXC shader compilation (DXIL + SPIR-V) succeeded; deps
   (plume, re-spirv, zstd, nfd, SDL2) all built. The renderer long-pole is done.
@@ -301,6 +306,37 @@ Still NOT done (later phases):
   `pi.cpp`; pak contents persist to `saves/<game id>.bin` with async atomic writes + backup.
   Boot-verified: game runs accessory-detect (write/read `0x8001`), accepts the pak, writes
   filesystem blocks. One-shot `[wcw] first Controller Pak read/write` stderr markers remain.
+- ✅ **PATCHES BUILD STANDS (2026-07-05, runtime-verified) — Phase-4 foundation.** Full
+  BMHero-style pipeline: `patches/*.c` --(MIPS cross-compile)--> `patches/patches.elf`
+  --(`N64Recomp patches.toml`, ELF mode w/ `syms/dump.toml` + new `syms/data_dump.toml`)-->
+  `RecompiledPatches/patches.c` + `patches.bin` --(file_to_c)--> `PatchesLib` → registered by
+  `src/main/register_patches.cpp` (called from main.cpp). Verified in-game: a RECOMP_PATCH'd
+  `func_80013BF0` (= sqrtf, 9 call sites) printed its one-shot `[patches] ... is live` marker
+  on stdout; a second patch (`func_80000644`, `return D_8003CCF4`) proves extern data
+  resolution against data_dump.toml (lui/lw of the exact vram). Sharp edges discovered:
+  1. **No Windows clang has a MIPS backend** — BOTH VS BuildTools' LLVM and the official
+     llvm.org Windows binaries are trimmed to x86/ARM. The MIPS compiler is **`zig cc`**
+     (`C:\Users\selki\toolchains\zig-windows-x86_64-0.14.0`, bundles full LLVM 19; flags:
+     `-target mips-freestanding-none -mcpu=mips2`, emits the same non-PIC R_MIPS_HI16/LO16/26
+     relocs). **ld.lld's MIPS support is unconditional**, so the llvm.org 19.1.5 toolchain
+     (`C:\Users\selki\toolchains\clang+llvm-19.1.5-...`) links patches.elf fine.
+  2. **Link order is the patch mechanism**: PatchesLib MUST precede RecompiledFuncs in
+     `target_link_libraries` — patched funcs share their C symbol with the base recompiled
+     copies and take effect by winning static-lib resolution (silently inert if reversed).
+  3. **Two-build quirk** (same as BMHero's TODO): after editing patch C files, the first
+     `cmake --build` regenerates RecompiledPatches but links the old table; build twice.
+  4. `patches/syms.ld` must ONLY list runtime symbols that exist in the link (librecomp's
+     `*_recomp` set + our `src/game/recomp_api.cpp`, currently recomp_puts/recomp_exit
+     with stdout flush) — every entry lands in the generated `manual_patch_symbols` table
+     as a link-time reference. BMHero's game-side APIs (recomp_load_overlays, recomp_xxh3,
+     …) were trimmed; re-add entries as we implement them.
+  5. `patches/dummy_headers/` provides freestanding `stdint.h` + `ultra64.h` (libultra
+     primitive types) — ultramodern's ultra64.h is C++-only (bare struct-tag refs) and WCW
+     has no decomp headers to borrow. NOTE: unlike BMHero, NO overlay-loader patch is needed
+     (librecomp auto-loads our fixed-address overlays on PI DMA — proven since Phase 3).
+  Build: `mingw32-make` in `patches/` (defaults wired for this machine; `make clean` works
+  under cmd), or just `cmake --build build-msvc` (PatchesBin target drives it; tool paths
+  overridable via `-DPATCHES_C_COMPILER/-DPATCHES_LD/-DPATCHES_MAKE`).
 - ✅ **VI display + AI + RSP-task submission — NAMED; first frame REACHES RT64.** osViSetMode/
   Black/SetEvent/SwapBuffer/GetCurrent+NextFramebuffer/SetSpecialFeatures (0x80012xxx),
   osAiGetLength/SetNextBuffer (0x80016xxx), osSpTaskLoad/StartGo + osDpSetNextBuffer. `vi.mq`

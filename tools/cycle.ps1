@@ -7,7 +7,7 @@ $build = "$root\build-msvc"
 # --- Phase 1: regen + recompile (MinGW/python env) ---
 & "$root\tools\env.ps1" | Out-Null
 Push-Location $root
-python .\tools\gen_symbols.py --overlays | Select-Object -Last 1
+python .\tools\gen_symbols.py --overlays --data | Select-Object -Last 1
 & "$root\N64Recomp.exe" wcw.toml *>$null
 if ($LASTEXITCODE -ne 0) { Write-Host "N64Recomp FAILED ($LASTEXITCODE)"; Pop-Location; return }
 Write-Host "recompile OK"

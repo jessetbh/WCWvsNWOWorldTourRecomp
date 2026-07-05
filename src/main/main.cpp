@@ -408,6 +408,7 @@ int main(int argc, char** argv) {
 
     recomp::register_config_path(std::filesystem::current_path());
     wcw::register_wcw_overlays();
+    wcw::register_wcw_patches();
 
     // Register UI fonts (loaded from ./assets during render-context init). Without a primary
     // font, recompui throws during boot. Matches BMHero's font registration.

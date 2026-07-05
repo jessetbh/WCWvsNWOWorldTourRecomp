@@ -6,7 +6,7 @@
 $root = Split-Path $PSScriptRoot -Parent
 
 # 1. (Re)generate syms/dump.toml from the splat disassembly (includes overlays).
-python "$root\tools\gen_symbols.py" --overlays
+python "$root\tools\gen_symbols.py" --overlays --data
 
 # 2. Ensure the ROM is where wcw.toml expects it.
 if (-not (Test-Path "$root\wcw.z64")) {

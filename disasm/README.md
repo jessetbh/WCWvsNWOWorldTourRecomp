@@ -81,10 +81,12 @@ The libultra identification that this disassembly enabled is complete enough tha
 game runs its full demo loop (~40 functions named via the `RENAME` map in
 `../tools/gen_symbols.py`; evidence log in `libultra.md`, which also documents the
 runtime-stack bugs found and fixed along the way). Remaining disassembly-adjacent work:
-1. **Refine data/rodata splits** + generate `../syms/data_dump.toml` (needed for the
-   patches build and data-symbol naming; not needed for the code recompile).
-2. **Wire the overlay loader** into `../patches/required_patches.c` when the patches
-   build is stood up (mirrors BMHero).
+1. ~~Generate `../syms/data_dump.toml`~~ — DONE (2026-07-05): `gen_symbols.py --data`
+   parses the data/bss dlabels → 3,952 symbols. Data/rodata split refinement remains
+   an ongoing-as-needed activity (rodata currently lives inside the data sections).
+2. ~~Wire the overlay loader into `../patches/required_patches.c`~~ — NOT NEEDED,
+   unlike BMHero: librecomp auto-loads our fixed-address overlays when the game's PI
+   DMA hits their registered ROM ranges (proven in production since Phase 3).
 3. Name more `func_XXXX` opportunistically as gameplay debugging requires it.
 
 ## Resolved (was "still to determine")

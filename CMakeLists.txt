@@ -52,6 +52,59 @@ target_include_directories(RecompiledFuncs PRIVATE ${RECOMP_INCLUDES})
 file(GLOB FUNC_C_SOURCES ${CMAKE_SOURCE_DIR}/RecompiledFuncs/*.c)
 target_sources(RecompiledFuncs PRIVATE ${FUNC_C_SOURCES})
 
+# --- Patches (Phase 4): C patches cross-compiled to MIPS -> patches.elf -> N64Recomp ---
+# Mirrors BMHero's pipeline: make builds patches/patches.elf with a MIPS-capable clang,
+# N64Recomp (patches.toml) recompiles it into RecompiledPatches/patches.c + patches.bin,
+# file_to_c embeds the bin, and PatchesLib links it all into the exe.
+# NOTE: BOTH the VS BuildTools and llvm.org WINDOWS clang builds are trimmed to x86/ARM
+# backends (no MIPS), so the compiler here is `zig cc` (Zig bundles a full LLVM). lld's
+# MIPS support is unconditional, so the llvm.org ld.lld links fine. Override on the
+# configure line if your tools live elsewhere. See BUILDING.md.
+if(NOT DEFINED PATCHES_C_COMPILER)
+    set(PATCHES_C_COMPILER "C:/Users/selki/toolchains/zig-windows-x86_64-0.14.0/zig.exe cc")
+endif()
+if(NOT DEFINED PATCHES_LD)
+    set(PATCHES_LD "C:/Users/selki/toolchains/clang+llvm-19.1.5-x86_64-pc-windows-msvc/bin/ld.lld.exe")
+endif()
+if(NOT DEFINED PATCHES_MAKE)
+    set(PATCHES_MAKE "C:/Users/selki/toolchains/mingw64/bin/mingw32-make.exe")
+endif()
+
+add_custom_target(PatchesBin
+    COMMAND ${CMAKE_COMMAND} -E env "CC=${PATCHES_C_COMPILER}" "LD=${PATCHES_LD}" "${PATCHES_MAKE}"
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/patches
+    BYPRODUCTS ${CMAKE_SOURCE_DIR}/patches/patches.elf
+)
+
+# Recompile patches.elf into patches.c/patches.bin (plus the patch section table).
+add_custom_command(OUTPUT
+                       ${CMAKE_SOURCE_DIR}/patches/patches.bin
+                       ${CMAKE_SOURCE_DIR}/RecompiledPatches/patches.c
+                       ${CMAKE_SOURCE_DIR}/RecompiledPatches/recomp_overlays.inl
+                       ${CMAKE_SOURCE_DIR}/RecompiledPatches/funcs.h
+                   COMMAND ./N64Recomp patches.toml
+                   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                   DEPENDS ${CMAKE_SOURCE_DIR}/patches/patches.elf
+)
+
+# Generate patches_bin.c from patches.bin (symbol names match src/main/register_patches.cpp).
+add_custom_command(OUTPUT ${CMAKE_SOURCE_DIR}/RecompiledPatches/patches_bin.c
+    COMMAND file_to_c ${CMAKE_SOURCE_DIR}/patches/patches.bin wcw_patches_bin ${CMAKE_SOURCE_DIR}/RecompiledPatches/patches_bin.c ${CMAKE_SOURCE_DIR}/RecompiledPatches/patches_bin.h
+    DEPENDS ${CMAKE_SOURCE_DIR}/patches/patches.bin file_to_c
+)
+
+add_library(PatchesLib STATIC)
+target_compile_options(PatchesLib PRIVATE
+    -fno-strict-aliasing
+    -Wno-unused-variable
+    -Wno-implicit-function-declaration
+)
+target_include_directories(PatchesLib PRIVATE ${RECOMP_INCLUDES})
+target_sources(PatchesLib PRIVATE
+    ${CMAKE_SOURCE_DIR}/RecompiledPatches/patches.c
+    ${CMAKE_SOURCE_DIR}/RecompiledPatches/patches_bin.c
+)
+
 # --- DXC setup for the frontend's shaders ---
 # build_vertex_shader/etc. (defined in rt64's CMakeLists) resolve ${DXC} and ${DXC_*_OPTS}
 # in the CALLER's scope. rt64 sets them in its own subdir scope, so recompui (a sibling
@@ -88,6 +141,8 @@ add_executable(WCWRecompiled)
 set(SOURCES
     ${CMAKE_SOURCE_DIR}/src/main/main.cpp
     ${CMAKE_SOURCE_DIR}/src/main/register_overlays.cpp
+    ${CMAKE_SOURCE_DIR}/src/main/register_patches.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/recomp_api.cpp
     ${CMAKE_SOURCE_DIR}/rsp/wcw_audio.cpp
 )
 target_include_directories(WCWRecompiled PRIVATE
@@ -122,7 +177,11 @@ if (WIN32)
             $<TARGET_FILE_DIR:WCWRecompiled>)
 endif()
 
+# PatchesLib MUST come before RecompiledFuncs: patched functions share their C symbol
+# name with the base recompiled copies, and the patch takes effect by winning static-lib
+# symbol resolution order (mirrors BMHero).
 target_link_libraries(WCWRecompiled PRIVATE
+    PatchesLib
     RecompiledFuncs
     recompui
     recompinput
