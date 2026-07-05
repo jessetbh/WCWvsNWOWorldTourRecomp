@@ -1,0 +1,2 @@
+# Patch files must keep their exact bytes (git apply is line-ending sensitive)
+lib-patches/*.patch -text
