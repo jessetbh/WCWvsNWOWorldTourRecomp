@@ -50,10 +50,12 @@ patches.toml` → PatchesLib in the exe; a RECOMP_PATCH'd sqrtf printed its one-
 marker in-game. See the ✅ "PATCHES BUILD" bullet below for the sharp edges (zig, link
 order, two-build quirk). **WIDESCREEN SHIPPED (2026-07-05, verified in-game)** — the
 first real Phase-4 patch; see the ✅ "WIDESCREEN" bullet below for how it works and the
-verification evidence. Next up: more Phase-4 enhancements (input options; real high-FPS
+verification evidence. **OVERSCAN-EDGE CROP DONE (2026-07-05)** — see the ✅
+"OVERSCAN" bullet (RT64's VI origin-estimate re-exposes the fb row the game hides;
+fixed with a per-edge CRT-style crop in rt64_vi.cpp, env `WCW_CROP`). Next up: more
+Phase-4 enhancements (input options; real high-FPS
 interpolation needs RT64 multi-workload frame detection + matrix-group patches).
-Deferred but still owed: **overscan-edge crop** (thin garbage
-line at frame top) — come back to it after Phase 4 is under way. Dropped permanently
+Dropped permanently
 (decision 2026-07-05): upstreaming the general runtime bugs — the drafts in `upstream/`
 stay as documentation only and will not be filed. Iterate via `tools/cycle.ps1`; `WCW_SAMPLE=<seconds>` dumps all
 thread stacks at t+N; `WCW_RDC_T=<seconds>` sets the RenderDoc capture trigger time;
@@ -360,7 +362,27 @@ Still NOT done (later phases):
   → same matrix). Note: in Original mode fullscreen has ALWAYS stretched 4:3 to 16:9
   (user played that way); Expand is now the correct-proportions mode. The two pipeline-
   verification patches (func_80000644, sqrtf) were removed with this landing;
-  build-msvc/graphics.json flipped to ar_option=Expand. osViSetMode/
+  build-msvc/graphics.json flipped to ar_option=Expand.
+- ✅ **OVERSCAN-EDGE GARBAGE FIXED (2026-07-05): per-edge CRT-style crop.** Root cause
+  chain (measured via `WCW_CROP=0` present dumps + the extended `[wcw][present]` VI
+  log): the match runs a 480-wide fb with textbook NTSC VI timing (h=108..748,
+  v=37..511, xscale 0x300, yscale 0x400) and **origin parked at fb + exactly 1 row** —
+  the game deliberately skips its undrawn fb row 0. RT64's `VI::fbAddress()` "origin is
+  off by one or two rows" estimate subtracts that row back off; the subtraction is
+  REQUIRED (without it the fb lookup misses and every present drops to the native-res
+  scratch path — verified: `fbFound=0`, `scratch=60/s`, chunky image), but it re-exposes
+  fb row 0, and RT64 scans out all ~240 fb rows while hardware showed only 1..237.
+  **Fix**: `VI::cropRectangle()` in `lib/rt64/src/hle/rt64_vi.cpp` (`[wcw fix]`) crops
+  per-edge in SD-pixel units — default L4,T4,R4,B8; env `WCW_CROP=<n>` or
+  `WCW_CROP=L,T,R,B` overrides — which the VI renderer turns into the present scissor.
+  Bottom is 8 because RT64 shows fb rows ~238-239 that hardware never did. (The bright
+  bottom-left "speckle" turned out to be the legit white ring skirt — smooth,
+  low-noise — don't crop 16px chasing it.) The earlier flat-2px version of this fix
+  existed ONLY in the gitignored lib/ tree — never exported to `lib-patches/`; a
+  reclone would have silently lost it. Now exported (run export.ps1 after EVERY lib/
+  edit; note it dies on git's CRLF stderr warnings — $ErrorActionPreference=Stop — run
+  the git-diff redirections via bash if so).
+- ✅ **VI display + AI + RSP-task submission — NAMED; first frame REACHES RT64.** osViSetMode/
   Black/SetEvent/SwapBuffer/GetCurrent+NextFramebuffer/SetSpecialFeatures (0x80012xxx),
   osAiGetLength/SetNextBuffer (0x80016xxx), osSpTaskLoad/StartGo + osDpSetNextBuffer. `vi.mq`
   now registered, mode set, `osSpTaskStartGo type=1` → `submit_rsp_task` → RT64 renders; window

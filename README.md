@@ -39,8 +39,8 @@ a 32 KB pak in port 1 backed by the standard recomp save file.
 | 3 | **Saves** — Controller Pak emulated over raw joybus, persists to the recomp save file | ✅ done |
 | 4 | **Patches build foundation** (data symbols, MIPS cross-compile, RECOMP_PATCH verified in-game) | ✅ done |
 | 4 | **Widescreen** (game-side projection patch + host aspect API, Aspect Ratio: Expand) | ✅ done |
+| 4 | **Overscan-edge crop** (CRT-style per-edge crop; garbage line at frame top gone) | ✅ done |
 | 4 | More PC enhancements (high-FPS interpolation, input options) | 🔶 next |
-| — | Rendering polish (overscan edges) | ⬜ deferred, still planned |
 
 Getting here required fixing two runtime-stack bugs that likely affect other recomp
 projects too (documented in `disasm/libultra.md`, fixes tagged `[wcw fix]` in `lib/`):
@@ -73,7 +73,6 @@ plan; [`BUILDING.md`](BUILDING.md) for how to build and run it today.
   RT64's frame matching assumes one RSP workload per frame, WCW uses several. The default
   is now Framerate: Original (native pacing, renders correctly); interpolation is a
   Phase-4 item (needs multi-workload frame detection + matrix-group patches).
-- Minor overscan-edge garbage (thin line at the very top of the frame), hidden on a CRT.
 
 ## Target ROM
 - WCW vs. nWo World Tour (USA), `.z64`, SHA1 `5AD2D8359058C8BB71F08E3D3433B7A50D3BB645`,
