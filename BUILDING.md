@@ -62,9 +62,10 @@ null-guard; input poll in the raw-SI path — `si.cpp` calls the new
 `ultramodern::input::poll_input()` since WCW never calls `osContStartReadData`, the normal
 poller, so host input was never latched; Framerate default `Original` in recompui's
 graphics tab — RT64 frame interpolation assumes 1 workload = 1 frame and WCW uses several,
-so Display mode produces black/partial menu frames). If you ever reclone `lib/`, reapply
-them (grep this repo's docs for `[wcw fix]`; full context in `disasm/libultra.md` and
-`CLAUDE.md`).
+so Display mode produces black/partial menu frames). **All of these are checked in as
+`lib-patches/*.patch`** — after recloning `lib/`, run `.\lib-patches\apply.ps1`; after
+changing anything under `lib/`, run `.\lib-patches\export.ps1` and commit. Manifest of
+repo URLs + pinned commits: `lib-patches/README.md`.
 
 ## 5. Run the game
 ```powershell

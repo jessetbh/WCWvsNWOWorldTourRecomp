@@ -429,7 +429,10 @@ Still NOT done (later phases):
   Value" symbol at/below `RVA` (preferred base `0x140000000`). `lldb.exe` in VS LLVM is broken
   (missing `liblldb.dll`); cdb is not installed; WER LocalDumps need admin (HKLM).
 - ❌ RSP microcode not yet recompiled (identified: embedded in main data → IMEM `0x84001000`).
-- ✅ Runtime libs cloned into `lib/` (N64ModernRuntime, RecompFrontend, rt64) — gitignored.
+- ✅ Runtime libs cloned into `lib/` (N64ModernRuntime, RecompFrontend, rt64) — gitignored,
+  but **all local `[wcw fix]` changes are checked in as `lib-patches/*.patch`** (manifest +
+  `apply.ps1`/`export.ps1` there). After ANY edit under `lib/`, run `.\lib-patches\export.ps1`
+  and commit; after a reclone, run `.\lib-patches\apply.ps1`.
 - ✅ Port toolchain installed: **VS Build Tools 2022 (clang-cl 19.1.5, MSVC 14.44, CMake,
   Ninja, lld-link)**. Load it with `. .\tools\env-msvc.ps1`.
 - ✅ **The full recompiled output (all 36 `funcs_*.c`) compiles cleanly with clang-cl
