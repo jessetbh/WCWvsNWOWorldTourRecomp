@@ -421,6 +421,48 @@ int main(int argc, char** argv) {
     // run) — so gamepads are silently ignored while keyboard still works.
     recompinput::players::set_single_player_mode(true);
 
+    // WCW-specific default bindings (must run before the config tabs load / any profile is
+    // created — recompinput forbids changing defaults after first use). WCW's in-ring scheme
+    // (manual): D-PAD moves, ANALOG STICK taunts, L = duck/dodge, R = block/guard, C-Down =
+    // run, C-Up = climb/flip, C-Left/Right = switch focus, Z = unused. The generic recomp
+    // defaults fit badly (movement not on left stick; duck on LB while block is on RT).
+    // Layout here: move = left stick + d-pad; taunt = right stick; duck = LEFT trigger and
+    // block = RIGHT trigger (mirrored defensive pair); grapple = A, attack = X, run = B,
+    // climb/flip = Y, focus = LB/RB, Z parked on left-stick click.
+    {
+        using recompinput::GameInput;
+        using recompinput::InputField;
+        auto pad_digital = [](SDL_GameControllerButton b) { return InputField::controller_digital(b); };
+        auto pad_analog = [](SDL_GameControllerAxis a, bool positive) { return InputField::controller_analog(a, positive); };
+
+        recompinput::set_default_mapping_for_controller(GameInput::DPAD_LEFT,  { pad_digital(SDL_CONTROLLER_BUTTON_DPAD_LEFT),  pad_analog(SDL_CONTROLLER_AXIS_LEFTX, false) });
+        recompinput::set_default_mapping_for_controller(GameInput::DPAD_RIGHT, { pad_digital(SDL_CONTROLLER_BUTTON_DPAD_RIGHT), pad_analog(SDL_CONTROLLER_AXIS_LEFTX, true) });
+        recompinput::set_default_mapping_for_controller(GameInput::DPAD_UP,    { pad_digital(SDL_CONTROLLER_BUTTON_DPAD_UP),    pad_analog(SDL_CONTROLLER_AXIS_LEFTY, false) });
+        recompinput::set_default_mapping_for_controller(GameInput::DPAD_DOWN,  { pad_digital(SDL_CONTROLLER_BUTTON_DPAD_DOWN),  pad_analog(SDL_CONTROLLER_AXIS_LEFTY, true) });
+        recompinput::set_default_mapping_for_controller(GameInput::X_AXIS_NEG, { pad_analog(SDL_CONTROLLER_AXIS_RIGHTX, false) });
+        recompinput::set_default_mapping_for_controller(GameInput::X_AXIS_POS, { pad_analog(SDL_CONTROLLER_AXIS_RIGHTX, true) });
+        recompinput::set_default_mapping_for_controller(GameInput::Y_AXIS_POS, { pad_analog(SDL_CONTROLLER_AXIS_RIGHTY, false) });
+        recompinput::set_default_mapping_for_controller(GameInput::Y_AXIS_NEG, { pad_analog(SDL_CONTROLLER_AXIS_RIGHTY, true) });
+        recompinput::set_default_mapping_for_controller(GameInput::L,          { pad_analog(SDL_CONTROLLER_AXIS_TRIGGERLEFT, true) });
+        recompinput::set_default_mapping_for_controller(GameInput::R,          { pad_analog(SDL_CONTROLLER_AXIS_TRIGGERRIGHT, true) });
+        recompinput::set_default_mapping_for_controller(GameInput::Z,          { pad_digital(SDL_CONTROLLER_BUTTON_LEFTSTICK) });
+        recompinput::set_default_mapping_for_controller(GameInput::C_UP,       { pad_digital(recompinput::SDL_CONTROLLER_BUTTON_NORTH) });
+        recompinput::set_default_mapping_for_controller(GameInput::C_DOWN,     { pad_digital(recompinput::SDL_CONTROLLER_BUTTON_EAST) });
+        recompinput::set_default_mapping_for_controller(GameInput::C_LEFT,     { pad_digital(SDL_CONTROLLER_BUTTON_LEFTSHOULDER) });
+        recompinput::set_default_mapping_for_controller(GameInput::C_RIGHT,    { pad_digital(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) });
+
+        // Keyboard: same semantics — WASD = move (d-pad), IJKL = taunt (analog stick).
+        // The generic default had these reversed for WCW (WASD was the stick = taunt).
+        recompinput::set_default_mapping_for_keyboard(GameInput::DPAD_LEFT,  { InputField::keyboard(SDL_SCANCODE_A) });
+        recompinput::set_default_mapping_for_keyboard(GameInput::DPAD_RIGHT, { InputField::keyboard(SDL_SCANCODE_D) });
+        recompinput::set_default_mapping_for_keyboard(GameInput::DPAD_UP,    { InputField::keyboard(SDL_SCANCODE_W) });
+        recompinput::set_default_mapping_for_keyboard(GameInput::DPAD_DOWN,  { InputField::keyboard(SDL_SCANCODE_S) });
+        recompinput::set_default_mapping_for_keyboard(GameInput::X_AXIS_NEG, { InputField::keyboard(SDL_SCANCODE_J) });
+        recompinput::set_default_mapping_for_keyboard(GameInput::X_AXIS_POS, { InputField::keyboard(SDL_SCANCODE_L) });
+        recompinput::set_default_mapping_for_keyboard(GameInput::Y_AXIS_POS, { InputField::keyboard(SDL_SCANCODE_I) });
+        recompinput::set_default_mapping_for_keyboard(GameInput::Y_AXIS_NEG, { InputField::keyboard(SDL_SCANCODE_K) });
+    }
+
     // Create the standard config tabs (general/graphics/controls/sound) and load them from
     // disk. The input/render/audio paths read these configs during boot; without the tabs,
     // the gfx thread throws "General config has not been created yet" -> std::terminate.

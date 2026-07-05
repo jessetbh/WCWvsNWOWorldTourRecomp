@@ -68,6 +68,11 @@ plan; [`BUILDING.md`](BUILDING.md) for how to build and run it today.
   open the config menu — General (deadzone, background input), Graphics, Controls (full
   N64 button/stick rebinding for keyboard and controller, two slots per input), Sound.
   Changes persist next to the exe (`controls.json` etc.).
+- **WCW-tailored default controls**: this game moves on the N64 d-pad and taunts with the
+  analog stick, so the defaults map move to the left stick + d-pad, taunt to the right
+  stick, and the defensive pair to mirrored triggers — duck (N64 L) = left trigger, block
+  (N64 R) = right trigger. Grapple = A, attack = X, run = B, climb/flip = Y, switch
+  focus = bumpers. Keyboard: WASD moves, IJKL taunts.
 - `splat` disassembly of the ROM (`disasm/`), with the overlay table decoded.
 - `N64Recomp` recompiles the whole game to C with `tools/recompile.ps1`; the fast
   edit-compile-run loop is `tools/cycle.ps1`.

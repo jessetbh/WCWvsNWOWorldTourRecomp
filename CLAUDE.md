@@ -289,8 +289,10 @@ Still NOT done (later phases):
   (ultramodern input.hpp/cpp) invoked from `si.cpp::wcw_process_pif()` before
   `osContGetReadData`. Verified end-to-end by injecting WM_KEYDOWN into the game window: the
   throttled `[input]` log in si.cpp shows `buttons=1000` (Start) for Enter and `stick=(82,0)`
-  for held D; the game polls ~60/s. Default keyboard map (recompinput `input_mapping.cpp`):
-  Enter=Start, WASD=stick, Space=A, LShift=B, Q=Z, E/R=L/R, arrows=C buttons, IJKL=D-pad.
+  for held D; the game polls ~60/s. Default keyboard map: SUPERSEDED 2026-07-05 by the
+  WCW-specific defaults in `src/main/main.cpp` (see the ✅ "DEFAULT LAYOUT" bullet) —
+  now WASD=d-pad (move), IJKL=stick (taunt); Enter=Start, Space=A, LShift=B, Q=Z, E/R=L/R,
+  arrows=C buttons are unchanged from recompinput's generic `input_mapping.cpp` defaults.
   **Gamepad also verified working** (same day):
   needed `recompinput::players::set_single_player_mode(true)` in `src/main/main.cpp` (BMHero
   does this; we didn't) — in the default multiplayer mode, controller reads require a pad
@@ -404,6 +406,28 @@ Still NOT done (later phases):
   window (FindWindowW from PS marshals $null class as "" — enumerate windows by pid
   instead), BMP-dump a window aimed past the interaction. Tab-switch fake keys (F16/F17)
   did NOT work via injected WM_KEYDOWN; mouse clicks on the tab headers do.
+- ✅ **DEFAULT LAYOUT: WCW-specific bindings (2026-07-05, verified in-game).** The generic
+  recomp defaults fit WCW badly — this game MOVES ON THE D-PAD and taunts with the analog
+  stick (manual: A=grapple, B=attack, L=duck/dodge, R=block, C-Down=run, C-Up=climb/flip,
+  C-Left/Right=focus, Z=unused in-ring), so the old layout had "move" off the left stick,
+  duck on LB while block sat on RT, and LT wasted on Z. New defaults, set via
+  `recompinput::set_default_mapping_for_controller/keyboard` in `src/main/main.cpp`
+  (MUST run before the config tabs load — the API throws after first use): move = left
+  stick + d-pad (both emit d-pad), taunt = right stick, duck = LEFT TRIGGER and block =
+  RIGHT TRIGGER (mirrored defensive pair — deliberate), grapple=A/South, attack=X/West,
+  run=B/East (C-Down), climb/flip=Y/North (C-Up), focus=LB/RB (C-Left/Right), Z parked on
+  left-stick click. Keyboard: WASD=move (d-pad), IJKL=taunt (stick); rest unchanged.
+  Verified: Controls tab shows the new bindings, and MODE SELECT responds to d-pad
+  (selection moved WCW-vs-NWO → League on d-pad-down) so left-stick menu nav works.
+  GOTCHAS: (1) saved profiles override defaults — and the config loader
+  (`read_json_with_backups`) falls back to `controls.json.bak`, so BOTH controls.json and
+  the .bak must be deleted for new defaults to appear (this bit us: deleting only the
+  .json silently reloaded the old layout from the backup). (2) Rumble correction to the
+  2026-07-05 slider decision: the game DOES support the Rumble Pak on hardware ("Rumble
+  Pak supported — Insert a Rumble Pak now" prompt after Start at the title, waits for a
+  button), but the port's PIF pak emulation always answers as a Controller Pak (mempak
+  semantics), so rumble stays inert and the hidden slider remains correct; making the
+  emulated pak switchable/hybrid is a possible future enhancement.
 - ✅ **VI display + AI + RSP-task submission — NAMED; first frame REACHES RT64.** osViSetMode/
   Black/SetEvent/SwapBuffer/GetCurrent+NextFramebuffer/SetSpecialFeatures (0x80012xxx),
   osAiGetLength/SetNextBuffer (0x80016xxx), osSpTaskLoad/StartGo + osDpSetNextBuffer. `vi.mq`
