@@ -48,9 +48,11 @@ generated (3,952 data symbols; `gen_symbols.py --data`) and the **patches build 
 end to end** — `patches/*.c` → MIPS (zig cc) → `patches.elf` (ld.lld) → `N64Recomp
 patches.toml` → PatchesLib in the exe; a RECOMP_PATCH'd sqrtf printed its one-shot
 marker in-game. See the ✅ "PATCHES BUILD" bullet below for the sharp edges (zig, link
-order, two-build quirk). Next up: **first real Phase-4 patches** (widescreen, input
-options; real high-FPS interpolation needs RT64 multi-workload frame detection +
-matrix-group patches). Deferred but still owed: **overscan-edge crop** (thin garbage
+order, two-build quirk). **WIDESCREEN SHIPPED (2026-07-05, verified in-game)** — the
+first real Phase-4 patch; see the ✅ "WIDESCREEN" bullet below for how it works and the
+verification evidence. Next up: more Phase-4 enhancements (input options; real high-FPS
+interpolation needs RT64 multi-workload frame detection + matrix-group patches).
+Deferred but still owed: **overscan-edge crop** (thin garbage
 line at frame top) — come back to it after Phase 4 is under way. Dropped permanently
 (decision 2026-07-05): upstreaming the general runtime bugs — the drafts in `upstream/`
 stay as documentation only and will not be filed. Iterate via `tools/cycle.ps1`; `WCW_SAMPLE=<seconds>` dumps all
@@ -337,7 +339,28 @@ Still NOT done (later phases):
   Build: `mingw32-make` in `patches/` (defaults wired for this machine; `make clean` works
   under cmd), or just `cmake --build build-msvc` (PatchesBin target drives it; tool paths
   overridable via `-DPATCHES_C_COMPILER/-DPATCHES_LD/-DPATCHES_MAKE`).
-- ✅ **VI display + AI + RSP-task submission — NAMED; first frame REACHES RT64.** osViSetMode/
+- ✅ **WIDESCREEN SHIPPED (2026-07-05, verified in-game) — first real Phase-4 patch.**
+  WCW composes MVPs on the CPU (G_FORCEMTX-only), so the fix is at the projection's
+  source: the game has exactly ONE `guPerspectiveF` call — `func_80006860`, the camera
+  setup (fov 33°, aspect 4/3 inline, near 100/far 4000, then guLookAtF with up=(0,1,0)).
+  gu* cluster identified and documented in `disasm/libultra.md` ("gu* math cluster"):
+  guPerspectiveF=func_8001BD90, guLookAtF=func_8001C020, guMtxF2L=func_80013210,
+  sinf/cosf=func_8001C970/func_8001CB30. **⚠️ do NOT put gu*/sinf/cosf names in the
+  gen_symbols RENAME map** — N64Recomp auto-ignores known libultra names and librecomp
+  has no gu math shims; they must stay recompiled as func_XXXX. The patch
+  (`patches/widescreen.c`) RECOMP_PATCHes func_80006860 to pass
+  `recomp_get_target_aspect_ratio(4/3)` — new host API in `src/game/recomp_api.cpp`
+  (BMHero semantics: Original→4/3, Expand→window ratio, floor 4/3) + syms.ld entry
+  0x8F000084. With Aspect Ratio=Expand the projection pre-squeezes X in NDC and RT64's
+  Expand mode gives full-width perspective projections the wide viewport
+  (useWideViewport in rt64_framebuffer_renderer.cpp) → wider hFOV, correct proportions;
+  vFOV unchanged; 2D texrects stay 4:3-anchored (title "Press START" verified centered/
+  unstretched). Verified via present-BMP dumps at 2560x1440: attract match + title
+  render correct with Expand; Original mode is bit-identical to pre-patch (aspect==4/3
+  → same matrix). Note: in Original mode fullscreen has ALWAYS stretched 4:3 to 16:9
+  (user played that way); Expand is now the correct-proportions mode. The two pipeline-
+  verification patches (func_80000644, sqrtf) were removed with this landing;
+  build-msvc/graphics.json flipped to ar_option=Expand. osViSetMode/
   Black/SetEvent/SwapBuffer/GetCurrent+NextFramebuffer/SetSpecialFeatures (0x80012xxx),
   osAiGetLength/SetNextBuffer (0x80016xxx), osSpTaskLoad/StartGo + osDpSetNextBuffer. `vi.mq`
   now registered, mode set, `osSpTaskStartGo type=1` → `submit_rsp_task` → RT64 renders; window

@@ -38,7 +38,8 @@ a 32 KB pak in port 1 backed by the standard recomp save file.
 | 3 | **Menu flicker/missing assets fixed** (RT64 interpolation off by default; user-verified) | ✅ done |
 | 3 | **Saves** — Controller Pak emulated over raw joybus, persists to the recomp save file | ✅ done |
 | 4 | **Patches build foundation** (data symbols, MIPS cross-compile, RECOMP_PATCH verified in-game) | ✅ done |
-| 4 | PC enhancements (widescreen, high-FPS, input options) | 🔶 next |
+| 4 | **Widescreen** (game-side projection patch + host aspect API, Aspect Ratio: Expand) | ✅ done |
+| 4 | More PC enhancements (high-FPS interpolation, input options) | 🔶 next |
 | — | Rendering polish (overscan edges) | ⬜ deferred, still planned |
 
 Getting here required fixing two runtime-stack bugs that likely affect other recomp
@@ -58,6 +59,10 @@ plan; [`BUILDING.md`](BUILDING.md) for how to build and run it today.
   full matches end to end — hardware-accelerated rendering (RT64, D3D12/Vulkan) at 4x
   resolution, audio (recompiled RSP audio ucode → SDL), keyboard + gamepad input, clean
   menus, and persistent saves (emulated Controller Pak → `saves/<game id>.bin`).
+- **Widescreen**: with Aspect Ratio set to Expand, 3D renders at the window's aspect
+  with a correctly widened FOV (the game's single projection-setup function is patched
+  to take the display ratio; 2D stays 4:3-anchored). The first real gameplay patch —
+  `patches/widescreen.c`.
 - `splat` disassembly of the ROM (`disasm/`), with the overlay table decoded.
 - `N64Recomp` recompiles the whole game to C with `tools/recompile.ps1`; the fast
   edit-compile-run loop is `tools/cycle.ps1`.

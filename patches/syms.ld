@@ -31,4 +31,7 @@ __umoddi3_recomp             = 0x8F000070;
 osVirtualToPhysical_recomp   = 0x8F000078;
 osPiStartDma_recomp          = 0x8F00007C;
 
+/* Game-side host API (src/game/recomp_api.cpp) */
+recomp_get_target_aspect_ratio = 0x8F000084;
+
 /* Add more here as patches require them (input, audio, UI callbacks, etc.). */

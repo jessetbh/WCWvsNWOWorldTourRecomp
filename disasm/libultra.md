@@ -512,3 +512,38 @@ pass to guarantee completeness before flipping them to `ignored` in `wcw.toml`.
 3. Add the libultra names to `wcw.toml` `ignored = [...]` so ultramodern provides them.
 4. Remove the corresponding entries from the current `stubs`/`cache nop` lists (they were
    placeholders to get a clean recompile; ultramodern replaces them properly).
+
+## gu* math cluster — identified for the widescreen patch (2026-07-05)
+
+Found by hunting the projection-matrix source for Phase 4 widescreen. Evidence in
+`disasm/asm/1050.s`; the whole cluster is pure math (no MMIO) and recompiles perfectly.
+
+| func | libultra name | evidence |
+|------|---------------|----------|
+| `func_8001BD90` | `guPerspectiveF` | guMtxIdentF call; fovy × (π/180 double `D_80034380`) / 2; cot = cosf/sinf; `m[0][0]=cot/aspect` (store @+0x00), `m[1][1]=cot` (+0x14), `m[2][3]=-1.0f` (+0x2C); perspNorm `65536*2/(near+far)` computation at the end |
+| `func_8001BFC0` | `guPerspective` | thin wrapper: guPerspectiveF into a stack mf + guMtxF2L. **Never called by the game** |
+| `func_80013210` | `guMtxF2L` | float→s15.16 GBI pack; `trunc.w.s` + 0x10000 scale |
+| `func_80013310` | `guMtxIdentF` | called first by every gu matrix builder |
+| `func_8001C020` | `guLookAtF` | called by the camera setup with up=(0,1,0) |
+| `func_8001C970` | `sinf` | called in cos/sin pairs by all the rotation builders |
+| `func_8001CB30` | `cosf` | idem |
+| `func_8001C350` | `guRotateRPYF`-family | 3 × (sinf+cosf) pairs, π/180 float `D_80034390` |
+| `func_8001C4F0` | `guPositionF`-family | same shape, constant `D_800343A0`, wrapper `func_8001C6A0` (+guMtxF2L) |
+
+**⚠️ Do NOT add these to the `RENAME` map in `tools/gen_symbols.py`.** N64Recomp
+auto-*ignores* any function bearing a known libultra name, and librecomp has **no**
+`gu*`/`sinf`/`cosf` runtime shims — renaming them would drop the (perfectly working)
+recompiled implementations and break the link. They stay `func_XXXX`; the names live
+here and in `patches/widescreen.c` comments only.
+
+### The game's one projection call site
+`func_80006860` (main segment) is the camera/projection setup — **the only
+guPerspectiveF caller in the entire game** (`jal` at `0x800068B0`):
+```
+guPerspectiveF(D_80047B50, &norm, fovy=33.0f, aspect=4/3 (0x3FAAAAAB inline), near=100, far=4000, scale=1)
+guLookAtF     (D_80047B90, eye=a1..a3, at=stack args, up=(0,1,0))
+func_800016F8 (gfx, D_80047B50, D_80047B90)   // latch P and V float matrices
+func_80001724 (gfx, perspNorm)
+```
+Everything 3D goes through it (all composed MVPs inherit this P), which is why
+`patches/widescreen.c` RECOMP_PATCHes exactly this function.

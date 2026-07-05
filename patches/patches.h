@@ -19,6 +19,9 @@
 // Runtime API bridges (addresses assigned in syms.ld; the recompiler routes calls to
 // the matching *_recomp / recomp_* runtime function).
 void recomp_puts(const char* data, u32 size);
+// Returns the aspect ratio to render 3D at: `original` when the user's Aspect Ratio
+// setting is Original, else the window's ratio (never below `original`).
+f32 recomp_get_target_aspect_ratio(f32 original);
 
 // Project-wide patch declarations for WCW vs. nWo World Tour: Recompiled.
 // Add shared extern declarations for game functions/data you patch here.
