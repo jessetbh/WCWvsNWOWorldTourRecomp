@@ -25,8 +25,10 @@ Clone with `git clone --recursive <url> <dir> && git -C <dir> checkout --recurse
 - **N64ModernRuntime**: external-message-pump drain fix (deadlock; upstream-relevant),
   `osViSetEvent` both-ViStates + retrace-reload guard, audio buffer-depth under-reporting
   (`buffer_offset_frames`), 4 IDO softfloat `_recomp` shims, **new `librecomp/src/si.cpp`**
-  (raw-SI/PIF joybus emulation for WCW's homegrown controller layer) + input-poll hook
-  (`ultramodern::input::poll_input()`), assorted `[wcw]` diagnostics (pi/events/mesgqueue).
+  (raw-SI/PIF joybus emulation for WCW's homegrown controller layer: controller reads,
+  input-poll hook `ultramodern::input::poll_input()`, and **32 KB Controller Pak emulation**
+  — WCW's only save medium — backed by the save buffer via a new `save_read_ptr` in
+  `pi.cpp`), assorted `[wcw]` diagnostics (pi/events/mesgqueue).
 - **N64ModernRuntime-N64Recomp**: `include/recomp.h` declares the `__osSiRawStartDma_recomp`
   / `__osSiDeviceBusy_recomp` shims (implemented in the new si.cpp; needed by every
   recompiled TU since these names are in N64Recomp's ignored set).

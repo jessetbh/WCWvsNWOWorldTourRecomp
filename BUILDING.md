@@ -1,8 +1,9 @@
 # Building Guide
 
 This documents what actually works today and how to reproduce it on this machine. The
-full pipeline works end to end: recompile → build → **run the game** (it boots, renders,
-and plays its demo loop **with sound** — the RSP audio ucode is recompiled and working).
+full pipeline works end to end: recompile → build → **play the game** (boots, renders,
+full matches with sound, keyboard + gamepad input, clean menus, and persistent saves
+via emulated Controller Pak).
 
 There are **two separate toolchains**, by design:
 - **MinGW GCC** (`tools/env.ps1`) — used only to build the `N64Recomp` tool.
@@ -62,7 +63,9 @@ null-guard; input poll in the raw-SI path — `si.cpp` calls the new
 `ultramodern::input::poll_input()` since WCW never calls `osContStartReadData`, the normal
 poller, so host input was never latched; Framerate default `Original` in recompui's
 graphics tab — RT64 frame interpolation assumes 1 workload = 1 frame and WCW uses several,
-so Display mode produces black/partial menu frames). **All of these are checked in as
+so Display mode produces black/partial menu frames; **Controller Pak emulation** in
+`si.cpp` + `save_read_ptr` in `pi.cpp` — WCW saves only to the pak, emulated over raw
+joybus and backed by the standard recomp save file). **All of these are checked in as
 `lib-patches/*.patch`** — after recloning `lib/`, run `.\lib-patches\apply.ps1`; after
 changing anything under `lib/`, run `.\lib-patches\export.ps1` and commit. Manifest of
 repo URLs + pinned commits: `lib-patches/README.md`.
@@ -73,7 +76,8 @@ cd build-msvc
 .\WCWRecompiled.exe               # must run with build-msvc as the working directory
 ```
 It boots straight into the game: intro → attract match → wrestler cinematics → title,
-looping, with sound. Useful env vars:
+looping, with sound; press Start (Enter / pad Start) to play. Saves persist to
+`build-msvc\saves\<game id>.bin` (emulated Controller Pak). Useful env vars:
 - `WCW_SAMPLE=<seconds>` — dump all thread stacks N seconds in (stall diagnosis).
 - `WCW_RDC_T=<seconds>` — when running under RenderDoc, when to fire the in-app
   multi-frame capture (default 8).
@@ -100,11 +104,13 @@ was wired (`run/README.md`). Superseded by the real port; kept for reference:
 ```
 
 ## Remaining work (in order)
-1. **Input verification.** Input is wired through recompinput but untested in-game
-   (press Start on the title screen, navigate menus, start a match).
-2. **Rendering/asset polish** as issues surface, then Phase-4 enhancements (widescreen,
-   high-FPS interpolation, input options) via `patches/`.
+1. **Upstream the general fixes** (N64ModernRuntime message-pump starvation, RT64
+   present-blit race + zero-VP NaN guard, plume `copyTextureRegion` null-guard).
+2. **Rendering polish**: crop the overscan-edge garbage rows (thin line at frame top).
+3. **Phase 4** via `patches/`: generate `syms/data_dump.toml`, stand up the patches
+   build, then widescreen / input options; real high-FPS interpolation additionally
+   needs RT64 multi-workload frame detection + matrix-group tagging.
 
-(Audio is DONE — 2026-07-04: `rsp/wcw_audio.toml` → RSPRecomp → `rsp/wcw_audio.cpp`,
-returned by `get_rsp_microcode` for M_AUDTASK; it's the stock aspMain, byte-identical to
-BMHero's. See `rsp/README.md`.)
+(Done and user-verified as of 2026-07-05: audio — RSPRecomp'd stock aspMain, see
+`rsp/README.md`; keyboard + gamepad input; clean menus at Framerate=Original; saves
+via emulated Controller Pak → `saves/<game id>.bin`.)

@@ -9,7 +9,7 @@ built by statically recompiling the original game with
 > **This repository does not contain game assets.** A legally obtained copy of the
 > original ROM is required to build and run.
 
-## Status — the game is PLAYABLE: boots, renders, full matches with sound + input (2026-07-05)
+## Status — FULLY PLAYABLE: matches, sound, input, menus, and saves (2026-07-05)
 
 The port builds, boots to a window, and plays the game's complete attract/demo cycle
 indefinitely: intro (spinning WCW mat), attract match (3D ring + crowd + animated
@@ -21,7 +21,11 @@ Console instead of PresentEarly — WCW frames span multiple gfx tasks that pre-
 the next framebuffer, which PresentEarly then presented as a black frame). **Input works**
 (keyboard + gamepad; two fixes: the raw-SI path never triggered recompinput's poll, and
 single-player mode was never enabled) — **full matches verified playable end to end**.
-Current focus: in-game menus show flicker and some missing assets.
+**Menus render cleanly** (frame interpolation now defaults off — RT64 assumes one RSP
+workload per frame, WCW uses several, so interpolated frames came out black/partial).
+**Saves work**: WCW saves only to the Controller Pak, which the recomp stack doesn't
+support — but WCW's raw joybus driver goes through our PIF emulation, which now emulates
+a 32 KB pak in port 1 backed by the standard recomp save file.
 
 | Phase | What | State |
 |------:|------|-------|
@@ -32,7 +36,8 @@ Current focus: in-game menus show flicker and some missing assets.
 | 3 | **Audio** — RSPRecomp'd (`rsp/wcw_audio.toml`), real sound verified | ✅ done |
 | 3 | In-game **input** (keyboard + gamepad) — **matches playable end to end** | ✅ done |
 | 3 | **Menu flicker/missing assets fixed** (RT64 interpolation off by default; user-verified) | ✅ done |
-| 3 | Rendering polish (overscan edges, any remaining asset issues) | 🔶 next |
+| 3 | **Saves** — Controller Pak emulated over raw joybus, persists to the recomp save file | ✅ done |
+| 3 | Rendering polish (overscan edges); upstream the general runtime fixes | 🔶 next |
 | 4 | Patches & PC enhancements (widescreen, high-FPS, input options) | ⬜ later |
 
 Getting here required fixing two runtime-stack bugs that likely affect other recomp
@@ -48,9 +53,10 @@ See [`CLAUDE.md`](CLAUDE.md) for the full state, technical detail, and the step-
 plan; [`BUILDING.md`](BUILDING.md) for how to build and run it today.
 
 ## What works today
-- **The port itself**: `build-msvc\WCWRecompiled.exe` boots the game and runs the full
-  demo loop with hardware-accelerated rendering (RT64, D3D12/Vulkan) at 4x resolution
-  and working audio (recompiled RSP audio ucode → SDL).
+- **The whole game**: `build-msvc\WCWRecompiled.exe` boots to the title screen and plays
+  full matches end to end — hardware-accelerated rendering (RT64, D3D12/Vulkan) at 4x
+  resolution, audio (recompiled RSP audio ucode → SDL), keyboard + gamepad input, clean
+  menus, and persistent saves (emulated Controller Pak → `saves/<game id>.bin`).
 - `splat` disassembly of the ROM (`disasm/`), with the overlay table decoded.
 - `N64Recomp` recompiles the whole game to C with `tools/recompile.ps1`; the fast
   edit-compile-run loop is `tools/cycle.ps1`.

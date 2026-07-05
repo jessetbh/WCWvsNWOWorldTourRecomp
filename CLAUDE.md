@@ -31,27 +31,25 @@ Done and verified:
   installed**, and the **full recompiled output compiles with clang-cl against the real
   N64ModernRuntime headers**. libultra ~60 funcs identified (`disasm/libultra.md`).
 
-### Immediate next steps (DEMO LOOP + AUDIO WORK — next: input verification, polish)
-**Status (2026-07-04): the port boots, runs, and RENDERS the complete attract/demo cycle
-indefinitely** — intro (spinning WCW mat), attract match (ring + crowd + animated
-wrestlers), wrestler intro cinematics (Sting descending from the rafters, mostly-dark
-scenes with camera flashes — looks black in a quick glance but is correct), then loops.
-100+ s runs: no crash, no freeze, ~90 tasks/s in cinematic mode. Both game ucodes matched
-and render (F3DEX 1.23 Variant + F3DLX 1.23.Rej Variant, loaded at the overlay-B switch).
-Three bug classes were fixed to get here (details in the bullets below + `disasm/libultra.md`):
-the RT64 zero-VP NaN (black screen, 2026-07-03), the **ultramodern external-message pump
-starvation** (game-wide deadlock at the end of the attract sequence, 2026-07-04 — an
-upstream-relevant N64ModernRuntime bug), and two more libultra names (`osSpTaskYield` /
-`osSpTaskYielded`, crashes at the F3DLX ucode switch). **AUDIO NOW WORKS (2026-07-04)**:
-the audio ucode is RSPRecomp'd (`rsp/wcw_audio.toml` → `rsp/wcw_audio.cpp`, wired into
-`get_rsp_microcode` for M_AUDTASK; needed `-march=nehalem` in CMake for librecomp's SSE4.1
-VU intrinsics) — it's the stock aspMain, **byte-identical to BMHero's** (its indirect-branch
-targets applied verbatim); real text size is 0xE20, not the OSTask's rounded 0x1000 (see
-`rsp/README.md`). Verified by a peak-amplitude `[audio]` log in `queue_samples`: nonzero
-samples throughout the attract loop. Remaining work, in order: **input verification**
-in-game (press Start, navigate menus), then rendering/asset polish and Phase-4 enhancements.
-Iterate via `tools/cycle.ps1`; `WCW_SAMPLE=<seconds>` dumps all thread stacks at t+N;
-`WCW_RDC_T=<seconds>` sets the RenderDoc in-app capture trigger time (default 8).
+### Immediate next steps (GAME FULLY PLAYABLE — next: polish, upstreaming, Phase 4)
+**Status (2026-07-05): the port is FULLY PLAYABLE end to end, user-verified** — boots,
+renders, full matches with sound, keyboard + gamepad input, clean menus, and **working
+saves** (Controller Pak emulation). The 2026-07-04 baseline (complete attract/demo cycle,
+audio via the RSPRecomp'd stock aspMain — see `rsp/README.md`) was extended on 2026-07-05
+with three fixes, each detailed in the ✅ bullets below: **input** (raw-SI path never
+triggered recompinput's poll + single-player mode never enabled), **menu flicker/missing
+assets** (RT64 frame interpolation assumes 1 workload = 1 frame, WCW uses several →
+Framerate now defaults to Original), and **saves** (WCW saves ONLY to Controller Pak;
+si.cpp now emulates a 32 KB pak in port 1 backed by librecomp's save file). Work is now
+committed (was: one giant uncommitted tree) and all lib/ fixes are checked in as
+`lib-patches/*.patch` (apply.ps1 / export.ps1 — run export after ANY lib/ edit).
+Remaining, in rough order: **upstream the general bugs** (message-pump starvation,
+RT64 present race + zero-VP NaN, plume null-guard), **overscan-edge crop** (thin garbage
+line at frame top), then **Phase 4** (`syms/data_dump.toml` + patches build → widescreen,
+input options; real high-FPS interpolation needs RT64 multi-workload frame detection +
+matrix-group patches). Iterate via `tools/cycle.ps1`; `WCW_SAMPLE=<seconds>` dumps all
+thread stacks at t+N; `WCW_RDC_T=<seconds>` sets the RenderDoc capture trigger time;
+`WCW_PRESENT_LUM=1` + `WCW_BMP_START`/`WCW_BMP_COUNT` dump presented frames.
 
 What got named this session (all in `tools/gen_symbols.py` RENAME, evidence inline + in
 `disasm/libultra.md`): VI — `osViSetMode`(80012500), `osViBlack`(80012570), `osViSetEvent`
@@ -63,8 +61,8 @@ the RSP/DP task funcs (`osSpTaskLoad`/`StartGo`/`osDpSetNextBuffer`), and a no-o
 in `src/main/main.cpp` (audio ucode located: `0x80029C50`/data `0x80037530`/`0x1000` — see
 `rsp/README.md`).
 
-The path-to-a-picture is DONE (picture achieved 2026-07-03); the remaining work is real
-audio (RSPRecomp the located ucode), input verification, then asset/render correctness.
+The path-to-a-picture is DONE (2026-07-03) and the game is fully playable with saves
+(2026-07-05); what follows is the historical integration guide + evidence log.
 1. **libultra integration = a NAMING problem** (validated — see `disasm/libultra.md`).
    N64Recomp auto-ignores any function NAMED with a known libultra/libc/ido-math name
    (built-in sets in `N64Recomp/src/symbol_lists.cpp`); the runtime then provides it. So:
@@ -289,6 +287,19 @@ Still NOT done (later phases):
   produces A/D-pad N64 bits end to end. **User confirmed full matches playable end to end
   with menus navigable (2026-07-05).** The temporary `[inpoll]`/`[input]` diagnostics were
   removed after verification (si.cpp / input_state.cpp).
+- ✅ **SAVES WORK (2026-07-05, user-verified): Controller Pak emulation.** WCW saves ONLY
+  to the Controller Pak (no cart EEPROM/SRAM — unusual; most ported games have batteries),
+  and the recomp stack has no pak support (`Pak` enum only has RumblePak; osPfs* is
+  unimplemented). But WCW's homegrown raw-SI driver speaks joybus directly through our PIF
+  emulation, so `si.cpp` emulates a standard 32 KB pak in port 1: status byte reports
+  pak-present (0x01), joybus cmd `0x02`/`0x03` = 32-byte block read/write with the mempak
+  data CRC (poly 0x85), bank/ID region (>= 0x8000) reads zeros / acks writes without storing
+  (mupen64plus semantics — this is how games distinguish mempak from Rumble Pak's 0x80s).
+  Backing store = librecomp's save subsystem: `GameEntry.save_type = SaveType::Sram`
+  (exactly 32 KB) in `src/main/main.cpp`, new host-pointer `save_read_ptr` in librecomp
+  `pi.cpp`; pak contents persist to `saves/<game id>.bin` with async atomic writes + backup.
+  Boot-verified: game runs accessory-detect (write/read `0x8001`), accepts the pak, writes
+  filesystem blocks. One-shot `[wcw] first Controller Pak read/write` stderr markers remain.
 - ✅ **VI display + AI + RSP-task submission — NAMED; first frame REACHES RT64.** osViSetMode/
   Black/SetEvent/SwapBuffer/GetCurrent+NextFramebuffer/SetSpecialFeatures (0x80012xxx),
   osAiGetLength/SetNextBuffer (0x80016xxx), osSpTaskLoad/StartGo + osDpSetNextBuffer. `vi.mq`
