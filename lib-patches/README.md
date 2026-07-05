@@ -44,4 +44,5 @@ Clone with `git clone --recursive <url> <dir> && git -C <dir> checkout --recurse
 ## Notes
 - Patches are exact snapshots of the working trees (verified by reverse-apply at export).
 - If a patch no longer applies after moving a lib to a newer commit, resolve manually and
-  re-export; consider upstreaming the general fixes so this directory shrinks.
+  re-export. (Upstreaming the general fixes was considered and permanently declined,
+  2026-07-05 — these patches are carried locally for good; `upstream/` documents the bugs.)

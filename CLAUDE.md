@@ -31,7 +31,7 @@ Done and verified:
   installed**, and the **full recompiled output compiles with clang-cl against the real
   N64ModernRuntime headers**. libultra ~60 funcs identified (`disasm/libultra.md`).
 
-### Immediate next steps (GAME FULLY PLAYABLE — next: polish, upstreaming, Phase 4)
+### Immediate next steps (GAME FULLY PLAYABLE — next: Phase 4)
 **Status (2026-07-05): the port is FULLY PLAYABLE end to end, user-verified** — boots,
 renders, full matches with sound, keyboard + gamepad input, clean menus, and **working
 saves** (Controller Pak emulation). The 2026-07-04 baseline (complete attract/demo cycle,
@@ -43,11 +43,12 @@ Framerate now defaults to Original), and **saves** (WCW saves ONLY to Controller
 si.cpp now emulates a 32 KB pak in port 1 backed by librecomp's save file). Work is now
 committed (was: one giant uncommitted tree) and all lib/ fixes are checked in as
 `lib-patches/*.patch` (apply.ps1 / export.ps1 — run export after ANY lib/ edit).
-Remaining, in rough order: **upstream the general bugs** (message-pump starvation,
-RT64 present race + zero-VP NaN, plume null-guard), **overscan-edge crop** (thin garbage
-line at frame top), then **Phase 4** (`syms/data_dump.toml` + patches build → widescreen,
+Next up: **Phase 4** (`syms/data_dump.toml` + patches build → widescreen,
 input options; real high-FPS interpolation needs RT64 multi-workload frame detection +
-matrix-group patches). Iterate via `tools/cycle.ps1`; `WCW_SAMPLE=<seconds>` dumps all
+matrix-group patches). Deferred but still owed: **overscan-edge crop** (thin garbage
+line at frame top) — come back to it after Phase 4 is under way. Dropped permanently
+(decision 2026-07-05): upstreaming the general runtime bugs — the drafts in `upstream/`
+stay as documentation only and will not be filed. Iterate via `tools/cycle.ps1`; `WCW_SAMPLE=<seconds>` dumps all
 thread stacks at t+N; `WCW_RDC_T=<seconds>` sets the RenderDoc capture trigger time;
 `WCW_PRESENT_LUM=1` + `WCW_BMP_START`/`WCW_BMP_COUNT` dump presented frames.
 
@@ -338,7 +339,8 @@ Still NOT done (later phases):
   `lib/rt64/src/hle/rt64_rsp.cpp`, `[wcw fix]` tags): `isMatrixZero()` guard at the two consumers —
   a never-loaded zero VP is treated as identity, so `world = MVP` and `viewProj = identity`,
   preserving `viewProj × world = MVP`. Affects only forceMatrix-only games. lib/ is gitignored, so
-  this patch must be preserved/reapplied if lib/rt64 is ever recloned (candidate for upstreaming).
+  this patch must be preserved/reapplied if lib/rt64 is ever recloned (carried locally
+  for good — upstreaming was declined; see `upstream/README.md`).
   Env `WCW_INSPECTOR=1` auto-opens RT64's frame inspector (renders, but needs input forwarding).
 - 🔧 **RenderDoc workflow (validated, fully scriptable — how the black screen was cracked):**
   RenderDoc 1.44 at `C:\Program Files\RenderDoc`. `src/main/main.cpp` self-triggers

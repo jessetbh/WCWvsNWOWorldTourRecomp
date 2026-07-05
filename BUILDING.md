@@ -104,12 +104,14 @@ was wired (`run/README.md`). Superseded by the real port; kept for reference:
 ```
 
 ## Remaining work (in order)
-1. **Upstream the general fixes** (N64ModernRuntime message-pump starvation, RT64
-   present-blit race + zero-VP NaN guard, plume `copyTextureRegion` null-guard).
-2. **Rendering polish**: crop the overscan-edge garbage rows (thin line at frame top).
-3. **Phase 4** via `patches/`: generate `syms/data_dump.toml`, stand up the patches
+1. **Phase 4** via `patches/`: generate `syms/data_dump.toml`, stand up the patches
    build, then widescreen / input options; real high-FPS interpolation additionally
    needs RT64 multi-workload frame detection + matrix-group tagging.
+2. **Rendering polish** (deferred, still planned): crop the overscan-edge garbage rows
+   (thin line at frame top).
+
+Dropped permanently (2026-07-05): upstreaming the general runtime fixes — the drafts
+in `upstream/` are kept as documentation only.
 
 (Done and user-verified as of 2026-07-05: audio — RSPRecomp'd stock aspMain, see
 `rsp/README.md`; keyboard + gamepad input; clean menus at Framerate=Original; saves

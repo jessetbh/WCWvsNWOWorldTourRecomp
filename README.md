@@ -37,8 +37,8 @@ a 32 KB pak in port 1 backed by the standard recomp save file.
 | 3 | In-game **input** (keyboard + gamepad) — **matches playable end to end** | ✅ done |
 | 3 | **Menu flicker/missing assets fixed** (RT64 interpolation off by default; user-verified) | ✅ done |
 | 3 | **Saves** — Controller Pak emulated over raw joybus, persists to the recomp save file | ✅ done |
-| 3 | Rendering polish (overscan edges); upstream the general runtime fixes | 🔶 next |
-| 4 | Patches & PC enhancements (widescreen, high-FPS, input options) | ⬜ later |
+| 4 | Patches & PC enhancements (widescreen, high-FPS, input options) | 🔶 next |
+| — | Rendering polish (overscan edges) | ⬜ deferred, still planned |
 
 Getting here required fixing two runtime-stack bugs that likely affect other recomp
 projects too (documented in `disasm/libultra.md`, fixes tagged `[wcw fix]` in `lib/`):
