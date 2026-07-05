@@ -1,0 +1,26 @@
+# RSPRecomp config for WCW's AUDIO microcode — WORKING (2026-07-04): recompiled, wired
+# into get_rsp_microcode, real audio verified (nonzero samples through the attract loop).
+# Values from the OSTask logged at runtime by get_rsp_microcode (see rsp/README.md):
+# ucode text vram 0x80029C50 -> ROM 0x2A850 (main segment: vram 0x80000400 = rom 0x1000).
+# The OSTask reports ucode_size 0x1000, but that's the rounded-up DMA size: the graphics
+# ucode A text starts at ROM 0x2B670 = 0x2A850 + 0xE20, so the real audio text is 0xE20
+# (same size as BMHero's aspMain — with 0x1000, RSPRecomp hits the gfx ucode's mfc0
+# DPC_CURRENT and aborts). text_address 0x04001080 = where rspboot places task ucode in
+# IMEM (same as BMHero's aspMain.toml).
+# NOTE: the graphics ucode (D_8002AA70 / D_8002BEA0, built in func_80002EAC) is handled by
+# RT64 — do NOT point this at it. This is for the audio ucode only.
+# Run from repo root:  .\RSPRecomp.exe rsp\wcw_audio.toml   (paths are relative to rsp/).
+text_offset = 0x2A850
+text_size = 0xE20
+text_address = 0x04001080
+rom_file_path = "../wcw.z64"
+output_file_path = "wcw_audio.cpp"
+output_function_name = "wcw_audio_ucode"
+
+# Indirect (jump-table) branch targets: taken verbatim from BMHero's aspMain.toml —
+# valid because WCW's audio ucode is byte-identical to BMHero's (0/0xE20 bytes differ,
+# ROM 0x2A850 here vs 0x4A060 there). Both ship the same stock Nintendo audio microcode.
+extra_indirect_branch_targets = [
+	0x1118, 0x1470, 0x11DC, 0x1B38, 0x1214, 0x187C, 0x1254, 0x12D0,
+	0x12EC, 0x1328, 0x140C, 0x1294, 0x1E24, 0x138C, 0x170C, 0x144C
+]

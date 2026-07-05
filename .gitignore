@@ -1,6 +1,9 @@
 # Build output
 build/
 build-cmake/
+build-coretest/
+build-msvc/
+build-*/
 out/
 *.obj
 *.o
@@ -26,13 +29,14 @@ patches/*.d
 # RSP recompiler output
 rsp/*.cpp
 
-# Recompiler binaries copied into the repo
+# Recompiler binaries copied into the repo + their MinGW runtime DLLs
 N64Recomp
 N64Recomp.exe
 RSPRecomp
 RSPRecomp.exe
 file_to_c
 file_to_c.exe
+*.dll
 
 # ROMs and assets — NEVER commit these
 *.z64
@@ -42,6 +46,18 @@ wcw.z64
 
 # Generated symbol dumps live under syms/ but are produced by tooling; keep the dir,
 # decide per-file whether to track once they stabilize.
+
+# Runtime libraries (cloned for Phase 3; should become proper git submodules later).
+# Ignored for now so the ~940 MB of code isn't committed as plain files.
+lib/N64ModernRuntime/
+lib/RecompFrontend/
+lib/rt64/
+
+# Standalone run/ experiment — build artifacts (keep the source + README)
+run/obj/
+run/*.exe
+run/*.o
+run/last_run.txt
 
 # Disassembly project (Phase 1) — generated/large; keep configs + symbol files only
 disasm/.venv/
@@ -60,3 +76,6 @@ disasm/undefined_syms_auto.txt
 *.user
 Thumbs.db
 .DS_Store
+
+# Claude Code local (per-machine) settings
+.claude/settings.local.json

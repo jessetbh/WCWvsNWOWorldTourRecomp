@@ -1,19 +1,36 @@
 # syms/ — symbol metadata
 
-N64Recomp needs to know where the game's functions and data live. This directory holds:
+N64Recomp needs to know where the game's functions and data live.
 
-- `dump.toml` — sections + functions (+ relocs) for the base game.
-- `data_dump.toml` — data symbols for the base game.
+## `dump.toml` — GENERATED, present ✅
+Sections + functions for the base game, in N64Recomp's symbol-TOML format. Contains all
+**1763 functions** across 4 sections (entry, main, ovl_a, ovl_b). Produced by
+`../tools/gen_symbols.py --overlays`, which parses the splat disassembly (`../disasm/asm/`)
+— we use **symbol-TOML mode**, not ELF mode, because this machine has no MIPS assembler.
 
-**These do not exist yet.** WCW vs. nWo World Tour has no public decompilation, so they
-must be generated (CLAUDE.md, Phase 1/2). The two routes:
+`wcw.toml` points `symbols_file_path` at `dump.toml`. Regenerate any time the disassembly
+or function boundaries change.
 
-1. **Recommended:** build a disassembly ELF (see `../disasm/`), run N64Recomp in ELF mode
-   once, and let it emit these files (it writes exactly this format — see
-   `N64Recomp/src/main.cpp::dump_context`).
-2. Author them by hand (only sane for tiny binaries).
+Notes:
+- The `RENAME` map in `gen_symbols.py` is the **libultra integration mechanism**: mapping
+  `func_XXXX` → a known libultra name makes N64Recomp skip recompiling it, and the runtime
+  (ultramodern/librecomp) provides the host implementation instead. ~40 functions are
+  named this way (threads, messages, VI, AI, PI/EPI DMA, SP/DP tasks incl. osSpTaskYield/
+  Yielded, raw SI, clock, IDO softfloat) — this is what makes the port boot and run.
+  Evidence for each name is inline in `gen_symbols.py` and in `../disasm/libultra.md`.
+- The game's function literally named `main` is renamed to `game_main` (it collides
+  with the C/C++ entry point).
+- Both overlays load to vram `0x80090000`; the recompiler resolves the ambiguous
+  `jal 0x80090000` via runtime function lookup (the overlay swap mechanism).
+- After editing `RENAME`, regenerate + recompile + rebuild — `../tools/cycle.ps1` does the
+  whole loop.
 
-Format reference is in `../CLAUDE.md` under "The symbol TOML format".
+## `data_dump.toml` — not generated yet ⬜
+Data symbols for the base game. Not required for the code recompile (it succeeds without
+them), but needed for the patches build (`patches.toml` references it) and for naming data
+references. Generate later from the splat data sections.
 
-`wcw.toml` points `symbols_file_path` at `syms/dump.toml`; `patches.toml` points its
-reference syms at both files.
+## Format reference
+See `../CLAUDE.md` → "The symbol TOML format". The `[[section]]` blocks carry
+`rom`/`vram`/`size` and a `functions = [{ name, vram, size }, …]` array; data symbol files
+carry `symbols = [{ name, vram }, …]`.

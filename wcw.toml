@@ -31,53 +31,81 @@ trace_mode = false
 # implementations (runtime-provided or recompiler support) before the game runs. TODO.
 stubs = [
     #"__osSiDeviceBusy",
-    "func_800134AC", "func_800134E8", "func_80013550", "func_8001358C",
-    "func_800135E8", "func_80013618", "func_80013678", "func_80013740",
-    "func_8001375C", "func_80013778", "func_80013818", "func_800138B4",
-    "func_800138CC", "func_800138E4", "func_80013918",
+    # The softfloat/64-bit helper cluster (func_800134AC..func_80013918) was ALL stubbed together
+    # for the first recompile. RESOLVED (2026-06-11): split and removed from stubs entirely.
+    #  * the 64-bit INTEGER-math group (ddiv/ddivu/dmultu) recompiles cleanly with the current
+    #    N64Recomp, so it is now real recompiled code (func_8001358C 64-bit divide etc. are
+    #    actually CALLED, incl. from overlay B — the stubs had been returning garbage).
+    #  * the FP<->int64 CONVERSION group (trunc.l.*/cvt.*.l, which N64Recomp can't emit) is now
+    #    NAMED to the IDO softfloat routines in tools/gen_symbols.py (__d_to_ll/__f_to_ll/
+    #    __d_to_ull/__f_to_ull/__ll_to_d/__ll_to_f/__ull_to_d/__ull_to_f), so the recompiler
+    #    auto-ignores them and links librecomp's math_routines.cpp `<name>_recomp` shims (4 of
+    #    which were missing and were added).
+
+    # libultra OS / exception / TLB layer (mfc0/mtc0/tlb*/eret). These are placeholders:
+    # the proper fix is to NAME each (see tools/gen_symbols.py RENAME) so N64Recomp
+    # auto-ignores it and the runtime provides it. As they get named they move out of this
+    # list (already done: __osDisableInt, __osRestoreInt, __osDispatchThread).
+    "func_8001CCA0",
+    "func_8001CCB0", "func_8001D39C", "func_8001D4F4",
+    # func_8001EB30 (mfc0 $9 = osGetCount) was here — now NAMED osGetCount in gen_symbols.py
+    # (stubbing it froze the game clock → timed intro waits never completed).
+    "func_8001D680", "func_8001EC90", "func_80025D30",
+    "func_80029B88", "func_80029C50", "func_80029D80",
+
+    # Handwritten exception handler (__osException): k0/k1 + mfc0 $12/$13 + thread-context
+    # save to __osRunningThread (D_80033A90). Referenced only by-address inside osInitialize
+    # (func_800112D0, now ignored) to install the exception vectors, so it is never called;
+    # stubbed because its mfc0/mtc0/eret can't be recompiled. (Was previously mis-named
+    # osInitialize in gen_symbols.py.)
+    "func_8001CD70",
+
+    # Handwritten exception/boot asm with cross-"function" branches that spimdisasm
+    # split incorrectly. Part of the same runtime-provided OS layer; stubbed for now.
+    "func_8001D2B4",
+
+    # RSP boot/IMEM management (branches into 0x84001000 = RSP IMEM). RSP is handled
+    # separately by RSPRecomp, so this CPU-side glue is stubbed.
+    "func_80029B80",
 ]
 
 # Functions the recompiler should not emit (runtime provides its own version).
 ignored = [
     #"__osPfsReleasePages",
+    # NOTE: do NOT list standard libultra here. N64Recomp has a built-in ignored/
+    # reimplemented set (see N64Recomp/src/symbol_lists.cpp) that auto-handles libultra by
+    # NAME — just naming a function `osCreateThread` etc. in syms/dump.toml (via the RENAME
+    # map in tools/gen_symbols.py) makes the recompiler skip it and the runtime provide it.
+    # This list is only for project-specific functions to ignore.
 ]
 
-# Replace the MIPS `cache` instructions (cache management) with nop. The recompiler
-# can't emit `cache`, and cache coherency is a no-op on the host, so this is correct
-# while preserving each function's real copy/DMA logic. (9 sites, 4 functions.)
+# (The former `cache`-instruction nop patches were removed: the 4 cache functions are now
+# named osInvalDCache/osInvalICache/osWritebackDCache/osWritebackDCacheAll in
+# tools/gen_symbols.py, so the recompiler auto-ignores them and the runtime provides them —
+# their `cache` instructions are never recompiled. Add real [[patches.instruction]] here if
+# a specific bug needs a single-instruction fix.)
+
+# Idle-thread cooperative-yield fix.
+# The idle thread func_800004AC, after spawning the managers and lowering its own priority,
+# busy-spins as `L_80000584: jal func_80011BF0 (PRNG); b L_80000584`. The backward branch
+# (0x8000058C) targets the jal, NOT itself, so N64Recomp does NOT inject the `pause_self()`
+# it emits only for self-branches (`b .`, where branch_target == instr_vram; see
+# N64Recomp/src/recompilation.cpp). In ultramodern's COOPERATIVE (non-preemptive) scheduler
+# this spin makes no syscall, so it never yields and monopolizes the CPU the moment boot
+# setup finishes — external messages (VI retrace) are then never processed and the whole
+# frame pipeline deadlocks a few frames in (scheduler func_80000CBC stuck on its 0x8003CAB8
+# recv, overlay func_800033E8 stuck on frame-done). On real N64 the idle thread relies on
+# interrupt preemption, which doesn't exist here.
+# Fix: rewrite the branch at 0x8000058C into a self-branch (`b .` = 0x1000FFFF) so the
+# recompiler emits pause_self(), which perpetually drains external messages and yields to
+# higher-priority threads — exactly the right idle-thread behavior. (The idle thread now runs
+# the PRNG once instead of forever; harmless — 21 other callers churn the same seed.)
 [[patches.instruction]]
-func = "func_80011D70"
-vram = 0x80011DAC
-value = 0x00000000
-[[patches.instruction]]
-func = "func_80011D70"
-vram = 0x80011DD0
-value = 0x00000000
-[[patches.instruction]]
-func = "func_80011D70"
-vram = 0x80011DE0
-value = 0x00000000
-[[patches.instruction]]
-func = "func_80011D70"
-vram = 0x80011E04
-value = 0x00000000
-[[patches.instruction]]
-func = "func_80012040"
-vram = 0x80012078
-value = 0x00000000
-[[patches.instruction]]
-func = "func_80012040"
-vram = 0x8001209C
-value = 0x00000000
-[[patches.instruction]]
-func = "func_800128B0"
-vram = 0x800128C0
-value = 0x00000000
-[[patches.instruction]]
-func = "func_80013C80"
-vram = 0x80013CB8
-value = 0x00000000
-[[patches.instruction]]
-func = "func_80013C80"
-vram = 0x80013CDC
-value = 0x00000000
+func = "func_800004AC"
+vram = 0x8000058C
+value = 0x1000FFFF
+# [DIAGNOSTIC RESULT 2026-06-11] A temporary patch forcing func_800C34E8's scene-draw path
+# (0x800C355C imm 1->2, defeating the a0==1 draw-skip at 0x800C3564) did NOT produce visible
+# output — still black. Conclusion: overlay B's scene is genuinely EMPTY (the game hasn't
+# populated any geometry), so the black screen is an upstream game-state stall, not the draw
+# gate. Patch reverted.
