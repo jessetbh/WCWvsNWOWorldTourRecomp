@@ -426,6 +426,9 @@ int main(int argc, char** argv) {
     // the gfx thread throws "General config has not been created yet" -> std::terminate.
     // (We skip the launcher UI but still need the config state. Mirrors BMHero init_config.)
     recompui::config::GeneralTabOptions general_options{};
+    // WCW never uses the Rumble Pak (it's a Controller Pak game and the port emulates a
+    // mempak in port 1), so hide the dead Rumble Strength slider.
+    general_options.has_rumble_strength = false;
     recompui::config::create_general_tab(general_options);
     recompui::config::create_graphics_tab();
     recompui::config::create_controls_tab();

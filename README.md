@@ -40,7 +40,8 @@ a 32 KB pak in port 1 backed by the standard recomp save file.
 | 4 | **Patches build foundation** (data symbols, MIPS cross-compile, RECOMP_PATCH verified in-game) | ✅ done |
 | 4 | **Widescreen** (game-side projection patch + host aspect API, Aspect Ratio: Expand) | ✅ done |
 | 4 | **Overscan-edge crop** (CRT-style per-edge crop; garbage line at frame top gone) | ✅ done |
-| 4 | More PC enhancements (high-FPS interpolation, input options) | 🔶 next |
+| 4 | **Input options** (in-game config menu — Esc/gamepad Back; rebinding verified, persists) | ✅ done |
+| 4 | More PC enhancements (high-FPS interpolation) | 🔶 next |
 
 Getting here required fixing two runtime-stack bugs that likely affect other recomp
 projects too (documented in `disasm/libultra.md`, fixes tagged `[wcw fix]` in `lib/`):
@@ -63,6 +64,10 @@ plan; [`BUILDING.md`](BUILDING.md) for how to build and run it today.
   with a correctly widened FOV (the game's single projection-setup function is patched
   to take the display ratio; 2D stays 4:3-anchored). The first real gameplay patch —
   `patches/widescreen.c`.
+- **In-game options menu**: press Esc (or the gamepad Back/Select button) during play to
+  open the config menu — General (deadzone, background input), Graphics, Controls (full
+  N64 button/stick rebinding for keyboard and controller, two slots per input), Sound.
+  Changes persist next to the exe (`controls.json` etc.).
 - `splat` disassembly of the ROM (`disasm/`), with the overlay table decoded.
 - `N64Recomp` recompiles the whole game to C with `tools/recompile.ps1`; the fast
   edit-compile-run loop is `tools/cycle.ps1`.

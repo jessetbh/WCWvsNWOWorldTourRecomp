@@ -1,5 +1,5 @@
 diff --git a/recompui/src/base/ui_state.cpp b/recompui/src/base/ui_state.cpp
-index 277a421..7c800ae 100644
+index 277a421..f5d6ad6 100644
 --- a/recompui/src/base/ui_state.cpp
 +++ b/recompui/src/base/ui_state.cpp
 @@ -659,6 +659,16 @@ void draw_hook(plume::RenderCommandList* command_list, plume::RenderFramebuffer*
@@ -19,6 +19,19 @@ index 277a421..7c800ae 100644
  
      std::lock_guard lock{ ui_state_mutex };
  
+@@ -838,6 +848,12 @@ void draw_hook(plume::RenderCommandList* command_list, plume::RenderFramebuffer*
+             }
+ 
+             if (open_config) {
++                // [wcw] one-shot marker: confirms the esc/menu-button -> config path fired in-game.
++                static bool wcw_logged_open = false;
++                if (!wcw_logged_open) {
++                    wcw_logged_open = true;
++                    fprintf(stderr, "[wcw][ui] config menu opened (esc/menu button)\n");
++                }
+                 recompui::config::open();
+             }
+         }
 diff --git a/recompui/src/config/ui_config_tab_graphics.cpp b/recompui/src/config/ui_config_tab_graphics.cpp
 index 4fdf81f..71192bc 100644
 --- a/recompui/src/config/ui_config_tab_graphics.cpp
