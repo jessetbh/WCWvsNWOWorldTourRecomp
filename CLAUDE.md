@@ -519,51 +519,44 @@ Still NOT done (later phases):
   whole 3D scene in one workload, which is why they looked fine. **Fix**: default Framerate
   = `RefreshRate::Original` (`[wcw fix]` in recompui `ui_config_tab_graphics.cpp`; also flipped
   the user's saved `build-msvc/graphics.json` since saved config overrides the default).
-  Verified: 0 black presents, title screen pixel-perfect via BMP dump. Display-mode flicker
-  itself FIXED 2026-07-05 — see the ✅ "DISPLAY FRAMERATE / FRAME INTERPOLATION" bullet
-  (multi-workload frame detection is DONE). Capture tooling upgraded:
-  `WCW_BMP_START`/`WCW_BMP_COUNT`/`WCW_LUM_END`
+  Verified: 0 black presents, title screen pixel-perfect via BMP dump. Capture tooling
+  upgraded: `WCW_BMP_START`/`WCW_BMP_COUNT`/`WCW_LUM_END`
   env vars aim the present-BMP dump window at any moment (defaults 600/13/1500). Known minor
   artifact: overscan-edge garbage rows (thin line top, speckle bottom-left) — CRT-hidden on
   hardware; polish later.
-- ✅ **DISPLAY FRAMERATE / FRAME INTERPOLATION FIXED (2026-07-05, verified via readback).**
-  Framerate=Display used to flicker (black presents). THREE stacked root causes, all fixed in
-  lib/rt64 (`[wcw fix]`, exported to lib-patches):
-  1. **Multi-workload frame grouping** (the old rt64_workload_queue.cpp "1 workload = 1 frame"
-     TODO): the render thread now accumulates all workloads sharing a `presentId` (measured via
-     new `WCW_FRAME_LOG=1` → wcw_frame_log.csv: menus build a frame from 3-7 RSP tasks; matches
-     1-2) into ONE GameFrame (`GameFrame::set/match/threadRenderFrame` already supported
-     multi-workload frames). Boundary = next workload with a different presentId, OR
-     `notifyFrameEnd` (new: `State::advancePresent` reports {coveredWorkloadId, VI fb address}
-     to the WorkloadQueue), OR group cap `WORKLOAD_QUEUE_MAX_GROUP`=8. Ring bumped 4→24
-     (`WORKLOAD_QUEUE_SIZE`); the barrier is now PARKED on the group's first slot
-     (`threadSetBarrier`) so the whole prev group survives as matching prevFrame (advancing +1
-     per workload would let the game overwrite it). `WCW_NO_GROUP=1` restores old behavior.
-     Required 3 fixes in GameFrame matching for variable group sizes (crash otherwise —
-     empty-map OOB in matchScene): maps sized unconditionally, scenes may not span workloads,
-     scene pairing restricted to positional partners.
-  2. **Interpolation target picked the WRONG framebuffer** (found via new `WCW_INTERP_LOG=1`
-     correlation of generation vs presented luminance): WCW pre-clears the NEXT buffer as the
-     LAST fbPair of each frame, and the backward target scan picked that pre-cleared buffer →
-     every interpolated frame re-rendered only a black clear (this — not menus — was the
-     dominant match/title-phase flicker; pre-existing, NOT caused by grouping; MSAA-independent).
-     Fix: detection prefers the candidate whose colorImage.address == the present's VI fb
-     address (carried by notifyFrameEnd, `frameEndFbAddresses` deque), bypassing the
-     `interpolationEnabled` guess for that pair (the flag ping-pongs exactly wrong for
-     triple-buffered pre-clear games).
-  3. **Override target started undefined (white)**: the frame's own workloads contain no clear
-     (it happened in the PREVIOUS frame), so non-MSAA interpolated re-renders drew on white.
-     Fix: prime the override target by copyTextureRegion from the live target before re-render.
-     (`copyFromTarget` is cross-format-only — same-format copy null-crashes in Release.)
-  **Verified** (2560x1440@143, swapchain readback, full attract cycle ~115s each): Original
-  mode regression-clean (0 dips); Display+MSAA4X (user config): 4 dips/115s vs ~100+/10s
-  before, 0 crash, ~65 presents/s in stable-30fps scenes, consecutive title-orbit BMPs correct.
-  Present rate is ~65/s not 143 (interpolated frames get skipped when the next frame is already
-  queued — `skipWorkloadNow`); raising it + interpolation QUALITY during fast motion (heuristic
-  MVP matching can mispair on similar objects — seen once as warped spotlight cones on the
-  title with MSAA off) remain Phase-4 polish: matrix-group patches (stable matrix IDs from the
-  game side) are the proper fix, as WCW is G_FORCEMTX-only (worldTransforms are full MVPs).
-  graphics.json now ships rr_option=Display + MSAA4X.
+- ❌➡️🔒 **DISPLAY FRAMERATE / FRAME INTERPOLATION: ATTEMPTED, REVERTED, OPTION LOCKED
+  (2026-07-05).** A full fix for the Framerate=Display black-frame flicker was built and
+  readback-verified (multi-workload frame grouping in rt64_workload_queue + present-fb-address
+  interpolation-target selection + override-target priming — the complete implementation and
+  analysis live in **git history at commit `bd35fac`**, lib-patches/rt64.patch of that commit),
+  but was **reverted the same day**: with flicker gone, the interpolated frames instead WARP
+  GEOMETRY ("polygons bounce all over" — user-reported unplayable in real gameplay). Root
+  cause of the warping is fundamental, not a bug: WCW is **G_FORCEMTX-only**, so RT64's
+  worldTransforms are full pre-multiplied MVPs and its heuristic transform matching
+  (position/orientation/screen-space metrics meant for model matrices) mispairs them —
+  interpolation then lerps between unrelated matrices. **The proper fix is Phase-4 matrix-group
+  patches** (game-side stable matrix IDs via G_EX, requires locating WCW's CPU matrix
+  composition sites) — anyone reattempting should START from `bd35fac`, whose three findings
+  remain valid and readback-verified:
+  1. WCW builds one visual frame from 1-7 RSP workloads (menus most, matches least); grouping
+     by shared `presentId` + a present-submission signal works and needs GameFrame matching
+     hardened for variable group sizes (empty-map OOB crashes in matchScene otherwise).
+  2. The interpolation target MUST be the present's VI fb: WCW pre-clears the NEXT buffer as
+     each frame's LAST fbPair, so RT64's backward candidate scan reliably picks the wrong
+     buffer (→ black re-renders), and `interpolationEnabled` ping-pongs exactly wrong for
+     triple-buffered pre-clear games.
+  3. Interpolated override targets start undefined (the game's clear lives in the PREVIOUS
+     frame's workloads) and must be primed from the live target (`copyTextureRegion`;
+     `RenderTarget::copyFromTarget` is cross-format-only and null-crashes on same-format).
+  **Current state**: lib/rt64 reverted to the pre-`bd35fac` patch set (verified: Original-mode
+  readback clean, 30/s, 0 crash). **Framerate is LOCKED to Original** in recompui
+  `ui_config_tab_graphics.cpp` (`[wcw fix]`, in lib-patches/RecompFrontend.patch): the UI
+  control is disabled (grayed, with an explanatory description) AND `on_json_parse_option`
+  coerces any saved `rr_option` back to Original — covers stale graphics.json AND its .bak
+  (the backup-fallback loader bit us before with controls.json). Lock verified end to end: with
+  `"rr_option": "Display"` planted in graphics.json, the game runs at Original rates (300
+  presents/10s max vs 550-680 when Display was live). Diagnostics `WCW_FRAME_LOG=1` /
+  `WCW_INTERP_LOG=1` were reverted with the rt64 changes (re-add from `bd35fac` if needed).
 - ✅ **A/V "FLICKERING" BOTH FIXED (2026-07-04).** Two independent root causes:
   1. **Audio crackle = constant SDL underruns** (~22/s: the device queue hit 0 on half the
      batches; gaps up to 79ms vs 46ms buffered). WCW registers NO AI event (verified:

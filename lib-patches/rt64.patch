@@ -92,125 +92,11 @@ index 785de27..cb5f3b9 100644
          screenApiProfiler.logAndRestart();
          state->updateScreen(core.decodeVI(), false);
      }
-diff --git a/src/hle/rt64_game_frame.cpp b/src/hle/rt64_game_frame.cpp
-index 87392d0..9cef941 100644
---- a/src/hle/rt64_game_frame.cpp
-+++ b/src/hle/rt64_game_frame.cpp
-@@ -48,6 +48,13 @@ namespace RT64 {
-         const FramebufferPair &fbPair = workload.fbPairs[proj.fbPairIndex];
-         const Projection &fbProj = fbPair.projections[proj.projectionIndex];
-         const GameIndices::Projection &firstProj = scene.projections.front();
-+        // [wcw fix] Scenes must not span workloads. matchScene/matchTransform index every
-+        // per-scene map (viewProjections, transforms, prevTransformsMapped, ...) through the
-+        // scene's FIRST projection's workload only, so a scene mixing workloads reads maps
-+        // with indices from a different workload (out of bounds with multi-workload frames).
-+        if (firstProj.workloadIndex != proj.workloadIndex) {
-+            return false;
-+        }
-         if (!areFramebufferPairsCompatible(workloadQueue, { firstProj.workloadIndex, firstProj.fbPairIndex }, { proj.workloadIndex, proj.fbPairIndex })) {
-             return false;
-         }
-@@ -261,17 +268,12 @@ namespace RT64 {
-         workloadsModified.clear();
- 
-         for (uint32_t w = 0; w < workloads.size(); w++) {
--            if (w >= prevFrame.workloads.size()) {
--                continue;
--            }
--
--            // We assume the workloads will be detected in the same order between frames.
-+            // [wcw fix] Size the current workload's maps UNCONDITIONALLY. With multi-workload
-+            // frames the group size varies between frames, and matchScene indexes these vectors
-+            // for any workload that ends up in a scene — a workload without a positional partner
-+            // in the previous frame used to keep empty vectors (out-of-bounds access).
-             GameFrameMap::WorkloadMap &workloadMap = frameMap.workloads[workloads[w]];
--            workloadMap.prevWorkloadIndex = prevFrame.workloads[w];
--            workloadMap.mapped = true;
--
-             Workload &curWorkload = workloadQueue.workloads[workloads[w]];
--            const Workload &prevWorkload = workloadQueue.workloads[workloadMap.prevWorkloadIndex];
-             workloadMap.viewProjections.clear();
-             workloadMap.viewProjections.resize(curWorkload.drawData.viewProjTransforms.size());
-             workloadMap.transforms.clear();
-@@ -281,10 +283,20 @@ namespace RT64 {
-             workloadMap.lookAt.clear();
-             workloadMap.lookAt.resize(curWorkload.drawData.rspLookAt.size());
-             workloadMap.prevTransformsMapped.clear();
--            workloadMap.prevTransformsMapped.resize(prevWorkload.drawData.worldTransforms.size());
-             workloadMap.prevTilesMapped.clear();
--            workloadMap.prevTilesMapped.resize(prevWorkload.drawData.rdpTiles.size());
-             workloadMap.prevLookAtMapped.clear();
-+
-+            if (w >= prevFrame.workloads.size()) {
-+                continue;
-+            }
-+
-+            // We assume the workloads will be detected in the same order between frames.
-+            workloadMap.prevWorkloadIndex = prevFrame.workloads[w];
-+            workloadMap.mapped = true;
-+
-+            const Workload &prevWorkload = workloadQueue.workloads[workloadMap.prevWorkloadIndex];
-+            workloadMap.prevTransformsMapped.resize(prevWorkload.drawData.worldTransforms.size());
-+            workloadMap.prevTilesMapped.resize(prevWorkload.drawData.rdpTiles.size());
-             workloadMap.prevLookAtMapped.resize(prevWorkload.drawData.rspLookAt.size());
- 
-             buildTransformIdMap(curWorkload, curWorkload.transformIdMap, curWorkload.transformIgnoredIds);
-@@ -328,6 +340,19 @@ namespace RT64 {
-             }
-         }
- 
-+        // [wcw fix] Scene pairing must respect the positional workload mapping established above:
-+        // every per-scene prev map (prevTransformsMapped, ...) is sized for the POSITIONAL prev
-+        // partner, so pairing scenes across positions reads maps of the wrong workload.
-+        auto positionOf = [](const std::vector<uint32_t> &v, uint32_t slot) {
-+            for (size_t i = 0; i < v.size(); i++) {
-+                if (v[i] == slot) {
-+                    return int(i);
-+                }
-+            }
-+
-+            return -1;
-+        };
-+
-         thread_local std::vector<MatchCandidate> matchCandidates;
-         thread_local std::vector<bool> curScenesMatched;
-         thread_local std::vector<bool> prevScenesMatched;
-@@ -336,6 +361,7 @@ namespace RT64 {
-             matchCandidates.clear();
-             for (uint32_t i = 0; i < curScenes.size(); i++) {
-                 const GameIndices::Projection curFirstProj = curScenes[i].projections[0];
-+                const int curPosition = positionOf(workloads, curFirstProj.workloadIndex);
-                 const Workload &curWorkload = workloadQueue.workloads[curFirstProj.workloadIndex];
-                 const FramebufferPair &curFbPair = curWorkload.fbPairs[curFirstProj.fbPairIndex];
-                 const Projection &curProj = curFbPair.projections[curFirstProj.projectionIndex];
-@@ -343,6 +369,11 @@ namespace RT64 {
-                 const hlslpp::float4x4 &curProjTransform = curWorkload.drawData.projTransforms[curProj.transformsIndex];
-                 for (uint32_t j = 0; j < prevScenes.size(); j++) {
-                     const GameIndices::Projection prevFirstProj = prevScenes[j].projections[0];
-+                    // [wcw fix] See positionOf above: only positional partners may pair.
-+                    if (curPosition != positionOf(prevFrame.workloads, prevFirstProj.workloadIndex)) {
-+                        continue;
-+                    }
-+
-                     const Workload &prevWorkload = workloadQueue.workloads[prevFirstProj.workloadIndex];
-                     const FramebufferPair &prevFbPair = prevWorkload.fbPairs[prevFirstProj.fbPairIndex];
-                     const Projection &prevProj = prevFbPair.projections[prevFirstProj.projectionIndex];
 diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
-index 3227ab1..299dea8 100644
+index 3227ab1..2710429 100644
 --- a/src/hle/rt64_present_queue.cpp
 +++ b/src/hle/rt64_present_queue.cpp
-@@ -92,6 +92,10 @@ namespace RT64 {
-         presentThread = new std::thread(&PresentQueue::threadLoop, this);
-     }
- 
-+    // [wcw] DIAGNOSTIC (WCW_INTERP_LOG=1): shared logger, defined in rt64_workload_queue.cpp.
-+    FILE *wcwInterpLogFile();
-+    void wcwInterpLog(char side, const char *tag, int64_t a, int64_t b, int64_t c);
-+
-     void PresentQueue::threadPresent(const Present &present, bool &swapChainValid) {
-         FramebufferManager &fbManager = ext.sharedResources->framebufferManager;
-         RenderTargetManager &targetManager = ext.sharedResources->renderTargetManager;
-@@ -116,8 +120,14 @@ namespace RT64 {
+@@ -116,6 +116,8 @@ namespace RT64 {
  
          RenderTarget *colorTarget = nullptr;
          int32_t framesToPresent = 1;
@@ -218,14 +104,8 @@ index 3227ab1..299dea8 100644
 +        uint32_t wcw_addr = 0; // [wcw] DIAGNOSTIC: address of the fb actually presented
          bool lockedWorkloadMutex = false;
          InterpolatedFrameCounters &frameCounters = ext.sharedResources->interpolatedFrames[ext.sharedResources->interpolatedFramesIndex];
-+        if (wcwInterpLogFile() != nullptr) {
-+            wcwInterpLog('P', "enter", (int64_t)present.presentId, (int64_t)ext.sharedResources->interpolatedFramesIndex,
-+                (int64_t)frameCounters.count * 1000000 + (int64_t)frameCounters.available * 1000 + (int64_t)frameCounters.presented);
-+        }
  
-         // TODO: There's a possible race condition interactions that can happen while the workload
-         // queue is rendering extra frames and the present event is processed while it's generating
-@@ -127,6 +137,15 @@ namespace RT64 {
+@@ -127,6 +129,15 @@ namespace RT64 {
          
          // Perform any external write operations indicated by the event.
          if (!present.fbOperations.empty()) {
@@ -241,7 +121,7 @@ index 3227ab1..299dea8 100644
              const std::scoped_lock lock(screenFbChangePoolMutex);
              {
                  RenderWorkerExecution workerExecution(ext.presentGraphicsWorker);
-@@ -194,9 +213,27 @@ namespace RT64 {
+@@ -194,9 +205,27 @@ namespace RT64 {
                      ext.sharedResources->workloadMutex.lock();
                  }
  
@@ -269,7 +149,7 @@ index 3227ab1..299dea8 100644
                      // If a depth framebuffer is about to be shown, convert it to color.
                      if (presentFb->isLastWriteDifferent(Framebuffer::Type::Color)) {
                          RenderTargetKey otherColorTargetKey(presentFb->addressStart, presentFb->width, presentFb->siz, presentFb->lastWriteType);
-@@ -210,6 +247,7 @@ namespace RT64 {
+@@ -210,6 +239,7 @@ namespace RT64 {
                  }
                  else {
                      colorTarget = nullptr;
@@ -277,7 +157,7 @@ index 3227ab1..299dea8 100644
                  }
  
                  if (!present.paused && (viHistory.top().vi != present.screenVI)) {
-@@ -219,6 +257,13 @@ namespace RT64 {
+@@ -219,6 +249,13 @@ namespace RT64 {
              else {
                  uint32_t fbAddress = present.screenVI.fbAddress();
  
@@ -291,7 +171,7 @@ index 3227ab1..299dea8 100644
                  // Use a scratch framebuffer to upload the RAM to the render target.
                  hlslpp::uint2 fbSize = present.screenVI.fbSize();
                  scratchFb.addressStart = fbAddress;
-@@ -266,6 +311,10 @@ namespace RT64 {
+@@ -266,6 +303,10 @@ namespace RT64 {
              }
          }
          
@@ -302,15 +182,8 @@ index 3227ab1..299dea8 100644
          for (int32_t i = 0; i < framesToPresent; i++) {
              uint32_t frameCountersNextPresented = 0;
              if ((framesToPresent > 1) && (usingMSAA || (i > 0))) {
-@@ -297,10 +346,18 @@ namespace RT64 {
-                 frameCountersNextPresented = frameCounters.count;
-             }
+@@ -299,8 +340,11 @@ namespace RT64 {
  
-+            if (wcwInterpLogFile() != nullptr) {
-+                wcwInterpLog('P', "blit", (int64_t)i * 1000 + framesToPresent, (int64_t)(intptr_t)colorTarget,
-+                    (int64_t)frameCounters.available * 1000 + (int64_t)frameCounters.skipped);
-+            }
-+
              uint32_t swapChainIndex = 0;
              const bool presentFrame = (i < framesToPresent) && swapChainValid;
 +            double wcwAcqMs = 0.0;
@@ -321,7 +194,7 @@ index 3227ab1..299dea8 100644
              }
  
              if (presentFrame && swapChainValid) {
-@@ -340,6 +397,20 @@ namespace RT64 {
+@@ -340,6 +384,20 @@ namespace RT64 {
                      }
                  }
                  
@@ -342,7 +215,7 @@ index 3227ab1..299dea8 100644
                  commandList->setFramebuffer(swapChainFramebuffer);
                  commandList->clearColor();
  
-@@ -358,7 +429,38 @@ namespace RT64 {
+@@ -358,7 +416,38 @@ namespace RT64 {
                      if (inspector != nullptr) {
                          inspector->draw(commandList);
                      }
@@ -382,7 +255,7 @@ index 3227ab1..299dea8 100644
                      commandList->barriers(RenderBarrierStage::NONE, RenderTextureBarrier(swapChainTexture, RenderTextureLayout::PRESENT));
                      commandList->end();
                      const RenderCommandList *commandList = ext.presentGraphicsWorker->commandList.get();
-@@ -366,6 +468,44 @@ namespace RT64 {
+@@ -366,6 +455,44 @@ namespace RT64 {
                      RenderCommandSemaphore *signalSemaphore = drawSemaphores[swapChainIndex].get();
                      ext.presentGraphicsWorker->commandQueue->executeCommandLists(&commandList, 1, &waitSemaphore, 1, &signalSemaphore, 1, ext.presentGraphicsWorker->commandFence.get());
                      ext.presentGraphicsWorker->wait();
@@ -427,7 +300,7 @@ index 3227ab1..299dea8 100644
                  }
              }
  
-@@ -460,6 +600,18 @@ namespace RT64 {
+@@ -460,6 +587,18 @@ namespace RT64 {
                      processCursor = threadCursor;
                      threadCursor = (threadCursor + 1) % presents.size();
                      skipPresent = (writeCursor != threadCursor);
@@ -582,7 +455,7 @@ index ee2030b..cdba99d 100644
          const uint32_t cycleType = state->rdp->otherMode.cycleType();
          assert(cycleType != G_CYC_COPY);
 diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
-index d249a97..51b2ed5 100644
+index d249a97..24a228b 100644
 --- a/src/hle/rt64_state.cpp
 +++ b/src/hle/rt64_state.cpp
 @@ -1747,6 +1747,21 @@ namespace RT64 {
@@ -628,44 +501,6 @@ index d249a97..51b2ed5 100644
          if (newVI.visible()) {
              // See if there's an existing framebuffer that lines up with the VI. If there is, we support reading 
              // CPU changes directly to it and recreating them in the render thread at low resolution.
-@@ -2627,17 +2656,37 @@ namespace RT64 {
-         }
-     }
- 
-+    // [wcw] DIAGNOSTIC (WCW_FRAME_LOG=1): submission-order log of workloads (W) and presents (P)
-+    // with their ids, to measure how many workloads make up one game frame (presentId groups).
-+    static void wcwFrameLog(char kind, uint64_t wId, uint64_t pId, uint32_t extra) {
-+        static const bool on = getenv("WCW_FRAME_LOG") != nullptr;
-+        if (!on) return;
-+        static FILE *f = nullptr;
-+        if (f == nullptr) f = fopen("wcw_frame_log.csv", "w");
-+        if (f != nullptr) {
-+            double ms = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 1000.0;
-+            fprintf(f, "%.1f,%c,%llu,%llu,0x%X\n", ms, kind, (unsigned long long)wId, (unsigned long long)pId, extra);
-+            fflush(f);
-+        }
-+    }
-+
-     void State::advanceWorkload(Workload &workload, bool paused) {
-         workload.workloadId = ++workloadId;
-         workload.presentId = presentId;
-         workload.debuggerCamera = debuggerInspector.camera;
-         workload.debuggerRenderer = debuggerInspector.renderer;
-         workload.paused = paused;
-+        wcwFrameLog('W', workload.workloadId, workload.presentId, (workload.fbPairCount > 0) ? workload.fbPairs[0].colorImage.address : 0);
-     }
- 
-     void State::advancePresent(Present &present, bool paused) {
-         present.presentId = ++presentId;
-         present.workloadId = workloadId;
-+        wcwFrameLog('P', present.workloadId, present.presentId, present.screenVI.fbAddress());
-+        // [wcw fix] Tell the workload queue the game frame is complete: every workload submitted
-+        // so far belongs to a frame that is now being presented (multi-workload frame grouping).
-+        // The VI fb address lets the group pick the presented fb as its interpolation target.
-+        ext.workloadQueue->notifyFrameEnd(present.workloadId, present.screenVI.visible() ? present.screenVI.fbAddress() : 0);
-         present.paused = paused;
-         present.debuggerFramebuffer.address = debuggerInspector.renderer.framebufferAddress;
-         present.debuggerFramebuffer.view = (debuggerInspector.renderer.framebufferIndex >= 0);
 diff --git a/src/hle/rt64_vi.cpp b/src/hle/rt64_vi.cpp
 index a870166..bc0aec8 100644
 --- a/src/hle/rt64_vi.cpp
@@ -713,68 +548,10 @@ index a870166..bc0aec8 100644
              const bool interlacedStep = status.serrate && (vCurrentLine & 0x1);
              const uint32_t rowBytes = width * (1U << (siz - 1));
 diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
-index 5a331aa..2ea2679 100644
+index 5a331aa..ea37684 100644
 --- a/src/hle/rt64_workload_queue.cpp
 +++ b/src/hle/rt64_workload_queue.cpp
-@@ -11,6 +11,22 @@
- #define ENABLE_HIGH_RESOLUTION_RENDERER 1
- 
- namespace RT64 {
-+    // [wcw] DIAGNOSTIC (WCW_INTERP_LOG=1): shared trace of interpolated-frame generation and
-+    // presentation, to correlate black interpolated presents with their generation.
-+    FILE *wcwInterpLogFile() {
-+        static FILE *f = (getenv("WCW_INTERP_LOG") != nullptr) ? fopen("wcw_interp_log.csv", "w") : nullptr;
-+        return f;
-+    }
-+
-+    void wcwInterpLog(char side, const char *tag, int64_t a, int64_t b, int64_t c) {
-+        FILE *f = wcwInterpLogFile();
-+        if (f != nullptr) {
-+            double ms = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 1000.0;
-+            fprintf(f, "%.1f,%c,%s,%lld,%lld,%lld\n", ms, side, tag, (long long)a, (long long)b, (long long)c);
-+            fflush(f);
-+        }
-+    }
-+
-     // WorkloadQueue
- 
-     WorkloadQueue::WorkloadQueue() {
-@@ -45,6 +61,25 @@ namespace RT64 {
-         barrierCursor = int(workloads.size()) - 1;
-         workloadId = 0;
-         lastPresentId = 0;
-+        frameEndWorkloadId = 0;
-+        frameEndFbAddresses.clear();
-+    }
-+
-+    // [wcw fix] Called by State::advancePresent (game thread) when a present event is submitted.
-+    // Any pending workload group whose last workload is covered by the present is a complete
-+    // game frame; wake the render thread so it can process it. The present's VI fb address is
-+    // recorded so the group can pick the fb that will actually be shown as its interpolation target.
-+    void WorkloadQueue::notifyFrameEnd(uint64_t coveredWorkloadId, uint32_t viFbAddress) {
-+        {
-+            const std::scoped_lock lock(cursorMutex);
-+            frameEndWorkloadId = coveredWorkloadId;
-+            frameEndFbAddresses.emplace_back(coveredWorkloadId, viFbAddress);
-+            if (frameEndFbAddresses.size() > workloads.size()) {
-+                frameEndFbAddresses.pop_front();
-+            }
-+        }
-+
-+        cursorCondition.notify_all();
-     }
- 
-     void WorkloadQueue::advanceToNextWorkload() {
-@@ -291,7 +326,7 @@ namespace RT64 {
-     
-     void WorkloadQueue::threadRenderFrame(GameFrame &curFrame, const GameFrame &prevFrame, const WorkloadConfiguration &workloadConfig,
-         const DebuggerRenderer &debuggerRenderer, const DebuggerCamera &debuggerCamera, float curFrameWeight, float prevFrameWeight,
--        float deltaTimeMs, RenderTargetKey overrideTargetKey, int32_t overrideTargetFbPairIndex, RenderTarget *overrideTarget,
-+        float deltaTimeMs, RenderTargetKey overrideTargetKey, int32_t overrideTargetWorkloadSlot, int32_t overrideTargetFbPairIndex, RenderTarget *overrideTarget,
-         uint32_t overrideTargetModifier, bool uploadVelocity, bool uploadExtras, bool interpolateTiles, bool interpolateLookAts)
-     {
- #   if ENABLE_HIGH_RESOLUTION_RENDERER
-@@ -452,6 +487,22 @@ namespace RT64 {
+@@ -452,6 +452,22 @@ namespace RT64 {
                      if (colorFb != nullptr) {
                          fbKey.colorTargetKey = RenderTargetKey(colorFb->addressStart, colorFb->width, colorFb->siz, Framebuffer::Type::Color);
                          colorTarget = &targetManager.get(fbKey.colorTargetKey);
@@ -797,61 +574,7 @@ index 5a331aa..2ea2679 100644
                      }
                      else {
                          colorTarget = nullptr;
-@@ -462,6 +513,11 @@ namespace RT64 {
-                         fbKey.modifierKey = overrideTargetModifier;
-                     }
- 
-+                    if ((overrideTarget != nullptr) && (wcwInterpLogFile() != nullptr)) {
-+                        // [wcw] DIAGNOSTIC: did the re-render actually route this fbPair into the override target?
-+                        wcwInterpLog('W', "ovr-route", (int64_t)colorImg.address, (int64_t)(colorTarget == overrideTarget), (int64_t)(intptr_t)colorTarget);
-+                    }
-+
-                     fixedResScale = RenderTarget::computeFixedResolutionScale(colorImg.width, fixedResScale);
-                     RenderTarget::computeScaledSize(nativeColorWidth, nativeColorHeight, fixedResScale, targetWidth, targetHeight, targetMisalignX);
- 
-@@ -703,7 +759,28 @@ namespace RT64 {
-             ext.workloadGraphicsWorker->commandList->writeTimestamp(queryPool.get(), 0);
-             framebufferRenderer->endFramebuffers(ext.workloadGraphicsWorker, &workload.drawBuffers, &workload.outputBuffers, workloadConfig.raytracingEnabled);
-             framebufferRenderer->recordSetup(ext.workloadGraphicsWorker, bufferUploaders, processRSP ? rspProcessor.get() : nullptr, processWorldVertices ? vertexProcessor.get() : nullptr, &workload.outputBuffers, workloadConfig.raytracingEnabled);
--            
-+
-+            // [wcw fix] Prime the override target with the live target's content before the
-+            // re-rendered pairs draw into it. Games that pre-clear each buffer in the PREVIOUS
-+            // frame's workloads (WCW) submit no clear in the current frame, so a fresh override
-+            // target would keep undefined (white) content behind the re-rendered geometry.
-+            // (Plain texture copy: copyFromTarget only supports cross-format color<->depth.)
-+            if ((w == 0) && (overrideTarget != nullptr) && !usingMSAA) {
-+                RenderTarget &liveTarget = targetManager.get(overrideTargetKey, true);
-+                if (!liveTarget.isEmpty()) {
-+                    overrideTarget->resize(ext.workloadGraphicsWorker, liveTarget.width, liveTarget.height);
-+                    RenderTextureBarrier primeBarriers[] = {
-+                        RenderTextureBarrier(liveTarget.texture.get(), RenderTextureLayout::COPY_SOURCE),
-+                        RenderTextureBarrier(overrideTarget->texture.get(), RenderTextureLayout::COPY_DEST)
-+                    };
-+                    ext.workloadGraphicsWorker->commandList->barriers(RenderBarrierStage::COPY, primeBarriers, uint32_t(std::size(primeBarriers)));
-+                    const RenderBox primeBox(0, 0, int32_t(std::min(liveTarget.width, overrideTarget->width)), int32_t(std::min(liveTarget.height, overrideTarget->height)));
-+                    ext.workloadGraphicsWorker->commandList->copyTextureRegion(
-+                        RenderTextureCopyLocation::Subresource(overrideTarget->texture.get()),
-+                        RenderTextureCopyLocation::Subresource(liveTarget.texture.get()), 0, 0, 0, &primeBox);
-+                }
-+            }
-+
-             // Record all framebuffer pairs.
-             uint32_t framebufferIndex = 0;
-             for (uint32_t f = 0; f < fbPairCount; f++) {
-@@ -805,8 +882,9 @@ namespace RT64 {
-                         ext.workloadGraphicsWorker->commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(chosenTarget->texture.get(), RenderTextureLayout::SHADER_READ));
-                     }
- 
--                    // Do the resolve if using MSAA while target override is active and we're on the correct framebuffer pair index.
--                    if (usingMSAA && (overrideTarget != nullptr) && ((uint32_t)overrideTargetFbPairIndex == f)) {
-+                    // Do the resolve if using MSAA while target override is active and we're on the correct workload + framebuffer pair index.
-+                    // [wcw fix] With multi-workload frames the fbPair index alone is ambiguous; the interpolation target's workload slot must match too.
-+                    if (usingMSAA && (overrideTarget != nullptr) && (overrideTargetWorkloadSlot == int32_t(curFrame.workloads[w])) && ((uint32_t)overrideTargetFbPairIndex == f)) {
-                         overrideTarget->resize(ext.workloadGraphicsWorker, colorTarget->width, colorTarget->height);
-                         overrideTarget->resolveFromTarget(ext.workloadGraphicsWorker, colorTarget, ext.shaderLibrary);
-                     }
-@@ -842,6 +920,32 @@ namespace RT64 {
+@@ -842,6 +858,32 @@ namespace RT64 {
              framebufferRenderer->waitForUploaders();
              ext.workloadGraphicsWorker->execute();
              ext.workloadGraphicsWorker->wait();
@@ -884,94 +607,10 @@ index 5a331aa..2ea2679 100644
              workerMutex.unlock();
  
              // Update the GPU profiler with the results from the timestamps of the frame.
-@@ -869,6 +973,15 @@ namespace RT64 {
-         barrierCursor = (barrierCursor + 1) % workloads.size();
-     }
- 
-+    // [wcw fix] Group-aware barrier: park the barrier on the FIRST slot of the frame that was
-+    // just rendered. The submission thread stalls before reclaiming that slot, which keeps the
-+    // whole contiguous group (the next match's prevFrame) intact while freeing everything before
-+    // it. Advancing by one per workload would only protect the group's last slot.
-+    void WorkloadQueue::threadSetBarrier(int slot) {
-+        std::scoped_lock<std::mutex> cursorLock(cursorMutex);
-+        barrierCursor = slot;
-+    }
-+
-     void WorkloadQueue::threadAdvanceWorkloadId(uint64_t newWorkloadId) {
-         {
-             std::scoped_lock<std::mutex> cursorLock(workloadIdMutex);
-@@ -886,24 +999,94 @@ namespace RT64 {
-         int64_t displayTicks = 0;
-         uint32_t originalRateForTicks = 0;
-         uint32_t displayRateForTicks = 0;
--        int processCursor = -1;
-         bool frameReduction = false;
-+        // [wcw fix] Multi-workload frame grouping (the TODO further below). Games like WCW build
-+        // one game frame out of SEVERAL RSP tasks (up to ~7 in its menus), so matching one
-+        // workload to one frame makes interpolated frames re-render only a slice of the frame
-+        // (often just a pre-clear), presenting black/partial images whenever the Framerate is
-+        // above Original. Instead, accumulate every workload that shares a presentId (= all
-+        // workloads submitted between two VI swaps) into one GameFrame. A group is complete when:
-+        //   - a workload with a different presentId arrives (the next frame started), or
-+        //   - the present event covering the group's last workload is submitted (notifyFrameEnd), or
-+        //   - the group hits WORKLOAD_QUEUE_MAX_GROUP (safety flush so submission can't stall).
-+        // GameFrame::set/match and threadRenderFrame already support multi-workload frames.
-+        // Set WCW_NO_GROUP=1 to restore the old 1-workload = 1-frame behavior.
-+        static const bool groupingDisabled = getenv("WCW_NO_GROUP") != nullptr;
-+        std::vector<uint32_t> groupIndices;
-+        bool groupReady = false;
-         while (threadsRunning) {
-             {
-                 std::unique_lock<std::mutex> cursorLock(cursorMutex);
-                 cursorCondition.wait(cursorLock, [&]() {
--                    return (writeCursor != threadCursor) || !threadsRunning;
-+                    if (!threadsRunning) {
-+                        return true;
-+                    }
-+
-+                    if (writeCursor != threadCursor) {
-+                        return true;
-+                    }
-+
-+                    return !groupIndices.empty() && (frameEndWorkloadId >= workloads[groupIndices.back()].workloadId);
-                 });
- 
-                 if (threadsRunning) {
--                    processCursor = threadCursor;
--                    threadCursor = (threadCursor + 1) % workloads.size();
-+                    // Pull available workloads into the pending group, stopping at a frame boundary.
-+                    while (!groupReady && (threadCursor != writeCursor) && (groupIndices.size() < WORKLOAD_QUEUE_MAX_GROUP)) {
-+                        const Workload &incoming = workloads[threadCursor];
-+                        if (!groupIndices.empty() && (incoming.paused || (incoming.presentId != workloads[groupIndices.front()].presentId))) {
-+                            // The incoming workload belongs to the next frame; the pending group is complete.
-+                            groupReady = true;
-+                            break;
-+                        }
-+
-+                        groupIndices.push_back(uint32_t(threadCursor));
-+                        threadCursor = (threadCursor + 1) % workloads.size();
-+
-+                        // Paused (debugger) workloads are processed one at a time, like before.
-+                        if (groupingDisabled || incoming.paused) {
-+                            groupReady = true;
-+                        }
-+                    }
-+
-+                    if (!groupReady && !groupIndices.empty()) {
-+                        // A submitted present covering the group's last workload completes the frame.
-+                        // A group at the maximum size is flushed as-is.
-+                        groupReady = (frameEndWorkloadId >= workloads[groupIndices.back()].workloadId) ||
-+                                     (groupIndices.size() >= WORKLOAD_QUEUE_MAX_GROUP);
-+                    }
-                 }
-             }
- 
--            if (processCursor >= 0) {
-+            if (groupReady && !groupIndices.empty()) {
+@@ -904,6 +946,32 @@ namespace RT64 {
+             if (processCursor >= 0) {
                  std::unique_lock<std::mutex> threadLock(threadMutex);
--                Workload &workload = workloads[processCursor];
-+                Workload &workload = workloads[groupIndices.front()];
-+                Workload &lastWorkload = workloads[groupIndices.back()];
+                 Workload &workload = workloads[processCursor];
 +                // [wcw] DIAGNOSTIC: count workloads + checksum CPU-side draw data. If posFloats /
 +                // rdpParams are zeros, the interpreter->drawData conversion is broken; if real,
 +                // the GPU upload/consumption is the break.
@@ -1001,104 +640,7 @@ index 5a331aa..2ea2679 100644
                  ext.presentQueue->waitForPresentId(workload.presentId);
  
                  if (!threadsRunning) {
-@@ -915,20 +1098,42 @@ namespace RT64 {
-                 threadConfigurationUpdate(workload.viFbSize, workloadConfig);
- 
-                 // FIXME: This is a very hacky way to find out if we need to advance the frame if the workload was paused for the first time.
--                if (!workload.paused || (!gameFrames[curFrameIndex].workloads.empty() && (gameFrames[curFrameIndex].workloads[0] != (uint32_t)processCursor))) {
-+                if (!workload.paused || (!gameFrames[curFrameIndex].workloads.empty() && (gameFrames[curFrameIndex].workloads[0] != groupIndices.front()))) {
-                     prevFrameIndex = curFrameIndex;
-                     curFrameIndex = (curFrameIndex + 1) % gameFrames.size();
-                 }
--                
--                // TODO: The frame detection needs to be more elaborate than just matching one workload to one frame.
-+
-+                // [wcw fix] (was TODO: frame detection more elaborate than one workload = one frame)
-+                // The GameFrame is the whole workload group gathered above.
-                 GameFrame &curFrame = gameFrames[curFrameIndex];
-                 const GameFrame &prevFrame = gameFrames[prevFrameIndex];
--                uint32_t workloadIndex = processCursor;
--                curFrame.set(*this, &workloadIndex, 1);
-+                curFrame.set(*this, groupIndices.data(), uint32_t(groupIndices.size()));
- 
--                // Detect the color image to interpolate for this workload.
-+                // [wcw fix] Fetch the VI fb address of the present event that closed this frame.
-+                // The interpolation target MUST be the fb the present will actually show — WCW's
-+                // last fbPair is the pre-clear of the NEXT buffer, and picking it means every
-+                // interpolated frame re-renders only a black clear (verified via WCW_INTERP_LOG).
-+                uint32_t expectedFbAddress = 0;
-+                {
-+                    const std::scoped_lock cursorLock(cursorMutex);
-+                    while (!frameEndFbAddresses.empty() && (frameEndFbAddresses.front().first < lastWorkload.workloadId)) {
-+                        frameEndFbAddresses.pop_front();
-+                    }
-+
-+                    if (!frameEndFbAddresses.empty()) {
-+                        expectedFbAddress = frameEndFbAddresses.front().second;
-+                        frameEndFbAddresses.pop_front();
-+                    }
-+                }
-+
-+                // Detect the color image to interpolate for this frame, scanning the group's
-+                // workloads (and their fbPairs) from last to first. A candidate matching the
-+                // present's fb address is always preferred; the first candidate found is the
-+                // fallback when the present's address is unknown or matches no candidate.
-                 RenderTargetKey interpolationTargetKey;
-+                int32_t interpolationTargetWorkloadSlot = -1;
-                 int32_t interpolationTargetFbPairIndex = -1;
-+                bool interpolationTargetLocked = false;
-                 {
-                     std::scoped_lock<std::mutex> managerLock(ext.sharedResources->managerMutex);
-                     FramebufferManager &fbManager = ext.sharedResources->framebufferManager;
-@@ -936,8 +1141,10 @@ namespace RT64 {
-                     std::unordered_set<uint32_t> &colorSet = ext.sharedResources->colorImageAddressSet;
-                     colorVector.clear();
-                     colorSet.clear();
--                    for (int32_t f = workload.fbPairCount - 1; f >= 0; f--) {
--                        const FramebufferPair &fbPair = workload.fbPairs[f];
-+                    for (int32_t g = int32_t(groupIndices.size()) - 1; g >= 0; g--) {
-+                    const Workload &groupWorkload = workloads[groupIndices[g]];
-+                    for (int32_t f = groupWorkload.fbPairCount - 1; f >= 0; f--) {
-+                        const FramebufferPair &fbPair = groupWorkload.fbPairs[f];
-                         bool interpolationCandidate = fbPair.earlyPresentCandidate();
-                         if (fbPair.drawColorRect.isEmpty()) {
-                             continue;
-@@ -955,19 +1162,32 @@ namespace RT64 {
-                             colorSet.insert(colorImg.address);
-                         }
- 
--                        if (!interpolationCandidate || !interpolationTargetKey.isEmpty()) {
-+                        if (!interpolationCandidate || interpolationTargetLocked) {
-                             continue;
-                         }
- 
-+                        const bool matchesPresent = (expectedFbAddress != 0) && (colorImg.address == expectedFbAddress);
-+                        if (!interpolationTargetKey.isEmpty() && !matchesPresent) {
-+                            continue;
-+                        }
-+
-+                        // A pair matching the present's fb address doesn't need the interpolationEnabled
-+                        // guess: that flag ping-pongs wrong for triple-buffered games that pre-clear the
-+                        // next buffer (the scene fb was pre-cleared last frame, so the previous present
-+                        // just cleared its flag), and the guess is redundant when the presented address
-+                        // is known exactly.
-                         Framebuffer *interpolationFb = fbManager.find(colorImg.address);
--                        if ((interpolationFb != nullptr) && interpolationFb->interpolationEnabled) {
-+                        if ((interpolationFb != nullptr) && (interpolationFb->interpolationEnabled || matchesPresent)) {
-                             interpolationTargetKey.fbType = Framebuffer::Type::Color;
-                             interpolationTargetKey.address = fbPair.colorImage.address;
-                             interpolationTargetKey.siz = fbPair.colorImage.siz;
-                             interpolationTargetKey.width = fbPair.colorImage.width;
-+                            interpolationTargetWorkloadSlot = int32_t(groupIndices[g]);
-                             interpolationTargetFbPairIndex = f;
-+                            interpolationTargetLocked = matchesPresent;
-                         }
-                     }
-+                    }
-                 }
- 
-                 float prevFrameWeight = 0.0f;
-@@ -986,7 +1206,10 @@ namespace RT64 {
+@@ -986,7 +1054,10 @@ namespace RT64 {
                      matchingProfiler.log();
  
                      const bool displayRateAboveOriginal = (workload.viOriginalRate > 0) && (workloadConfig.targetRate > workload.viOriginalRate);
@@ -1110,121 +652,6 @@ index 5a331aa..2ea2679 100644
  
                      const bool resetTicks = !generateInterpolatedFrames || (originalRateForTicks != workload.viOriginalRate) || (displayRateForTicks != workloadConfig.targetRate) || !displayRateAboveOriginal;
                      if (resetTicks) {
-@@ -1077,6 +1300,13 @@ namespace RT64 {
-                         }
-                     }
- 
-+                    if ((frame == 0) && (wcwInterpLogFile() != nullptr)) {
-+                        wcwInterpLog('W', "group", (int64_t)lastWorkload.presentId, (int64_t)groupIndices.size(), (int64_t)displayFrames);
-+                        wcwInterpLog('W', "counters", (int64_t)ext.sharedResources->interpolatedFramesIndex, (int64_t)curFrameCounters.count, (int64_t)generateInterpolatedFrames);
-+                        wcwInterpLog('W', "target", (int64_t)interpolationTargetKey.address, (int64_t)interpolationTargetWorkloadSlot, (int64_t)interpolationTargetFbPairIndex);
-+                        wcwInterpLog('W', "expect", (int64_t)expectedFbAddress, (int64_t)interpolationTargetLocked, 0);
-+                    }
-+
-                     RenderTarget *overrideTarget = nullptr;
-                     uint32_t overrideModifier = 0;
-                     if (generateInterpolatedFrames) {
-@@ -1118,14 +1348,18 @@ namespace RT64 {
- 
-                     int64_t renderTimeMicro = workloadTimer.elapsedMicroseconds();
-                     threadRenderFrame(curFrame, prevFrame, workloadConfig, workload.debuggerRenderer, workload.debuggerCamera, curFrameWeight, prevFrameWeight, deltaTimeMs,
--                        interpolationTargetKey, interpolationTargetFbPairIndex, overrideTarget, overrideModifier, velocityUploaderUsed, uploadExtras, tileInterpolationUsed, lookAtInterpolationUsed);
-+                        interpolationTargetKey, interpolationTargetWorkloadSlot, interpolationTargetFbPairIndex, overrideTarget, overrideModifier, velocityUploaderUsed, uploadExtras, tileInterpolationUsed, lookAtInterpolationUsed);
- 
-                     // Add total time the frame took to render.
-                     renderTimeTotalMicro += workloadTimer.elapsedMicroseconds() - renderTimeMicro;
- 
--                    // After one frame is rendered, we indicate the workload has been processed so the present thread can start presenting frames as soon as it can.
-+                    if (wcwInterpLogFile() != nullptr) {
-+                        wcwInterpLog('W', "frame", (int64_t)frame, (int64_t)(overrideTarget != nullptr ? int64_t(targetIndex) - 1 : -1), (int64_t)(intptr_t)overrideTarget);
-+                    }
-+
-+                    // After one frame is rendered, we indicate the workload group has been processed so the present thread can start presenting frames as soon as it can.
-                     if (frame == 0) {
--                        threadAdvanceWorkloadId(workload.workloadId);
-+                        threadAdvanceWorkloadId(lastWorkload.workloadId);
-                     }
- 
-                     // For every additional frame, we increase the frames available and notify the present queue.
-@@ -1165,10 +1399,13 @@ namespace RT64 {
-                 threadConfigurationValidate();
- 
-                 if (!workload.paused) {
--                    threadAdvanceBarrier();
-+                    // [wcw fix] Park the barrier on the first slot of the group just rendered so
-+                    // the whole group survives as the next match's prevFrame (see threadSetBarrier).
-+                    threadSetBarrier(int(groupIndices.front()));
-                 }
- 
--                processCursor = -1;
-+                groupIndices.clear();
-+                groupReady = false;
-                 workloadProfiler.end();
-                 workloadProfiler.log();
-                 workloadProfiler.reset();
-diff --git a/src/hle/rt64_workload_queue.h b/src/hle/rt64_workload_queue.h
-index bde2f03..4cd06d5 100644
---- a/src/hle/rt64_workload_queue.h
-+++ b/src/hle/rt64_workload_queue.h
-@@ -5,6 +5,7 @@
- #pragma once
- 
- #include <array>
-+#include <deque>
- 
- #include "common/rt64_enhancement_configuration.h"
- #include "common/rt64_profiling_timer.h"
-@@ -23,7 +24,11 @@
- #   include "render/rt64_raytracing_shader_cache.h"
- #endif
- 
--#define WORKLOAD_QUEUE_SIZE 4
-+// [wcw fix] 4 -> 24: multi-workload frame grouping holds back up to WORKLOAD_QUEUE_MAX_GROUP
-+// workloads until their game frame is complete, and the previous frame's group must stay
-+// protected behind the barrier while the current one renders (2 groups + headroom).
-+#define WORKLOAD_QUEUE_SIZE 24
-+#define WORKLOAD_QUEUE_MAX_GROUP 8
- 
- namespace RT64 {
-     struct PresentQueue;
-@@ -69,6 +74,16 @@ namespace RT64 {
-         std::condition_variable cursorCondition;
-         uint64_t workloadId;
-         uint64_t lastPresentId;
-+        // [wcw fix] Highest workloadId covered by a submitted present event (set by
-+        // State::advancePresent). A pending workload group whose last workload is covered
-+        // by a present is a complete game frame.
-+        std::atomic<uint64_t> frameEndWorkloadId = 0;
-+        // [wcw fix] Queue of (coveredWorkloadId, VI fb address) per submitted present, guarded by
-+        // cursorMutex. Games that draw the next frame's pre-clear as the LAST fbPair (WCW) fool
-+        // the backward interpolation-target scan into picking the pre-cleared buffer, so the
-+        // interpolated frames re-render only a black clear. The present's actual fb address picks
-+        // the right target.
-+        std::deque<std::pair<uint64_t, uint32_t>> frameEndFbAddresses;
-         std::mutex workloadIdMutex;
-         std::condition_variable workloadIdCondition;
-         std::thread *renderThread = nullptr;
-@@ -106,6 +121,7 @@ namespace RT64 {
-         void reset();
-         void advanceToNextWorkload();
-         void repeatLastWorkload();
-+        void notifyFrameEnd(uint64_t coveredWorkloadId, uint32_t viFbAddress);
-         uint32_t previousWriteCursor() const;
-         void waitForIdle();
-         void waitForWorkloadId(uint64_t waitId);
-@@ -115,10 +131,11 @@ namespace RT64 {
-         void threadConfigurationValidate();
-         void threadRenderFrame(GameFrame &curFrame, const GameFrame &prevFrame, const WorkloadConfiguration &workloadConfig,
-             const DebuggerRenderer &debuggerRenderer, const DebuggerCamera &debuggerCamera, float curFrameWeight, float prevFrameWeight,
--            float deltaTimeMs, RenderTargetKey overrideTargetKey, int32_t overrideTargetFbPairIndex, RenderTarget *overrideTarget,
-+            float deltaTimeMs, RenderTargetKey overrideTargetKey, int32_t overrideTargetWorkloadSlot, int32_t overrideTargetFbPairIndex, RenderTarget *overrideTarget,
-             uint32_t overrideTargetModifier, bool uploadVelocity, bool uploadExtras, bool interpolateTiles, bool interpolateLookAts);
- 
-         void threadAdvanceBarrier();
-+        void threadSetBarrier(int slot);
-         void threadAdvanceWorkloadId(uint64_t newWorkloadId);
-         void renderThreadLoop();
-         void idleThreadLoop();
 diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
 index 9fae0d4..f1f0ab1 100644
 --- a/src/render/rt64_framebuffer_renderer.cpp
