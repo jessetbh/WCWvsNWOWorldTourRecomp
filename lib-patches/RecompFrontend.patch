@@ -1,0 +1,53 @@
+diff --git a/recompui/src/base/ui_state.cpp b/recompui/src/base/ui_state.cpp
+index 277a421..7c800ae 100644
+--- a/recompui/src/base/ui_state.cpp
++++ b/recompui/src/base/ui_state.cpp
+@@ -659,6 +659,16 @@ void draw_hook(plume::RenderCommandList* command_list, plume::RenderFramebuffer*
+     if (!recompui::is_any_context_shown() && !ultramodern::is_game_started()) {
+         recompui::show_context(recompui::get_launcher_context_id(), "");
+     }
++    // [wcw] Hide the launcher once the game is running. WCW's minimal main.cpp boots the game
++    // directly (recomp::start_game) without going through the launcher UI, which normally calls
++    // hide_all_contexts() itself (ui_launcher.cpp on_start_game_mode). Without this, the block
++    // above auto-shows the launcher during the boot window (before is_game_started() flips) and
++    // the fullscreen launcher page then covers the game's output forever — the game renders
++    // fine underneath but the window stays black.
++    else if (ultramodern::is_game_started() && recompui::is_context_shown(recompui::get_launcher_context_id())) {
++        fprintf(stderr, "[wcw][ui] game started - hiding leftover launcher context\n");
++        recompui::hide_context(recompui::get_launcher_context_id());
++    }
+ 
+     std::lock_guard lock{ ui_state_mutex };
+ 
+diff --git a/recompui/src/config/ui_config_tab_graphics.cpp b/recompui/src/config/ui_config_tab_graphics.cpp
+index 4fdf81f..71192bc 100644
+--- a/recompui/src/config/ui_config_tab_graphics.cpp
++++ b/recompui/src/config/ui_config_tab_graphics.cpp
+@@ -304,7 +304,13 @@ namespace recompui {
+                 "Framerate",
+                 get_framerate_text(60),
+                 refresh_rate_options,
+-                ultramodern::renderer::RefreshRate::Display
++                // [wcw fix] Default Original, not Display. WCW builds one visual frame from
++                // MULTIPLE RSP workloads, but RT64's frame matching assumes 1 workload = 1 frame
++                // (rt64_workload_queue.cpp TODO), so interpolated frames re-render only a slice
++                // of the frame — pure-black / partially-drawn presents (verified via swapchain
++                // readback: constant black bursts in menus at Display, zero at Original).
++                // Revisit when multi-workload frame detection / matrix-group patches exist.
++                ultramodern::renderer::RefreshRate::Original
+             );
+ 
+             config.add_number_option(
+diff --git a/recompui/src/renderer/rt64_render_context.cpp b/recompui/src/renderer/rt64_render_context.cpp
+index a7954c7..71635b7 100644
+--- a/recompui/src/renderer/rt64_render_context.cpp
++++ b/recompui/src/renderer/rt64_render_context.cpp
+@@ -299,6 +299,8 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
+             app->userConfig.graphicsAPI = RT64::UserConfiguration::GraphicsAPI::Automatic;
+             break;
+     }
++    // [wcw] NOTE (2026-06-12 black-screen investigation): forcing the Vulkan backend here was
++    // tested and produced the SAME all-black game rendering as D3D12 — the defect is API-independent.
+ 
+     // Set up the RT64 application.
+     uint32_t thread_id = 0;

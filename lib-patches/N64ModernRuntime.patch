@@ -1,0 +1,828 @@
+diff --git a/librecomp/CMakeLists.txt b/librecomp/CMakeLists.txt
+index 716d48b..bbc5b5f 100644
+--- a/librecomp/CMakeLists.txt
++++ b/librecomp/CMakeLists.txt
+@@ -31,6 +31,7 @@ add_library(librecomp STATIC
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/print.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/rsp.cpp"
++    "${CMAKE_CURRENT_SOURCE_DIR}/src/si.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/sp.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/ultra_stubs.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/ultra_translation.cpp"
+diff --git a/librecomp/src/ai.cpp b/librecomp/src/ai.cpp
+index 0195f2b..e1fface 100644
+--- a/librecomp/src/ai.cpp
++++ b/librecomp/src/ai.cpp
+@@ -16,12 +16,15 @@ extern "C" void osAiSetFrequency_recomp(uint8_t* rdram, recomp_context* ctx) {
+ }
+ 
+ extern "C" void osAiSetNextBuffer_recomp(uint8_t* rdram, recomp_context* ctx) {
++    // [wcw] totals every 64 calls to see whether the audio driver still feeds buffers late in a run
++    { static int n = 0; if ((n++ % 64) == 0) fprintf(stderr, "[wcw][ai] osAiSetNextBuffer #%d len=0x%X\n", n - 1, (unsigned)ctx->r5); }
+     ultramodern::queue_audio_buffer(rdram, ctx->r4, ctx->r5);
+     ctx->r2 = 0;
+ }
+ 
+ extern "C" void osAiGetLength_recomp(uint8_t* rdram, recomp_context* ctx) {
+     ctx->r2 = ultramodern::get_remaining_audio_bytes();
++    { static int n = 0; if ((n++ % 256) == 0) fprintf(stderr, "[wcw][ai] osAiGetLength #%d -> 0x%X\n", n - 1, (unsigned)ctx->r2); }
+ }
+ 
+ extern "C" void osAiGetStatus_recomp(uint8_t* rdram, recomp_context* ctx) {
+diff --git a/librecomp/src/math_routines.cpp b/librecomp/src/math_routines.cpp
+index 4d6a01d..9e2dc24 100644
+--- a/librecomp/src/math_routines.cpp
++++ b/librecomp/src/math_routines.cpp
+@@ -112,3 +112,35 @@ extern "C" void __ll_lshift_recomp(uint8_t * rdram, recomp_context * ctx) {
+     ctx->r2 = (int32_t)(ret >> 32);
+     ctx->r3 = (int32_t)(ret >> 0);
+ }
++
++// [wcw] The remaining IDO softfloat conversions used by WCW (math_routines didn't ship these
++// four). N64Recomp can't emit trunc.l.*/cvt.*.l, so the game's func_XXXX are named to these in
++// tools/gen_symbols.py and routed here. FP arg in f12, int64 result in r2(hi)/r3(lo) and vice
++// versa, matching the existing helpers above.
++extern "C" void __d_to_ll_recomp(uint8_t * rdram, recomp_context * ctx) {
++    int64_t ret = (int64_t)ctx->f12.d;
++
++    ctx->r2 = (int32_t)(ret >> 32);
++    ctx->r3 = (int32_t)(ret >> 0);
++}
++
++extern "C" void __d_to_ull_recomp(uint8_t * rdram, recomp_context * ctx) {
++    uint64_t ret = (uint64_t)ctx->f12.d;
++
++    ctx->r2 = (int32_t)(ret >> 32);
++    ctx->r3 = (int32_t)(ret >> 0);
++}
++
++extern "C" void __f_to_ull_recomp(uint8_t * rdram, recomp_context * ctx) {
++    uint64_t ret = (uint64_t)ctx->f12.fl;
++
++    ctx->r2 = (int32_t)(ret >> 32);
++    ctx->r3 = (int32_t)(ret >> 0);
++}
++
++extern "C" void __ll_to_d_recomp(uint8_t * rdram, recomp_context * ctx) {
++    int64_t a = (ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
++    double ret = (double)a;
++
++    ctx->f0.d = ret;
++}
+diff --git a/librecomp/src/pi.cpp b/librecomp/src/pi.cpp
+index 62656ad..e49b5b5 100644
+--- a/librecomp/src/pi.cpp
++++ b/librecomp/src/pi.cpp
+@@ -8,6 +8,7 @@
+ #include "librecomp/addresses.hpp"
+ #include "librecomp/game.hpp"
+ #include "librecomp/files.hpp"
++#include "librecomp/overlays.hpp"
+ #include <ultramodern/ultra64.h>
+ #include <ultramodern/ultramodern.hpp>
+ 
+@@ -63,6 +64,18 @@ extern "C" void osCreatePiManager_recomp(uint8_t* rdram, recomp_context* ctx) {
+ 
+ void recomp::do_rom_read(uint8_t* rdram, gpr ram_address, uint32_t physical_addr, size_t num_bytes) {
+     // TODO use word copies when possible
++    // [wcw] DIAGNOSTIC: log every ROM read + flag out-of-range params.
++    {
++        static int n = 0;
++        size_t off = (size_t)physical_addr - (size_t)recomp::rom_base;
++        bool bad = (physical_addr < recomp::rom_base) || (off + num_bytes > rom.size());
++        if (n < 30 || bad) {
++            fprintf(stderr, "[wcw][rom_read#%d] rdram=%p dest=%p ram=0x%llX phys=0x%08X off=0x%zX nbytes=0x%zX rom.size=0x%zX rom_base=0x%X%s\n",
++                n, (void*)rdram, (void*)(rdram + (ram_address - 0xFFFFFFFF80000000ull)), (unsigned long long)ram_address, physical_addr, off, num_bytes, rom.size(), (unsigned)recomp::rom_base, bad ? "  <<< OUT OF RANGE" : "");
++        }
++        n++;
++        if (bad) { fprintf(stderr, "[wcw][rom_read] refusing out-of-range read\n"); fflush(stderr); return; }
++    }
+ 
+     // TODO handle misaligned DMA
+     assert((physical_addr & 0x1) == 0 && "Only PI DMA from aligned ROM addresses is currently supported");
+@@ -266,6 +279,31 @@ void ultramodern::join_saving_thread() {
+     }
+ }
+ 
++// [wcw] WCW has two CPU overlays that both load to vram 0x80090000 (see disasm/README.md and
++// RecompiledFuncs/recomp_overlays.inl). The game DMAs the overlay code there and jumps to it;
++// we must register the overlay's recompiled functions with the runtime (load_overlays) so
++// get_function(0x80090000) resolves. Hook the cart-DMA path: when a transfer's destination is
++// the overlay base, map the matching overlay (unloading the previously-mapped one first).
++static void wcw_maybe_load_overlay(gpr rdram_address, uint32_t physical_addr) {
++    if ((uint32_t)rdram_address != 0x80090000) {
++        return;
++    }
++    static const struct { uint32_t rom; uint32_t size; } ovls[] = {
++        { 0x00A21750, 0x00033BC0 }, // overlay A
++        { 0x00A69570, 0x00055F70 }, // overlay B
++    };
++    uint32_t rom_off = physical_addr - (uint32_t)recomp::rom_base;
++    for (const auto& o : ovls) {
++        if (rom_off == o.rom) {
++            fprintf(stderr, "[wcw][ovl] map overlay rom=0x%06X -> 0x80090000 size=0x%X\n", o.rom, o.size);
++            unload_overlays(0x80090000, 0x00056000); // cover the largest overlay
++            load_overlays(o.rom, 0x80090000, o.size);
++            return;
++        }
++    }
++    fprintf(stderr, "[wcw][ovl] DMA to 0x80090000 from unrecognized rom 0x%X\n", rom_off);
++}
++
+ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_addr, uint32_t size, uint32_t direction) {
+     // TODO asynchronous transfer
+     // TODO implement unaligned DMA correctly
+@@ -273,6 +311,7 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
+         if (physical_addr >= recomp::rom_base) {
+             // read cart rom
+             recomp::do_rom_read(rdram, rdram_address, physical_addr, size);
++            wcw_maybe_load_overlay(rdram_address, physical_addr);
+ 
+             // Send a message to the mq to indicate that the transfer completed
+             ultramodern::enqueue_external_message(mq, 0, false, true);
+diff --git a/librecomp/src/si.cpp b/librecomp/src/si.cpp
+new file mode 100644
+index 0000000..0780049
+--- /dev/null
++++ b/librecomp/src/si.cpp
+@@ -0,0 +1,111 @@
++// [wcw] SI / PIF (joybus) emulation for games that use the RAW libultra SI primitives
++// (__osSiRawStartDma / __osSiDeviceBusy) instead of the high-level osCont* API.
++//
++// recomp.h's MEM_* macros do not trap MMIO, so the recompiled raw-SI code crashes writing
++// SI_PIF_ADDR_* / reading SI_STATUS (0xA48000xx -> out of RDRAM). We instead reimplement the
++// two SI primitives in C: name func_80023970 -> __osSiRawStartDma and func_800251E0 ->
++// __osSiDeviceBusy in tools/gen_symbols.py, and provide the *_recomp shims here.
++//
++// The game builds a 64-byte PIF RAM joybus command block in RDRAM, does
++// __osSiRawStartDma(OS_WRITE) (DRAM->PIF), waits for the SI message, then
++// __osSiRawStartDma(OS_READ) (PIF->DRAM) to read the result. We keep a 64-byte PIF RAM,
++// run the joybus on the WRITE (filling results from host input via osContGetReadData), and
++// copy it back on the READ. Both directions raise the SI completion message.
++#include "ultramodern/ultramodern.hpp"
++#include "ultramodern/ultra64.h"
++#include "ultramodern/input.hpp"
++
++#include "helpers.hpp"
++
++#define MAXCONTROLLERS 4
++
++static uint8_t pif_ram[64];
++
++extern "C" void __osSiDeviceBusy_recomp(uint8_t* rdram, recomp_context* ctx) {
++    // The host SI is never busy.
++    _return<s32>(ctx, 0);
++}
++
++// Execute the joybus command block currently in pif_ram, filling in result bytes.
++static void wcw_process_pif() {
++    OSContPad pads[MAXCONTROLLERS];
++    for (int c = 0; c < MAXCONTROLLERS; c++) {
++        pads[c].button = 0; pads[c].stick_x = 0; pads[c].stick_y = 0; pads[c].err_no = 0;
++    }
++    // [wcw fix] Latch host input NOW. osContGetReadData only reads state previously latched
++    // by the poll_input callback (recompinput::poll_inputs — it caches SDL_GetKeyboardState
++    // and the controller list). The normal poller is osContStartReadData, which this game
++    // never calls (raw-SI path) — without this poll the cache stays empty forever and all
++    // input reads as neutral.
++    ultramodern::input::poll_input();
++    // osContGetReadData reads current host input (already converted to N64 stick range) and
++    // sets err_no != 0 for absent controllers.
++    osContGetReadData(pads);
++
++    int channel = 0;
++    int i = 0;
++    while (i < 63 && channel < MAXCONTROLLERS) {
++        uint8_t t = pif_ram[i];
++        if (t == 0xFE) { break; }                       // end of commands
++        if (t == 0x00) { channel++; i++; continue; }    // skip this channel
++        if (t == 0xFF) { i++; continue; }               // padding byte (channel unchanged)
++        if (t & 0xC0)  { i++; continue; }               // not a valid tx count
++        uint8_t rx = pif_ram[i + 1] & 0x3F;
++        if (i + 2 + t + rx > 64) { break; }             // malformed / overflow guard
++        uint8_t cmd = pif_ram[i + 2];
++        uint8_t* res = &pif_ram[i + 2 + t];
++        // [wcw] Port 1 (channel 0) is ALWAYS reported connected — a virtual controller is always
++        // present (neutral input when the host pad/key is idle). osContGetReadData sets err_no != 0
++        // whenever the input callback returns no response that frame, which would otherwise make
++        // the game see "no controller in port 1" and refuse to advance past the title.
++        bool connected = (channel == 0) || (pads[channel].err_no == 0);
++
++        if (!connected) {
++            pif_ram[i + 1] |= 0x80;                      // CHNL_ERR_NORESP: no device
++        }
++        else if (cmd == 0x00 || cmd == 0xFF) {           // request status
++            if (rx >= 3) { res[0] = 0x05; res[1] = 0x00; res[2] = 0x00; } // CONT_TYPE_NORMAL
++        }
++        else if (cmd == 0x01) {                          // read button
++            if (rx >= 4) {
++                uint16_t b = pads[channel].button;
++                res[0] = (uint8_t)(b >> 8);
++                res[1] = (uint8_t)(b & 0xFF);
++                res[2] = (uint8_t)pads[channel].stick_x;
++                res[3] = (uint8_t)pads[channel].stick_y;
++            }
++        }
++        else {
++            // Controller Pak / EEPROM-over-SI etc. not emulated yet: report no device so the
++            // game falls back gracefully instead of hanging.
++            pif_ram[i + 1] |= 0x80;
++        }
++
++        i += 2 + t + rx;
++        channel++;
++    }
++}
++
++extern "C" void __osSiRawStartDma_recomp(uint8_t* rdram, recomp_context* ctx) {
++    s32 dir = (s32)ctx->r4;          // a0: OS_READ(0) = PIF->DRAM, OS_WRITE(1) = DRAM->PIF
++    gpr dram_addr = ctx->r5;          // a1: RDRAM address of the 64-byte PIF block
++
++    if (dir == 1) {
++        // DRAM -> PIF: latch the command block, then run joybus so results are ready.
++        for (int i = 0; i < 64; i++) {
++            pif_ram[i] = (uint8_t)MEM_B(i, dram_addr);
++        }
++        wcw_process_pif();
++    }
++    else {
++        // PIF -> DRAM: hand back the (already-processed) result block.
++        for (int i = 0; i < 64; i++) {
++            MEM_B(i, dram_addr) = (int8_t)pif_ram[i];
++        }
++    }
++
++    // Each SI DMA completion raises the SI interrupt; the game blocks on osRecvMesg for it.
++    ultramodern::send_si_message();
++
++    _return<s32>(ctx, 0);
++}
+diff --git a/librecomp/src/sp.cpp b/librecomp/src/sp.cpp
+index ae0f44f..9a6e7dc 100644
+--- a/librecomp/src/sp.cpp
++++ b/librecomp/src/sp.cpp
+@@ -2,6 +2,9 @@
+ #include <fstream>
+ #include <ultramodern/ultramodern.hpp>
+ #include "recomp.h"
++#ifdef _WIN32
++#include <windows.h>
++#endif
+ 
+ extern "C" void osSpTaskLoad_recomp(uint8_t* rdram, recomp_context* ctx) {
+     // Nothing to do here
+@@ -10,8 +13,13 @@ extern "C" void osSpTaskLoad_recomp(uint8_t* rdram, recomp_context* ctx) {
+ bool dump_frame = false;
+ 
+ extern "C" void osSpTaskStartGo_recomp(uint8_t* rdram, recomp_context* ctx) {
+-    //printf("[sp] osSpTaskStartGo(0x%08X)\n", (uint32_t)ctx->r4);
+     OSTask* task = TO_PTR(OSTask, ctx->r4);
++    // [wcw] running totals every 64 tasks so a stall's task mix is visible late in a run
++    {
++        static int nGfx = 0, nAud = 0, nAll = 0;
++        if (task->t.type == M_GFXTASK) nGfx++; else if (task->t.type == M_AUDTASK) nAud++;
++        if ((nAll++ % 64) == 0) fprintf(stderr, "[wcw][sp] task totals: gfx=%d aud=%d\n", nGfx, nAud);
++    }
+     if (task->t.type == M_GFXTASK) {
+         //printf("[sp] Gfx task: %08X\n", (uint32_t)ctx->r4);
+     } else if (task->t.type == M_AUDTASK) {
+diff --git a/ultramodern/include/ultramodern/input.hpp b/ultramodern/include/ultramodern/input.hpp
+index 1dab1b8..dae7046 100644
+--- a/ultramodern/include/ultramodern/input.hpp
++++ b/ultramodern/include/ultramodern/input.hpp
+@@ -57,6 +57,12 @@ namespace ultramodern {
+         };
+ 
+         void set_callbacks(const callbacks_t& callbacks);
++
++        // [wcw fix] Run the poll_input callback (latches host keyboard/controller state).
++        // Normally driven by osContStartReadData; games that bypass the osCont* API and talk
++        // raw SI/PIF (e.g. WCW's homegrown controller layer) never call that, so the raw-SI
++        // emulation must trigger the poll itself before sampling input.
++        void poll_input();
+     }
+ }
+ 
+diff --git a/ultramodern/src/audio.cpp b/ultramodern/src/audio.cpp
+index 3198be0..31ee871 100644
+--- a/ultramodern/src/audio.cpp
++++ b/ultramodern/src/audio.cpp
+@@ -38,7 +38,14 @@ void ultramodern::queue_audio_buffer(RDRAM_ARG PTR(int16_t) audio_data_, uint32_
+ // For SDL2
+ //uint32_t buffer_offset_frames = 1;
+ // For Godot
+-float buffer_offset_frames = 0.5f;
++//float buffer_offset_frames = 0.5f;
++// [wcw fix] WCW registers no AI event (verified: osSetEventMesg(OS_EVENT_AI) never called);
++// its audio thread generates a burst once per ~33ms game frame, sized by osAiGetLength.
++// On hardware osAiGetLength reports only the current DMA buffer, so the game stays buffers
++// ahead; here it sees the whole host queue and keeps ~0 headroom → constant underruns
++// (~22/s measured) against SDL's chunked consumption. Under-report by ~6 VIs worth
++// (~50ms @ 22050 Hz) so the game builds real queue depth. Costs ~50ms audio latency.
++float buffer_offset_frames = 6.0f;
+ 
+ // If there's ever any audio popping, check here first. Some games are very sensitive to
+ // the remaining sample count and reporting a number that's too high here can lead to issues.
+diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
+index 090cc42..79a2c27 100644
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -29,6 +29,7 @@ struct SpTaskAction {
+ };
+ 
+ struct ScreenUpdateAction {
++    double wcw_enqueue_ms; // [wcw] DIAGNOSTIC: set at VI-thread enqueue for latency measurement
+     ultramodern::renderer::ViRegs regs;
+ };
+ 
+@@ -72,6 +73,11 @@ static struct {
+         void update_vi() {
+             ViState* next_state = get_next_state();
+             const OSViMode* next_mode = next_state->mode;
++            if (next_mode == nullptr) {
++                static bool warned = false;
++                if (!warned) { warned = true; fprintf(stderr, "[wcw][vi] update_vi: next_state->mode is NULL (cur_state=%d field=%d game_started=%d) - skipping\n", cur_state, field, (int)ultramodern::is_game_started()); }
++                return;
++            }
+             const OSViCommonRegs* common_regs = &next_mode->comRegs;
+             const OSViFieldRegs* field_regs = &next_mode->fldRegs[field];
+             PTR(void) framebuffer = osVirtualToPhysical(next_state->framebuffer);
+@@ -91,6 +97,19 @@ static struct {
+ 
+             // TODO implement osViFade
+ 
++            { // [wcw] DIAGNOSTIC (WCW_PRESENT_LUM=1): trace the ViState dance per tick.
++                static const bool wcwTlog = getenv("WCW_PRESENT_LUM") != nullptr;
++                if (wcwTlog) {
++                    static FILE *tf = nullptr;
++                    if (tf == nullptr) tf = fopen("wcw_vistate_log.csv", "w");
++                    if (tf != nullptr) {
++                        double ms = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 1000.0;
++                        fprintf(tf, "%.1f,%d,0x%X,0x%X,0x%X\n", ms, cur_state,
++                            (unsigned)states[0].framebuffer, (unsigned)states[1].framebuffer, (unsigned)origin);
++                        fflush(tf);
++                    }
++                }
++            }
+             // Update VI registers.
+             regs.VI_ORIGIN_REG = origin;
+             regs.VI_WIDTH_REG = common_regs->width;
+@@ -143,6 +162,7 @@ ultramodern::renderer::ViRegs* ultramodern::renderer::get_vi_regs() {
+ 
+ extern "C" void osSetEventMesg(RDRAM_ARG OSEvent event_id, PTR(OSMesgQueue) mq_, OSMesg msg) {
+     std::lock_guard lock{ events_context.message_mutex };
++    fprintf(stderr, "[wcw][osSetEventMesg] event=%d mq=0x%X msg=0x%X\n", (int)event_id, (unsigned)mq_, (unsigned)msg);
+ 
+     switch (event_id) {
+         case OS_EVENT_SP:
+@@ -165,10 +185,21 @@ extern "C" void osSetEventMesg(RDRAM_ARG OSEvent event_id, PTR(OSMesgQueue) mq_,
+ 
+ extern "C" void osViSetEvent(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, u32 retrace_count) {
+     std::lock_guard lock{ events_context.message_mutex };
++    // [wcw fix] the retrace event registration is global on real hardware (latest osViSetEvent
++    // wins), but the ViStates here are double-buffered and never copy to each other — writing
++    // only next_state leaves the stale registration live on the other parity. WCW re-registers
++    // its retrace (new mq/msg/rate) at the end of its attract sequence; the stale parity then
++    // starved the new one via the shared remaining_retraces counter and the game deadlocked.
+     ViState* next_state = events_context.vi.get_next_state();
+     next_state->mq = mq_;
+     next_state->msg = msg;
+     next_state->retrace_count = retrace_count;
++    ViState* cur_state = events_context.vi.get_cur_state();
++    cur_state->mq = mq_;
++    cur_state->msg = msg;
++    cur_state->retrace_count = retrace_count;
++    fprintf(stderr, "[wcw][osViSetEvent] mq=0x%X msg=0x%X retrace_count=%u\n",
++        (unsigned)(uint32_t)mq_, (unsigned)(uint32_t)msg, retrace_count);
+ }
+ 
+ uint64_t total_vis = 0;
+@@ -224,27 +255,89 @@ void vi_thread_func() {
+ 
+         // Queue a screen update for the graphics thread with the current VI register state.
+         // Doing this before the VI update is equivalent to updating the screen after the previous frame's scanout finished.
+-        events_context.action_queue.enqueue(ScreenUpdateAction{ events_context.vi.regs });
++        events_context.action_queue.enqueue(ScreenUpdateAction{
++            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 1000.0,
++            events_context.vi.regs });
+ 
+         // Update VI registers and swap VI modes.
+         events_context.vi.update_vi();
+ 
++        { // [wcw] DIAGNOSTIC: scanout health — log origin changes (framebuffer cycling
++          // pattern) and black scanouts (hStart==0 = VI_STATE_BLACK), to characterize
++          // visual flicker. First ~200 origin changes logged individually + 1/s summary.
++            static uint32_t last_origin = 0xFFFFFFFF; static int vis = 0, changes = 0, blacks = 0, logged = 0;
++            uint32_t org = events_context.vi.regs.VI_ORIGIN_REG;
++            uint32_t hs = events_context.vi.regs.VI_H_START_REG;
++            vis++;
++            if (hs == 0) blacks++;
++            if (org != last_origin) {
++                changes++;
++                if (logged < 200) { fprintf(stderr, "[wcw][scan] vi=%llu origin 0x%08X -> 0x%08X hstart=0x%X\n", (unsigned long long)total_vis, last_origin, org, hs); logged++; }
++                last_origin = org;
++            }
++            if (vis >= 60) {
++                extern std::atomic_int wcw_ai_del, wcw_ai_drop, wcw_vi_del, wcw_vi_drop;
++                extern std::atomic<int64_t> wcw_ai_maxlat, wcw_vi_maxlat;
++                fprintf(stderr, "[wcw][scan] 60 VIs: origin-changes=%d blacks=%d | ai del=%d drop=%d maxlat=%lldms | vi del=%d drop=%d maxlat=%lldms\n",
++                    changes, blacks,
++                    wcw_ai_del.exchange(0), wcw_ai_drop.exchange(0), (long long)wcw_ai_maxlat.exchange(0),
++                    wcw_vi_del.exchange(0), wcw_vi_drop.exchange(0), (long long)wcw_vi_maxlat.exchange(0));
++                vis = 0; changes = 0; blacks = 0;
++            }
++        }
++
+         // If the game has started, handle sending VI and AI events.
+         if (ultramodern::is_game_started()) {
+             remaining_retraces--;
+             
+             std::lock_guard lock{ events_context.message_mutex };
+             ViState* cur_state = events_context.vi.get_cur_state();
+-            if (remaining_retraces == 0) {
++            { // [wcw] DIAGNOSTIC: report VI/AI retrace-queue registration once a second, plus the
++              // fixed-segment game-mode state var @ 0x80034834 (0=overlay A, 1=overlay B — it
++              // advances 0->1 when B loads then sticks, i.e. the overlay-B internal state is the
++              // stall). Read from rdram with the recomp byte-swap (byte at game offset X = rdram[X^3]).
++                static int tick = 0;
++                if ((tick++ % 60) == 0) {
++                    uint8_t* rd = events_context.rdram;
++                    auto rd32 = [rd](uint32_t off) -> uint32_t {
++                        return ((uint32_t)rd[(off+0)^3] << 24) | ((uint32_t)rd[(off+1)^3] << 16)
++                             | ((uint32_t)rd[(off+2)^3] << 8)  | ((uint32_t)rd[(off+3)^3]);
++                    };
++                    extern std::atomic_int wcw_spb_delivered, wcw_spb_full, wcw_dpc_delivered, wcw_dpc_full;
++                    extern std::atomic_int wcw_spc_calls, wcw_dpc_calls;
++                    fprintf(stderr, "[wcw][vi] tick %d: gamemode=0x%X fb=0x%08X | state=0x%X hstart=0x%X origin=0x%X dpc=%d | vimq=0x%X vimsg=0x%X rc=%d aimq=0x%X\n",
++                        tick, rd32(0x34834), (unsigned)cur_state->framebuffer,
++                        cur_state->state, events_context.vi.regs.VI_H_START_REG, events_context.vi.regs.VI_ORIGIN_REG,
++                        wcw_dpc_calls.load(),
++                        (unsigned)cur_state->mq, (unsigned)cur_state->msg, cur_state->retrace_count,
++                        (unsigned)events_context.ai.mq);
++                }
++            }
++            // [wcw fix] was `== 0` with an unclamped reload: if cur_state->retrace_count ever reads
++            // 0 once (e.g. mid VI-state swap during a mode change / osViBlack fade), the counter
++            // reloads to 0, goes negative, and `== 0` never fires again — retrace events stop
++            // permanently and every game thread eventually starves (frozen game, live process).
++            // WCW hit this deterministically at the end of its attract sequence.
++            if (remaining_retraces <= 0) {
+                 if (cur_state->mq != NULLPTR) {
+                     // Send a message to the VI queue, and do not set it to be requeued if the queue was full.
+-                    // The worst case scenario is that the game misses a VI message and has to wait a little longer for the next. 
++                    // The worst case scenario is that the game misses a VI message and has to wait a little longer for the next.
++                    { // [wcw] DIAGNOSTIC: stamp enqueue time for delivery-latency measurement (see mesgqueue.cpp)
++                        extern std::atomic<uint32_t> wcw_vi_mq; extern std::atomic<int64_t> wcw_vi_enq_ms;
++                        wcw_vi_mq.store((uint32_t)cur_state->mq);
++                        wcw_vi_enq_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
++                    }
+                     ultramodern::enqueue_external_message(cur_state->mq, cur_state->msg, false, false);
+                 }
+-                remaining_retraces = cur_state->retrace_count;
++                remaining_retraces = (cur_state->retrace_count > 0) ? cur_state->retrace_count : 1;
+             }
+             if (events_context.ai.mq != NULLPTR) {
+                 // Send a message to the VI queue, and do not set it to be requeued if the queue was full for the same reason as the VI message above.
++                { // [wcw] DIAGNOSTIC: stamp enqueue time for delivery-latency measurement (see mesgqueue.cpp)
++                    extern std::atomic<uint32_t> wcw_ai_mq; extern std::atomic<int64_t> wcw_ai_enq_ms;
++                    wcw_ai_mq.store((uint32_t)events_context.ai.mq);
++                    wcw_ai_enq_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
++                }
+                 ultramodern::enqueue_external_message(events_context.ai.mq, events_context.ai.msg, false, false);
+             }
+         }
+@@ -255,15 +348,20 @@ void vi_thread_func() {
+     }
+ }
+ 
++// [wcw] DIAGNOSTIC counters: completion-message accounting (find where SP/DP dones get lost).
++std::atomic_int wcw_spc_calls{0}, wcw_dpc_calls{0};
++
+ void sp_complete() {
+     uint8_t* rdram = events_context.rdram;
+     std::lock_guard lock{ events_context.message_mutex };
++    wcw_spc_calls.fetch_add(1);
+     ultramodern::enqueue_external_message(events_context.sp.mq, events_context.sp.msg, false, true);
+ }
+ 
+ void dp_complete() {
+     uint8_t* rdram = events_context.rdram;
+     std::lock_guard lock{ events_context.message_mutex };
++    wcw_dpc_calls.fetch_add(1);
+     ultramodern::enqueue_external_message(events_context.dp.mq, events_context.dp.msg, false, true);
+ }
+ 
+@@ -355,8 +453,35 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+ 
+     while (!exited) {
+         // Try to pull an action from the queue
+-        Action action;
+-        if (events_context.action_queue.wait_dequeue_timed(action, 1ms)) {
++        Action first_action;
++        if (events_context.action_queue.wait_dequeue_timed(first_action, 1ms)) {
++            // [wcw fix] Drain the whole queue and drop STALE ScreenUpdateActions (keep only the
++            // newest). Each ScreenUpdateAction is a snapshot of the VI regs at one 60Hz tick; a
++            // standing backlog in this queue (SpTask display-list processing shares the thread)
++            // otherwise delays scanout by that backlog — measured at 5-6 VIs (~90ms), enough that
++            // the presented framebuffer overlapped the game re-clearing/redrawing it for its NEXT
++            // frame -> 1 of 3 presents was pure black (constant visible flicker). Presenting only
++            // the freshest VI snapshot bounds scanout latency to ~1 action regardless of backlog.
++            thread_local std::vector<Action> action_batch;
++            action_batch.clear();
++            action_batch.push_back(std::move(first_action));
++            {
++                Action extra;
++                while (events_context.action_queue.try_dequeue(extra)) {
++                    action_batch.push_back(std::move(extra));
++                }
++            }
++            size_t last_screen_update = SIZE_MAX;
++            for (size_t i = 0; i < action_batch.size(); i++) {
++                if (std::get_if<ScreenUpdateAction>(&action_batch[i]) != nullptr) {
++                    last_screen_update = i;
++                }
++            }
++            for (size_t action_index = 0; action_index < action_batch.size(); action_index++) {
++                Action &action = action_batch[action_index];
++                if ((std::get_if<ScreenUpdateAction>(&action) != nullptr) && (action_index != last_screen_update)) {
++                    continue; // stale screen update — a newer VI snapshot is in this batch
++                }
+             // Determine the action type and act on it
+             if (const auto* task_action = std::get_if<SpTaskAction>(&action)) {
+                 // Tell the game that the RSP completed instantly. This will allow it to queue other task types, but it won't
+@@ -372,6 +497,18 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+                 [[maybe_unused]] auto renderer_start = std::chrono::high_resolution_clock::now();
+                 renderer_context->send_dl(&task_action->task);
+                 [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
++                { // [wcw] DIAGNOSTIC (WCW_PRESENT_LUM=1): per-task display-list processing cost on this thread.
++                    static const bool wcwDlog = getenv("WCW_PRESENT_LUM") != nullptr;
++                    if (wcwDlog) {
++                        static FILE *df = nullptr;
++                        if (df == nullptr) df = fopen("wcw_dl_log.csv", "w");
++                        if (df != nullptr) {
++                            double now = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 1000.0;
++                            fprintf(df, "%.1f,%.2f\n", now, std::chrono::duration_cast<std::chrono::microseconds>(renderer_end - renderer_start).count() / 1000.0);
++                            fflush(df);
++                        }
++                    }
++                }
+ 
+                 dp_complete();
+                 // TODO hook the parsed event up to the actual parsing point when a callback is added to RT64.
+@@ -380,6 +517,18 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+                 // printf("Renderer ProcessDList time: %d us\n", static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(renderer_end - renderer_start).count()));
+             }
+             else if (const auto* screen_update_action = std::get_if<ScreenUpdateAction>(&action)) {
++                { // [wcw] DIAGNOSTIC (WCW_PRESENT_LUM=1): VI-enqueue -> gfx-thread processing latency.
++                    static const bool wcwUlog = getenv("WCW_PRESENT_LUM") != nullptr;
++                    if (wcwUlog) {
++                        static FILE *uf = nullptr;
++                        if (uf == nullptr) uf = fopen("wcw_supd_log.csv", "w");
++                        if (uf != nullptr) {
++                            double now = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 1000.0;
++                            fprintf(uf, "%.1f,%.1f\n", now, now - screen_update_action->wcw_enqueue_ms);
++                            fflush(uf);
++                        }
++                    }
++                }
+                 events_context.vi.update_screen_regs = screen_update_action->regs;
+                 renderer_context->update_screen();
+                 display_refresh_rate = renderer_context->get_display_framerate();
+@@ -395,6 +544,7 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+             else if (const auto* dummy_workload_action = std::get_if<DummyWorkloadAction>(&action)) {
+                 renderer_context->send_dummy_workload(dummy_workload_action->fb_address);
+             }
++            } // [wcw fix] end of drained-batch loop
+         }
+     }
+ 
+@@ -456,6 +606,21 @@ void set_dummy_vi(bool odd) {
+ 
+ extern "C" void osViSwapBuffer(RDRAM_ARG PTR(void) frameBufPtr) {
+     std::lock_guard lock{ events_context.message_mutex };
++    // [wcw] DIAGNOSTIC: log swaps — if this never fires, VI scans out nothing (black screen)
++    // regardless of what the RDP rendered.
++    { static int n = 0; if (n++ < 30) fprintf(stderr, "[wcw][viswap#%d] fb=0x%08X\n", n, (unsigned)frameBufPtr); }
++    { // [wcw] DIAGNOSTIC (WCW_PRESENT_LUM=1): timestamped swap log for present correlation.
++        static const bool wcwVlog = getenv("WCW_PRESENT_LUM") != nullptr;
++        if (wcwVlog) {
++            static FILE *vf = nullptr;
++            if (vf == nullptr) vf = fopen("wcw_swap_log.csv", "w");
++            if (vf != nullptr) {
++                double ms = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 1000.0;
++                fprintf(vf, "%.1f,0x%X\n", ms, (unsigned)frameBufPtr);
++                fflush(vf);
++            }
++        }
++    }
+     events_context.vi.get_next_state()->framebuffer = frameBufPtr;
+ }
+ 
+diff --git a/ultramodern/src/input.cpp b/ultramodern/src/input.cpp
+index a170407..89df3d0 100644
+--- a/ultramodern/src/input.cpp
++++ b/ultramodern/src/input.cpp
+@@ -104,11 +104,17 @@ extern "C" s32 osContStartQuery(RDRAM_ARG PTR(OSMesgQueue) mq) {
+     return 0;
+ }
+ 
+-extern "C" s32 osContStartReadData(RDRAM_ARG PTR(OSMesgQueue) mq) {
++// [wcw fix] Exposed so the raw-SI/PIF emulation (librecomp si.cpp) can latch host input;
++// games using raw SI never call osContStartReadData, which is normally the only poller.
++void ultramodern::input::poll_input() {
+     if (input_callbacks.poll_input != nullptr) {
+         input_callbacks.poll_input();
+     }
+     update_poll_time();
++}
++
++extern "C" s32 osContStartReadData(RDRAM_ARG PTR(OSMesgQueue) mq) {
++    ultramodern::input::poll_input();
+ 
+     ultramodern::send_si_message();
+ 
+diff --git a/ultramodern/src/mesgqueue.cpp b/ultramodern/src/mesgqueue.cpp
+index 961de3d..79d66e2 100644
+--- a/ultramodern/src/mesgqueue.cpp
++++ b/ultramodern/src/mesgqueue.cpp
+@@ -1,4 +1,8 @@
+ #include <thread>
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#endif
+ 
+ #include "blockingconcurrentqueue.h"
+ 
+@@ -34,10 +38,30 @@ void dequeue_external_messages(RDRAM_ARG1) {
+ }
+ 
+ void ultramodern::wait_for_external_message(RDRAM_ARG1) {
++    // [wcw fix] Drain every available message per wake instead of processing exactly one.
++    // The single-message version deadlocked: on delivery failure it re-enqueued immediately,
++    // and moodycamel's consumer bias then dequeued that same producer's item right back —
++    // an undeliverable requeue_if_blocked message (full 1-deep target queue) spun forever
++    // and starved every other producer's messages (VI retrace included), freezing the game.
+     QueuedMessage to_send;
++    thread_local std::vector<QueuedMessage> requeued_messages;
++    requeued_messages.clear();
++    bool delivered_any = false;
+     external_messages.wait_dequeue(to_send);
+-    if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
+-        external_messages.enqueue(to_send);
++    do {
++        if (do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false)) {
++            delivered_any = true;
++        }
++        else if (to_send.requeue_if_blocked) {
++            requeued_messages.push_back(to_send);
++        }
++    } while (external_messages.try_dequeue(to_send));
++    for (QueuedMessage& cur_mesg : requeued_messages) {
++        external_messages.enqueue(cur_mesg);
++    }
++    // If nothing was deliverable, don't burn a core cycling the requeued messages.
++    if (!delivered_any && !requeued_messages.empty()) {
++        ultramodern::sleep_milliseconds(1);
+     }
+ }
+ 
+@@ -72,22 +96,54 @@ s32 MQ_IS_FULL(OSMesgQueue* mq) {
+     return MQ_GET_COUNT(mq) >= mq->msgCount;
+ }
+ 
++// [wcw] DIAGNOSTIC counters: SP/DP completion delivery accounting (msg 0x29B/0x29C).
++std::atomic_int wcw_spb_delivered{0}, wcw_spb_full{0}, wcw_dpc_delivered{0}, wcw_dpc_full{0};
++
++// [wcw] DIAGNOSTIC: AI/VI event delivery accounting (enqueue timestamps set in events.cpp's
++// VI thread; latency = enqueue -> do_send delivery). Drops = target queue already full.
++#include <chrono>
++static int64_t wcw_now_ms() {
++    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++std::atomic<uint32_t> wcw_ai_mq{0}, wcw_vi_mq{0};
++std::atomic<int64_t> wcw_ai_enq_ms{0}, wcw_vi_enq_ms{0};
++std::atomic_int wcw_ai_del{0}, wcw_ai_drop{0}, wcw_vi_del{0}, wcw_vi_drop{0};
++std::atomic<int64_t> wcw_ai_maxlat{0}, wcw_vi_maxlat{0};
++
+ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block) {
+     OSMesgQueue* mq = TO_PTR(OSMesgQueue, mq_);
+     if (!block) {
+         // If non-blocking, fail if the queue is full.
+         if (MQ_IS_FULL(mq)) {
++            if ((uint32_t)msg == 0x29B) wcw_spb_full.fetch_add(1);
++            if ((uint32_t)msg == 0x29C) wcw_dpc_full.fetch_add(1);
++            if ((uint32_t)mq_ == wcw_ai_mq.load()) wcw_ai_drop.fetch_add(1);
++            if ((uint32_t)mq_ == wcw_vi_mq.load()) wcw_vi_drop.fetch_add(1);
+             return false;
+         }
+     }
+     else {
+         // Otherwise, yield this thread until the queue has room.
++        // ([wcw] NOTE: an earlier diagnostic insertion here accidentally rebound this else to the
++        // msg==0x29C check, letting blocking 0x29C sends post into a full queue. Restored.)
+         while (MQ_IS_FULL(mq)) {
+             debug_printf("[Message Queue] Thread %d is blocked on send\n", TO_PTR(OSThread, ultramodern::this_thread())->id);
+             ultramodern::thread_queue_insert(PASS_RDRAM GET_MEMBER(OSMesgQueue, mq_, blocked_on_send), ultramodern::this_thread());
+             ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
+         }
+     }
++    if ((uint32_t)msg == 0x29B) wcw_spb_delivered.fetch_add(1);
++    if ((uint32_t)msg == 0x29C) wcw_dpc_delivered.fetch_add(1);
++    if ((uint32_t)mq_ == wcw_ai_mq.load()) {
++        wcw_ai_del.fetch_add(1);
++        int64_t lat = wcw_now_ms() - wcw_ai_enq_ms.load();
++        if (lat > wcw_ai_maxlat.load()) wcw_ai_maxlat.store(lat);
++    }
++    if ((uint32_t)mq_ == wcw_vi_mq.load()) {
++        wcw_vi_del.fetch_add(1);
++        int64_t lat = wcw_now_ms() - wcw_vi_enq_ms.load();
++        if (lat > wcw_vi_maxlat.load()) wcw_vi_maxlat.store(lat);
++    }
+     
+     if (jam) {
+         // Jams insert at the head of the message queue's buffer.
+@@ -156,9 +212,21 @@ extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags)
+     // Handle any messages that have been received from an external thread.
+     dequeue_external_messages(PASS_RDRAM1);
+ 
++    // [wcw] DIAGNOSTIC: every frame-ready (send to 0x80040FC0) log the present pointer the game
++    // left in 0x80040FFC — nonzero = func_800033A0 present-with-DL, zero = func_800033E8 sync-only.
++    if ((uint32_t)mq_ == 0x80040FC0) {
++        static int fn = 0;
++        if (fn++ < 80) {
++            uint32_t off = 0x40FFC;
++            uint32_t pp = ((uint32_t)rdram[(off+0)^3] << 24) | ((uint32_t)rdram[(off+1)^3] << 16)
++                        | ((uint32_t)rdram[(off+2)^3] << 8)  | ((uint32_t)rdram[(off+3)^3]);
++            fprintf(stderr, "[wcw][frame#%d] presentptr=0x%08X\n", fn, pp);
++        }
++    }
++
+     // Try to send the message.
+     bool sent = do_send(PASS_RDRAM mq_, msg, jam, flags == OS_MESG_BLOCK);
+-    
++
+     // Check the queue to see if this thread should swap execution to another.
+     ultramodern::check_running_queue(PASS_RDRAM1);
+ 
+@@ -195,11 +263,26 @@ extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32
+     // Handle any messages that have been received from an external thread.
+     dequeue_external_messages(PASS_RDRAM1);
+ 
++    // [wcw] DIAGNOSTIC: trace recv calls to find where the game thread parks.
++    static int rn = 0;
++    if (rn < 80) fprintf(stderr, "[wcw][recv#%d] mq=0x%X block=%d validCount=%d\n", rn, (unsigned)mq_, (int)(flags == OS_MESG_BLOCK), mq ? (int)mq->validCount : -1);
++#ifdef _WIN32
++    if (rn == 0 && flags == OS_MESG_BLOCK) {
++        void* fr[24]; unsigned short n = RtlCaptureStackBackTrace(0, 24, fr, nullptr);
++        HMODULE base = GetModuleHandleW(nullptr);
++        fprintf(stderr, "[wcw][recv#0] base=%p frames:", (void*)base);
++        for (unsigned short i = 0; i < n; i++) fprintf(stderr, " +0x%llX", (unsigned long long)((uintptr_t)fr[i] - (uintptr_t)base));
++        fprintf(stderr, "\n");
++    }
++#endif
++    rn++;
++
+     // Try to receive a message.
+     bool received = do_recv(PASS_RDRAM mq_, msg_, flags == OS_MESG_BLOCK);
+-    
++
+     // Check the queue to see if this thread should swap execution to another.
+     ultramodern::check_running_queue(PASS_RDRAM1);
+ 
++    if (rn <= 80) fprintf(stderr, "[wcw][recv#%d] -> %s\n", rn - 1, received ? "got msg" : "empty");
+     return received ? 0 : -1;
+ }
+diff --git a/ultramodern/src/threads.cpp b/ultramodern/src/threads.cpp
+index 812c556..3be797f 100644
+--- a/ultramodern/src/threads.cpp
++++ b/ultramodern/src/threads.cpp
+@@ -185,6 +185,8 @@ void ultramodern::resume_thread_and_wait(RDRAM_ARG OSThread *t) {
+ static void _thread_func(RDRAM_ARG PTR(OSThread) self_, PTR(thread_func_t) entrypoint, PTR(void) arg, UltraThreadContext* thread_context) {
+     OSThread *self = TO_PTR(OSThread, self_);
+     debug_printf("[Thread] Thread created: %d\n", self->id);
++    // [wcw] map game thread ids to their entry PCs (to identify threads in traces)
++    fprintf(stderr, "[wcw][thread] id=%d entry=0x%08X pri=%d\n", self->id, (unsigned)(uint32_t)entrypoint, self->priority);
+     thread_self = self_;
+     is_game_thread = true;
+ 
+diff --git a/ultramodern/src/timer.cpp b/ultramodern/src/timer.cpp
+index 276301b..1dcdb8e 100644
+--- a/ultramodern/src/timer.cpp
++++ b/ultramodern/src/timer.cpp
+@@ -192,6 +192,14 @@ extern "C" int osSetTimer(RDRAM_ARG PTR(OSTimer) t_, OSTime countdown, OSTime in
+     t->mq = mq;
+     t->msg = msg;
+ 
++    // [wcw] identify who registers periodic timers (they keep firing into full queues post-freeze)
++    {
++        static int n = 0;
++        if (n++ < 30) fprintf(stderr, "[wcw][osSetTimer] t=0x%X countdown=%llu interval=%llu mq=0x%X msg=0x%X\n",
++            (unsigned)(uint32_t)t_, (unsigned long long)countdown, (unsigned long long)interval,
++            (unsigned)(uint32_t)mq, (unsigned)(uint32_t)msg);
++    }
++
+     timer_context.action_queue.enqueue(AddTimerAction{ t_ });
+ 
+     return 0;

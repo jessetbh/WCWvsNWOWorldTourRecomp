@@ -1,0 +1,730 @@
+diff --git a/src/common/rt64_enhancement_configuration.cpp b/src/common/rt64_enhancement_configuration.cpp
+index 1194a96..432e1ab 100644
+--- a/src/common/rt64_enhancement_configuration.cpp
++++ b/src/common/rt64_enhancement_configuration.cpp
+@@ -9,7 +9,14 @@ namespace RT64 {
+     
+     EnhancementConfiguration::EnhancementConfiguration() {
+         framebuffer.reinterpretFixULS = true;
+-        presentation.mode = Presentation::Mode::SkipBuffering;
++        // [wcw fix] was SkipBuffering. SkipBuffering redirects the present to the framebuffer
++        // the game is CURRENTLY drawing into (latency optimization, assumes one gfx task per
++        // visual frame). WCW builds each frame from MULTIPLE gfx tasks (separate clear + draw
++        // tasks, up to ~4-5/frame in cinematics), so SkipBuffering presented the buffer between
++        // the clear-task and the draw-tasks -> 1 in 3 presents was pure black (measured via
++        // swapchain readback; visible as constant black flicker). Console mode presents the VI
++        // origin buffer, which the game only swaps in once its content is final.
++        presentation.mode = Presentation::Mode::Console;
+         presentation.removeBlackBorders = true;
+         rect.fixRectLR = true;
+         f3dex.forceBranch = false;
+diff --git a/src/gbi/rt64_gbi.cpp b/src/gbi/rt64_gbi.cpp
+index 7006549..e98169d 100644
+--- a/src/gbi/rt64_gbi.cpp
++++ b/src/gbi/rt64_gbi.cpp
+@@ -459,6 +459,10 @@ namespace RT64 {
+             return nullptr;
+         }
+ 
++        // [wcw] DIAGNOSTIC: report which GBI the ucode hash matched.
++        fprintf(stderr, "[wcw][gbi] matched ucode: name='%s' enum=%d (text=0x%X data=0x%X)\n",
++            matchingInstance->name, (int)matchingInstance->ucode, textAddress, dataAddress);
++
+         GBI &gbi = gbiCache[uint32_t(matchingInstance->ucode)];
+         if (gbi.ucode == GBIUCode::Unknown) {
+             gbi.ucode = matchingInstance->ucode;
+diff --git a/src/hle/rt64_application.cpp b/src/hle/rt64_application.cpp
+index 785de27..cb5f3b9 100644
+--- a/src/hle/rt64_application.cpp
++++ b/src/hle/rt64_application.cpp
+@@ -116,6 +116,7 @@ namespace RT64 {
+         }
+ #   endif
+ 
++        fprintf(stderr, "[rt64setup] interpreter/state ok; creating window\n");
+         // Create the application window.
+         const char *windowTitle = "RT64";
+         appWindow = std::make_unique<ApplicationWindow>();
+@@ -125,12 +126,15 @@ namespace RT64 {
+         else {
+             appWindow->setup(windowTitle, this);
+         }
++        fprintf(stderr, "[rt64setup] appWindow setup ok; detecting refresh rate\n");
+ 
+         // Detect refresh rate from the display the window is located at.
+         appWindow->detectRefreshRate();
++        fprintf(stderr, "[rt64setup] refresh rate ok\n");
+ 
+         // Resolve the graphics API option in case it's automatic.
+         chosenGraphicsAPI = UserConfiguration::resolveGraphicsAPI(userConfig.graphicsAPI);
++        fprintf(stderr, "[rt64setup] resolved API = %d\n", (int)chosenGraphicsAPI);
+ 
+ #   ifdef _WIN64
+         // Windows can try falling back to the other API option in case of failure.
+@@ -181,9 +185,11 @@ namespace RT64 {
+                 return SetupResult::InvalidGraphicsAPI;
+             }
+ 
++            fprintf(stderr, "[rt64setup] render interface created = %p; creating device\n", (void*)renderInterface.get());
+             if (renderInterface != nullptr) {
+                 // Create the render device.
+                 device = renderInterface->createDevice();
++                fprintf(stderr, "[rt64setup] createDevice -> %p\n", (void*)device.get());
+             }
+         }
+ 
+@@ -511,6 +517,18 @@ namespace RT64 {
+ 
+     void Application::updateScreen() {
+         appWindow->sdlCheckFilterInstallation();
++        // [wcw] Set WCW_INSPECTOR=1 to auto-open the RT64 frame inspector at startup (it renders
++        // and is visible, but mouse interaction doesn't work yet — the frontend doesn't forward
++        // win32 messages to Application::windowMessageFilter).
++        { static bool checked = false;
++          if (!checked && (presentQueue != nullptr)) {
++            checked = true;
++            if (getenv("WCW_INSPECTOR") != nullptr) {
++                userConfig.developerMode = true;
++                processDeveloperShortcut(DeveloperShortcut::Inspector);
++                fprintf(stderr, "[wcw][inspector] auto-opened (developer mode forced)\n");
++            }
++          } }
+         screenApiProfiler.logAndRestart();
+         state->updateScreen(core.decodeVI(), false);
+     }
+diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
+index 3227ab1..2710429 100644
+--- a/src/hle/rt64_present_queue.cpp
++++ b/src/hle/rt64_present_queue.cpp
+@@ -116,6 +116,8 @@ namespace RT64 {
+ 
+         RenderTarget *colorTarget = nullptr;
+         int32_t framesToPresent = 1;
++        int wcw_reason = 0; // [wcw] DIAGNOSTIC present outcome: 0=vi-not-visible 1=ok 2=target-empty 3=scratch
++        uint32_t wcw_addr = 0; // [wcw] DIAGNOSTIC: address of the fb actually presented
+         bool lockedWorkloadMutex = false;
+         InterpolatedFrameCounters &frameCounters = ext.sharedResources->interpolatedFrames[ext.sharedResources->interpolatedFramesIndex];
+ 
+@@ -127,6 +129,15 @@ namespace RT64 {
+         
+         // Perform any external write operations indicated by the event.
+         if (!present.fbOperations.empty()) {
++            // [wcw] DIAGNOSTIC: fbOperations upload RDRAM contents ONTO render targets before
++            // presenting. WCW's fb RDRAM is never written back by RT64, so a WriteChanges op
++            // aimed at a presented fb would splat stale/black RAM over the rendered frame.
++            { static int fo = 0;
++              for (const auto &op : present.fbOperations) {
++                  if (fo < 40 || (fo % 60) == 0) fprintf(stderr, "[wcw][fbop#%d] type=%d addr=0x%X\n",
++                      fo, (int)op.type, (op.type == FramebufferOperation::Type::WriteChanges) ? op.writeChanges.address : 0);
++                  fo++;
++              } }
+             const std::scoped_lock lock(screenFbChangePoolMutex);
+             {
+                 RenderWorkerExecution workerExecution(ext.presentGraphicsWorker);
+@@ -194,9 +205,27 @@ namespace RT64 {
+                     ext.sharedResources->workloadMutex.lock();
+                 }
+ 
++                // [wcw fix] The base-frame (i=0) present samples the LIVE render target, which
++                // threadRenderFrame concurrently re-renders under workloadMutex on another GPU
++                // queue. Upstream only took the lock when interpolation was disabled, so the
++                // present blit raced the render and showed cleared/partial content — measured
++                // as 1 of every 3 presents being pure black at 20 fps (visible black flicker).
++                // Take the lock in the interpolation path too; the loop below releases it right
++                // after the i=0 present. Skip only MSAA multi-frame presents (their i=0 uses an
++                // interpolated COPY and waits on the workload queue, which would deadlock here).
++                if (!lockedWorkloadMutex && !(usingMSAA && (framesToPresent > 1))) {
++                    lockedWorkloadMutex = true;
++                    ext.sharedResources->workloadMutex.lock();
++                }
++
+                 RenderTargetKey colorTargetKey(presentFb->addressStart, presentFb->width, presentFb->siz, Framebuffer::Type::Color);
+                 colorTarget = &targetManager.get(colorTargetKey, true);
++                // [wcw] DIAGNOSTIC: report whether the present found a non-empty rendered target.
++                { static int pn = 0; if ((pn++ % 61) == 0) fprintf(stderr, "[wcw][blit#%d] addr=0x%X w=%d siz=%d empty=%d interp=%d\n",
++                    pn, presentFb->addressStart, (int)presentFb->width, (int)presentFb->siz, (int)colorTarget->isEmpty(), (int)presentFb->interpolationEnabled); }
+                 if (!colorTarget->isEmpty()) {
++                    wcw_reason = 1;
++                    wcw_addr = presentFb->addressStart;
+                     // If a depth framebuffer is about to be shown, convert it to color.
+                     if (presentFb->isLastWriteDifferent(Framebuffer::Type::Color)) {
+                         RenderTargetKey otherColorTargetKey(presentFb->addressStart, presentFb->width, presentFb->siz, presentFb->lastWriteType);
+@@ -210,6 +239,7 @@ namespace RT64 {
+                 }
+                 else {
+                     colorTarget = nullptr;
++                    wcw_reason = 2;
+                 }
+ 
+                 if (!present.paused && (viHistory.top().vi != present.screenVI)) {
+@@ -219,6 +249,13 @@ namespace RT64 {
+             else {
+                 uint32_t fbAddress = present.screenVI.fbAddress();
+ 
++                // [wcw] DIAGNOSTIC: count scratch-path presents. This path RESIZES the shared
++                // render target down to native size (destroying the rendered hi-res texture),
++                // clears it, and uploads the RDRAM copy (black — RT64 never writes back), which
++                // would wipe the rendered frame and explain the black screen.
++                { static int sp = 0; if ((sp++ % 30) == 0) fprintf(stderr, "[wcw][scratch-present#%d] fbAddr=0x%X (fb lookup MISSED)\n", sp, fbAddress); }
++                wcw_reason = 3;
++
+                 // Use a scratch framebuffer to upload the RAM to the render target.
+                 hlslpp::uint2 fbSize = present.screenVI.fbSize();
+                 scratchFb.addressStart = fbAddress;
+@@ -266,6 +303,10 @@ namespace RT64 {
+             }
+         }
+         
++        // [wcw] DIAGNOSTIC: if framesToPresent is 0, nothing is ever blitted to the swap chain.
++        { static int fp = 0; if ((fp++ % 60) == 0) fprintf(stderr, "[wcw][present-loop#%d] framesToPresent=%d counters.count=%u avail=%u target=%p swapValid=%d\n",
++            fp, framesToPresent, frameCounters.count, frameCounters.available, (void*)colorTarget, (int)swapChainValid); }
++
+         for (int32_t i = 0; i < framesToPresent; i++) {
+             uint32_t frameCountersNextPresented = 0;
+             if ((framesToPresent > 1) && (usingMSAA || (i > 0))) {
+@@ -299,8 +340,11 @@ namespace RT64 {
+ 
+             uint32_t swapChainIndex = 0;
+             const bool presentFrame = (i < framesToPresent) && swapChainValid;
++            double wcwAcqMs = 0.0;
+             if (presentFrame) {
++                auto wcwAcq0 = std::chrono::steady_clock::now();
+                 swapChainValid = ext.swapChain->acquireTexture(acquiredSemaphore.get(), &swapChainIndex);
++                wcwAcqMs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - wcwAcq0).count() / 1000.0;
+             }
+ 
+             if (presentFrame && swapChainValid) {
+@@ -340,6 +384,20 @@ namespace RT64 {
+                     }
+                 }
+                 
++                { // [wcw] DIAGNOSTIC: per-60-presents outcome accounting. A null source texture
++                  // means this present draws ONLY the clear -> a pure black frame on screen.
++                    static int prCnt = 0, prBlack = 0, prReason[4] = {};
++                    static double acqSum = 0.0, acqMax = 0.0;
++                    if (renderParams.texture == nullptr) prBlack++;
++                    prReason[wcw_reason]++;
++                    acqSum += wcwAcqMs; if (wcwAcqMs > acqMax) acqMax = wcwAcqMs;
++                    if (++prCnt >= 60) {
++                        fprintf(stderr, "[wcw][present] last %d presents: black=%d | notvis=%d ok=%d empty=%d scratch=%d | acquire avg=%.1fms max=%.1fms\n",
++                            prCnt, prBlack, prReason[0], prReason[1], prReason[2], prReason[3], acqSum / prCnt, acqMax);
++                        prCnt = prBlack = 0; prReason[0] = prReason[1] = prReason[2] = prReason[3] = 0;
++                        acqSum = 0.0; acqMax = 0.0;
++                    }
++                }
+                 commandList->setFramebuffer(swapChainFramebuffer);
+                 commandList->clearColor();
+ 
+@@ -358,7 +416,38 @@ namespace RT64 {
+                     if (inspector != nullptr) {
+                         inspector->draw(commandList);
+                     }
+-                    
++
++                    // [wcw] DIAGNOSTIC (env WCW_PRESENT_LUM=1): copy the finished swapchain image
++                    // into a readback buffer so the ACTUAL presented pixels can be verified CPU-side
++                    // (ground truth below the OS — screen captures are unreliable with MPO).
++                    static const bool wcwLum = getenv("WCW_PRESENT_LUM") != nullptr;
++                    // BMP dump window configurable: WCW_BMP_START (default 600), WCW_BMP_COUNT
++                    // (default 13), WCW_LUM_END (default 1500) — lets captures target any moment
++                    // (e.g. in-game menus) instead of only early boot.
++                    static const int wcwBmpStart = getenv("WCW_BMP_START") ? atoi(getenv("WCW_BMP_START")) : 600;
++                    static const int wcwBmpCount = getenv("WCW_BMP_COUNT") ? atoi(getenv("WCW_BMP_COUNT")) : 13;
++                    static const int wcwLumEnd = getenv("WCW_LUM_END") ? atoi(getenv("WCW_LUM_END")) : 1500;
++                    static std::unique_ptr<RenderBuffer> wcwReadback;
++                    static uint32_t wcwRbW = 0, wcwRbH = 0, wcwRbRow = 0;
++                    static int wcwPresentN = 0;
++                    bool wcwDoRead = false;
++                    if (wcwLum) {
++                        wcwPresentN++;
++                        if (wcwPresentN >= 240 && wcwPresentN <= wcwLumEnd) {
++                            uint32_t w = ext.swapChain->getWidth(), h = ext.swapChain->getHeight();
++                            uint32_t row = (w + 63) & ~63u;
++                            if (!wcwReadback || wcwRbW != w || wcwRbH != h) {
++                                wcwReadback = ext.device->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(row) * h * 4));
++                                wcwRbW = w; wcwRbH = h; wcwRbRow = row;
++                            }
++                            commandList->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(swapChainTexture, RenderTextureLayout::COPY_SOURCE));
++                            commandList->copyTextureRegion(
++                                RenderTextureCopyLocation::PlacedFootprint(wcwReadback.get(), RenderFormat::B8G8R8A8_UNORM, wcwRbW, wcwRbH, 1, wcwRbRow, 0),
++                                RenderTextureCopyLocation::Subresource(swapChainTexture));
++                            wcwDoRead = true;
++                        }
++                    }
++
+                     commandList->barriers(RenderBarrierStage::NONE, RenderTextureBarrier(swapChainTexture, RenderTextureLayout::PRESENT));
+                     commandList->end();
+                     const RenderCommandList *commandList = ext.presentGraphicsWorker->commandList.get();
+@@ -366,6 +455,44 @@ namespace RT64 {
+                     RenderCommandSemaphore *signalSemaphore = drawSemaphores[swapChainIndex].get();
+                     ext.presentGraphicsWorker->commandQueue->executeCommandLists(&commandList, 1, &waitSemaphore, 1, &signalSemaphore, 1, ext.presentGraphicsWorker->commandFence.get());
+                     ext.presentGraphicsWorker->wait();
++
++                    if (wcwDoRead) {
++                        const uint8_t *p = (const uint8_t *)(wcwReadback->map(0, nullptr));
++                        uint64_t sum = 0; uint32_t cnt = 0;
++                        for (uint32_t y = 0; y < wcwRbH; y += 8) {
++                            const uint8_t *rowp = p + uint64_t(y) * wcwRbRow * 4;
++                            for (uint32_t x = 0; x < wcwRbW; x += 8) {
++                                const uint8_t *px = rowp + uint64_t(x) * 4;
++                                sum += px[0] + px[1] + px[2];
++                                cnt += 3;
++                            }
++                        }
++                        static FILE *lumf = nullptr;
++                        if (lumf == nullptr) lumf = fopen("wcw_present_lum.csv", "w");
++                        if (lumf != nullptr) {
++                            double msNow = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 1000.0;
++                            fprintf(lumf, "%d,%.1f,0x%X,0x%X,%.2f\n", wcwPresentN, msNow, present.screenVI.fbAddress(), wcw_addr, double(sum) / cnt);
++                            fflush(lumf);
++                        }
++                        if (wcwPresentN >= wcwBmpStart && wcwPresentN < wcwBmpStart + wcwBmpCount) {
++                            char name[64]; snprintf(name, sizeof(name), "wcw_present_%04d.bmp", wcwPresentN);
++                            FILE *bf = fopen(name, "wb");
++                            if (bf != nullptr) {
++                                uint32_t imgSize = wcwRbW * wcwRbH * 4, fileSize = 54 + imgSize, off54 = 54, ihs = 40;
++                                int32_t negH = -int32_t(wcwRbH);
++                                uint16_t planes = 1, bpp = 32;
++                                uint8_t hdr[54] = {};
++                                hdr[0] = 'B'; hdr[1] = 'M';
++                                memcpy(hdr + 2, &fileSize, 4); memcpy(hdr + 10, &off54, 4); memcpy(hdr + 14, &ihs, 4);
++                                memcpy(hdr + 18, &wcwRbW, 4); memcpy(hdr + 22, &negH, 4);
++                                memcpy(hdr + 26, &planes, 2); memcpy(hdr + 28, &bpp, 2); memcpy(hdr + 34, &imgSize, 4);
++                                fwrite(hdr, 1, 54, bf);
++                                for (uint32_t y = 0; y < wcwRbH; y++) fwrite(p + uint64_t(y) * wcwRbRow * 4, 1, uint64_t(wcwRbW) * 4, bf);
++                                fclose(bf);
++                            }
++                        }
++                        wcwReadback->unmap();
++                    }
+                 }
+             }
+ 
+@@ -460,6 +587,18 @@ namespace RT64 {
+                     processCursor = threadCursor;
+                     threadCursor = (threadCursor + 1) % presents.size();
+                     skipPresent = (writeCursor != threadCursor);
++                    { // [wcw] DIAGNOSTIC (WCW_PRESENT_LUM=1): present-ring processing trace.
++                        static const bool wcwQlog = getenv("WCW_PRESENT_LUM") != nullptr;
++                        if (wcwQlog) {
++                            static FILE *qf = nullptr;
++                            if (qf == nullptr) qf = fopen("wcw_pring_log.csv", "w");
++                            if (qf != nullptr) {
++                                double ms = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 1000.0;
++                                fprintf(qf, "%.1f,proc,%d,%d,%d\n", ms, processCursor, writeCursor, (int)skipPresent);
++                                fflush(qf);
++                            }
++                        }
++                    }
+                 }
+             }
+ 
+diff --git a/src/hle/rt64_rdp.cpp b/src/hle/rt64_rdp.cpp
+index a10c11a..c113f3e 100644
+--- a/src/hle/rt64_rdp.cpp
++++ b/src/hle/rt64_rdp.cpp
+@@ -401,6 +401,12 @@ namespace RT64 {
+         uint32_t tmemStride, uint32_t wordsPerRow, uint32_t rowCount, uint32_t dxtIncrement = 0)
+     {
+         assert((!BLOCK || (rowCount == 1)) && "Load block must behave as if it only loads one row of data.");
++        // [wcw] DIAGNOSTIC: checksum the source RDRAM bytes of texture loads. If sums are zero,
++        // the game's texture data in RDRAM is zeros (game-side data bug, e.g. decompression);
++        // if nonzero, texture data is real and the problem is downstream in the texture path.
++        { static int tl = 0; if ((tl++ % 500) == 0) {
++            uint32_t sum = 0; for (uint32_t i = 0; i < 256; i++) { sum += RDRAM[(textureStart + i) ^ 3]; }
++            fprintf(stderr, "[wcw][tmemload#%d] src=0x%X words=%u rows=%u first256sum=0x%X\n", tl, textureStart, wordsPerRow, rowCount, sum); } }
+         
+         const uint32_t DXTSwap = 0x800;
+         uint32_t textureAddress, tmemAddress, wordCount, tmemMask, tmemAdvance;
+@@ -775,6 +781,8 @@ namespace RT64 {
+     }
+ 
+     void RDP::loadTLUT(uint8_t tile, uint16_t uls, uint16_t ult, uint16_t lrs, uint16_t lrt) {
++        // [wcw] DIAGNOSTIC: does the game ever load a palette via the proper TLUT command?
++        { static int lt = 0; if ((lt++ % 200) == 0) fprintf(stderr, "[wcw][loadtlut#%d] tile=%d uls=%d lrs=%d (tmem=0x%X)\n", lt, (int)tile, uls>>2, lrs>>2, (unsigned)tiles[tile].tmem << 3); }
+ #ifdef LOG_LOAD_METHODS
+         RT64_LOG_PRINTF("RDP::loadTLUT(tile %u, uls %u, ult %u, lrs %u, lrt %u)", tile, uls, ult, lrs, lrt);
+ #endif
+@@ -972,6 +980,8 @@ namespace RT64 {
+     }
+     
+     void RDP::setScissor(uint8_t mode, int32_t ulx, int32_t uly, int32_t lrx, int32_t lry, const ExtendedAlignment &extAlignment) {
++        // [wcw] DIAGNOSTIC: log scissor settings (empty scissor clips ALL draws -> black target).
++        { static int sc = 0; if ((sc++ % 200) == 0) fprintf(stderr, "[wcw][scissor#%d] mode=%d (%d,%d)-(%d,%d)\n", sc, (int)mode, ulx>>2, uly>>2, lrx>>2, lry>>2); }
+         FixedRect &scissorRect = scissorRectStack[scissorStackSize - 1];
+         scissorRect.ulx = std::clamp(movedFromOrigin(ulx + extAlignment.leftOffset, extAlignment.leftOrigin), extAlignment.leftBound, extAlignment.rightBound);
+         scissorRect.uly = std::clamp(uly + extAlignment.topOffset, extAlignment.topBound, extAlignment.bottomBound);
+@@ -1034,6 +1044,8 @@ namespace RT64 {
+ #   ifdef LOG_FILLRECT_METHODS
+         RT64_LOG_PRINTF("RDP::fillRect(ulx %d, uly %d, lrx %d, lry %d)", ulx, uly, lrx, lry);
+ #   endif
++        // [wcw] DIAGNOSTIC: count fill rects (clears) + log fill color occasionally.
++        { static int fr = 0; if ((fr++ % 120) == 0) fprintf(stderr, "[wcw][fillrect#%d] (%d,%d)-(%d,%d) fillColor=0x%08X\n", fr, ulx>>2, uly>>2, lrx>>2, lry>>2, fillColorStack[fillColorStackSize - 1]); }
+ 
+         // Filter out incorrect rectangles.
+         if ((lrx < ulx) || (lry < uly)) {
+@@ -1318,6 +1330,17 @@ namespace RT64 {
+     }
+     
+     void RDP::drawTexRect(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry, uint8_t tile, int16_t uls, int16_t ult, int16_t dsdx, int16_t dtdy, bool flip, const ExtendedAlignment &extAlignment) {
++        // [wcw] DIAGNOSTIC: count texture rects (2D blits — logos/menus draw with these), and log
++        // the color state — if prim/env are black and the combiner multiplies by them, everything
++        // draws black (stuck intro fade).
++        { static int tr = 0; if ((tr++ % 200) == 0) {
++            const hlslpp::float4& pc = primColorStack[primColorStackSize - 1];
++            const hlslpp::float4& ec = envColorStack[envColorStackSize - 1];
++            fprintf(stderr, "[wcw][texrect#%d] (%d,%d)-(%d,%d) tilefmt=%d tilesiz=%d tlut=0x%X prim=(%.2f,%.2f,%.2f,%.2f) cc=0x%08X%08X\n",
++                tr, ulx>>2, uly>>2, lrx>>2, lry>>2,
++                (int)tiles[tile].fmt, (int)tiles[tile].siz, (unsigned)otherMode.textLUT(),
++                (float)pc.x, (float)pc.y, (float)pc.z, (float)pc.w,
++                (unsigned)colorCombinerStack[colorCombinerStackSize-1].H, (unsigned)colorCombinerStack[colorCombinerStackSize-1].L); (void)ec; } }
+ #   ifdef LOG_TEXRECT_METHODS
+         RT64_LOG_PRINTF("RDP::drawTexRect(ulx %d, uly %d, lrx %d, lry %d, tile %u, uls %d, ult %d, dsdx %d, dtdy %d, flip %u)", ulx, uly, lrx, lry, tile, uls, ult, dsdx, dtdy, flip);
+ #   endif
+diff --git a/src/hle/rt64_rsp.cpp b/src/hle/rt64_rsp.cpp
+index ee2030b..cdba99d 100644
+--- a/src/hle/rt64_rsp.cpp
++++ b/src/hle/rt64_rsp.cpp
+@@ -131,6 +131,21 @@ namespace RT64 {
+         segments[seg] = address;
+     }
+ 
++    // [wcw fix] AKI-engine games (WCW/WWF) never load a projection matrix: they submit fully
++    // composed MVPs through G_FORCEMTX only. The projection stack top then stays at its zero
++    // reset value, which is singular — hlslpp::inverse() returns NaN and poisons every world
++    // transform (world = MVP * inv(VP)), which NaNs all GPU screen positions (black screen).
++    // Detect the never-loaded (all-zero) VP so callers can substitute identity (world = MVP).
++    static bool isMatrixZero(const hlslpp::float4x4 &m) {
++        const float *f = (const float *)&m;
++        for (int i = 0; i < 16; i++) {
++            if (f[i] != 0.0f) {
++                return false;
++            }
++        }
++        return true;
++    }
++
+     void RSP::matrixCommon(const hlslpp::float4x4 &floatMatrix, uint32_t address, uint8_t params) {
+         // Projection matrix.
+         hlslpp::float4x4 &viewMatrix = viewMatrixStack[projectionMatrixStackSize - 1];
+@@ -465,9 +480,18 @@ namespace RT64 {
+ 
+             uint32_t physicalAddress = projectionMatrixPhysicalAddressStack[projectionMatrixStackSize - 1];
+             workload.physicalAddressTransformMap.emplace(physicalAddress, uint32_t(drawData.viewProjTransformGroups.size()));
+-            drawData.viewTransforms.emplace_back(hlslpp::mul(extended.invViewMatrix, viewMatrixStack[projectionMatrixStackSize - 1]));
+-            drawData.projTransforms.emplace_back(hlslpp::mul(extended.invProjMatrix, projMatrixStack[projectionMatrixStackSize - 1]));
+-            drawData.viewProjTransforms.emplace_back(hlslpp::mul(extended.invViewProjMatrix, viewProjMatrixStack[projectionMatrixStackSize - 1]));
++            if (isMatrixZero(viewProjMatrixStack[projectionMatrixStackSize - 1])) {
++                // [wcw fix] no projection was ever loaded (forceMatrix-only game): use identity
++                // so viewProj * world == MVP holds with world = MVP.
++                drawData.viewTransforms.emplace_back(hlslpp::float4x4::identity());
++                drawData.projTransforms.emplace_back(hlslpp::float4x4::identity());
++                drawData.viewProjTransforms.emplace_back(hlslpp::float4x4::identity());
++            }
++            else {
++                drawData.viewTransforms.emplace_back(hlslpp::mul(extended.invViewMatrix, viewMatrixStack[projectionMatrixStackSize - 1]));
++                drawData.projTransforms.emplace_back(hlslpp::mul(extended.invProjMatrix, projMatrixStack[projectionMatrixStackSize - 1]));
++                drawData.viewProjTransforms.emplace_back(hlslpp::mul(extended.invViewProjMatrix, viewProjMatrixStack[projectionMatrixStackSize - 1]));
++            }
+             drawData.viewProjTransformGroups.emplace_back(extended.curViewProjMatrixIdGroupIndex);
+             drawData.rspViewports.emplace_back(viewportStack[viewportStackSize - 1]);
+             drawData.viewportOrigins.emplace_back(extended.viewportOriginStack[viewportStackSize - 1]);
+@@ -533,7 +557,13 @@ namespace RT64 {
+             modelViewProjInserted = false;
+ 
+             if (!projectionMatrixInversed) {
+-                invViewProjMatrixStack[projectionMatrixStackSize - 1] = hlslpp::inverse(viewProjMatrixStack[projectionMatrixStackSize - 1]);
++                if (isMatrixZero(viewProjMatrixStack[projectionMatrixStackSize - 1])) {
++                    // [wcw fix] singular zero VP (forceMatrix-only game): inverse() would be NaN.
++                    invViewProjMatrixStack[projectionMatrixStackSize - 1] = hlslpp::float4x4::identity();
++                }
++                else {
++                    invViewProjMatrixStack[projectionMatrixStackSize - 1] = hlslpp::inverse(viewProjMatrixStack[projectionMatrixStackSize - 1]);
++                }
+                 projectionMatrixInversed = true;
+             }
+ 
+@@ -1050,6 +1080,9 @@ namespace RT64 {
+     }
+ 
+     void RSP::drawIndexedTri(uint32_t a, uint32_t b, uint32_t c, bool rawGlobalIndices) {
++        // [wcw] DIAGNOSTIC: count triangle submissions (prints once per ~2000 tris; if this never
++        // prints, the game's display lists contain no geometry at all).
++        { static int tris = 0; if ((tris++ % 2000) == 0) fprintf(stderr, "[wcw][tri] total tris so far: %d\n", tris); }
+         // Copy mode is not supported when drawing regular tris and crashes the hardware.
+         const uint32_t cycleType = state->rdp->otherMode.cycleType();
+         assert(cycleType != G_CYC_COPY);
+diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
+index d249a97..35dfd36 100644
+--- a/src/hle/rt64_state.cpp
++++ b/src/hle/rt64_state.cpp
+@@ -1747,6 +1747,21 @@ namespace RT64 {
+             }
+         }
+         
++        { // [wcw] DIAGNOSTIC (WCW_PRESENT_LUM=1): timestamped workload SUBMISSION log (game-side
++          // thread), listing the color addresses of each fbPair, to correlate with render/present.
++            static const bool wcwSlog = getenv("WCW_PRESENT_LUM") != nullptr;
++            if (wcwSlog) {
++                static FILE *sf = nullptr;
++                if (sf == nullptr) sf = fopen("wcw_submit_log.csv", "w");
++                if (sf != nullptr) {
++                    double ms = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 1000.0;
++                    for (uint32_t f = 0; f < workload.fbPairCount; f++) {
++                        fprintf(sf, "%.1f,0x%X,%u\n", ms, workload.fbPairs[f].colorImage.address, f);
++                    }
++                    fflush(sf);
++                }
++            }
++        }
+         // Advance the workload queue at the end of a full synchronization.
+         advanceWorkload(workload, false);
+         ext.workloadQueue->advanceToNextWorkload();
+@@ -1870,6 +1885,15 @@ namespace RT64 {
+         screenCpuProfiler.start();
+         bool fbChangesMade = false;
+         bool screenChangesMade = false;
++        // [wcw] DIAGNOSTIC: once a second, report what the present path sees.
++        { static int n = 0;
++          if ((n++ % 60) == 0) {
++            Framebuffer* dbgFb = framebufferManager.find(screenFbAddress);
++            fprintf(stderr, "[wcw][present] visible=%d fbAddr=0x%X fbFound=%d fbW=%d viW=%d siz=%d/%d\n",
++                (int)newVI.visible(), screenFbAddress, dbgFb ? 1 : 0,
++                dbgFb ? (int)dbgFb->width : -1, (int)screenFbSize.x,
++                dbgFb ? (int)dbgFb->siz : -1, (int)screenFbSiz);
++          } }
+         if (newVI.visible()) {
+             // See if there's an existing framebuffer that lines up with the VI. If there is, we support reading 
+             // CPU changes directly to it and recreating them in the render thread at low resolution.
+diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
+index 5a331aa..ea37684 100644
+--- a/src/hle/rt64_workload_queue.cpp
++++ b/src/hle/rt64_workload_queue.cpp
+@@ -452,6 +452,22 @@ namespace RT64 {
+                     if (colorFb != nullptr) {
+                         fbKey.colorTargetKey = RenderTargetKey(colorFb->addressStart, colorFb->width, colorFb->siz, Framebuffer::Type::Color);
+                         colorTarget = &targetManager.get(fbKey.colorTargetKey);
++                        // [wcw] DIAGNOSTIC: which color targets does the workload render into?
++                        { static int rt = 0; if ((rt++ % 60) == 0) fprintf(stderr, "[wcw][render-target#%d] addr=0x%X w=%d siz=%d ptr=%p\n",
++                            rt, colorFb->addressStart, (int)colorFb->width, (int)colorFb->siz, (void*)colorTarget); }
++                        { // [wcw] DIAGNOSTIC (WCW_PRESENT_LUM=1): timestamped per-fbPair render log,
++                          // correlated offline with the present readback CSV (same steady clock).
++                            static const bool wcwRlog = getenv("WCW_PRESENT_LUM") != nullptr;
++                            if (wcwRlog) {
++                                static FILE *wf = nullptr;
++                                if (wf == nullptr) wf = fopen("wcw_render_log.csv", "w");
++                                if (wf != nullptr) {
++                                    double ms = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 1000.0;
++                                    fprintf(wf, "%.1f,0x%X,%d,%d\n", ms, colorFb->addressStart, (int)f, (int)fbPair.drawColorRect.bottom(true));
++                                    fflush(wf);
++                                }
++                            }
++                        }
+                     }
+                     else {
+                         colorTarget = nullptr;
+@@ -842,6 +858,32 @@ namespace RT64 {
+             framebufferRenderer->waitForUploaders();
+             ext.workloadGraphicsWorker->execute();
+             ext.workloadGraphicsWorker->wait();
++
++            // [wcw] DIAGNOSTIC: one-shot GPU readback of the rect vertex buffer (defaultBuffer)
++            // after the workload's GPU work completed. Compares GPU-side contents with the CPU
++            // source data — if GPU reads zeros, the upload copy is the broken link; if it matches,
++            // the vertex INPUT binding/layout is the bug.
++            { static int rbn = 0;
++              const auto& cpu = workload.drawData.triPosFloats;
++              auto& bufPair = workload.drawBuffers.triPosBuffer;
++              if ((rbn < 3) && (cpu.size() >= 8) && (bufPair.defaultBuffer != nullptr)) {
++                rbn++;
++                RenderWorker* w = ext.workloadGraphicsWorker;
++                const uint64_t bytes = 64; // 16 floats
++                std::unique_ptr<RenderBuffer> rbuf = w->device->createBuffer(RenderBufferDesc::ReadbackBuffer(bytes));
++                w->commandList->begin();
++                w->commandList->barriers(RenderBarrierStage::COPY, RenderBufferBarrier(bufPair.defaultBuffer.get(), RenderBufferAccess::READ));
++                w->commandList->copyBufferRegion(rbuf->at(0), bufPair.defaultBuffer->at(0), bytes);
++                w->commandList->end();
++                w->execute();
++                w->wait();
++                const float* g = (const float*)rbuf->map(0, nullptr);
++                fprintf(stderr, "[wcw][gpuverts#%d] GPU=(%.2f,%.2f,%.2f,%.2f)(%.2f,%.2f,%.2f,%.2f) CPU=(%.2f,%.2f,%.2f,%.2f)(%.2f,%.2f,%.2f,%.2f)\n",
++                    rbn, g[0],g[1],g[2],g[3],g[4],g[5],g[6],g[7],
++                    cpu[0],cpu[1],cpu[2],cpu[3],cpu[4],cpu[5],cpu[6],cpu[7]);
++                rbuf->unmap();
++              } }
++
+             workerMutex.unlock();
+ 
+             // Update the GPU profiler with the results from the timestamps of the frame.
+@@ -904,6 +946,32 @@ namespace RT64 {
+             if (processCursor >= 0) {
+                 std::unique_lock<std::mutex> threadLock(threadMutex);
+                 Workload &workload = workloads[processCursor];
++                // [wcw] DIAGNOSTIC: count workloads + checksum CPU-side draw data. If posFloats /
++                // rdpParams are zeros, the interpreter->drawData conversion is broken; if real,
++                // the GPU upload/consumption is the break.
++                { static int wl = 0; if ((wl++ % 61) == 0) {
++                    const auto& dd = workload.drawData;
++                    float posSum = 0.0f; for (size_t i = 0; i < dd.posFloats.size() && i < 256; i++) posSum += fabsf(dd.posFloats[i]);
++                    // [wcw] also checksum the RAW TRI (rect) vertices — the title screen is texrects,
++                    // which bind drawBuffers.triPosBuffer uploaded from drawData.triPosFloats.
++                    float rawSum = 0.0f; size_t rawN = dd.triPosFloats.size();
++                    for (size_t i = 0; i < rawN && i < 256; i++) rawSum += fabsf(dd.triPosFloats[i]);
++                    float raw0[8] = {0};
++                    for (size_t i = 0; i < 8 && i < rawN; i++) raw0[i] = dd.triPosFloats[i];
++                    fprintf(stderr, "[wcw][rawtris] count=%zu sum=%.1f v0=(%.1f,%.1f,%.1f,%.1f) v1=(%.1f,%.1f,%.1f,%.1f)\n",
++                        rawN / 4, rawSum, raw0[0], raw0[1], raw0[2], raw0[3], raw0[4], raw0[5], raw0[6], raw0[7]);
++                    uint32_t rdpSum = 0; const uint8_t* rp = (const uint8_t*)dd.rdpParams.data();
++                    for (size_t i = 0; i < dd.rdpParams.size() * sizeof(interop::RDPParams) && i < 512; i++) rdpSum += rp[i];
++                    fprintf(stderr, "[wcw][workload#%d] fbPairs=%d posFloats=%zu posSum=%.1f rdpParams=%zu rdpSum=0x%X\n",
++                        wl, (int)workload.fbPairCount, dd.posFloats.size(), posSum, dd.rdpParams.size(), rdpSum);
++                    for (uint32_t fp = 0; fp < workload.fbPairCount; fp++) {
++                        const auto& pair = workload.fbPairs[fp];
++                        fprintf(stderr, "[wcw]   fbPair[%u]: color=0x%X w=%d fmt=%d siz=%d depth=0x%X calls=%u projs=%u clearDepthOnly=%d fillRectOnly=%d drawRect=(%d,%d)-(%d,%d)\n",
++                            fp, pair.colorImage.address, (int)pair.colorImage.width, (int)pair.colorImage.fmt, (int)pair.colorImage.siz,
++                            pair.depthImage.address, pair.gameCallCount, pair.projectionCount,
++                            (int)pair.fastPaths.clearDepthOnly, (int)pair.fillRectOnly,
++                            pair.drawColorRect.left(false), pair.drawColorRect.top(false), pair.drawColorRect.right(false), pair.drawColorRect.bottom(false));
++                    } } }
+                 ext.presentQueue->waitForPresentId(workload.presentId);
+ 
+                 if (!threadsRunning) {
+@@ -986,7 +1054,10 @@ namespace RT64 {
+                     matchingProfiler.log();
+ 
+                     const bool displayRateAboveOriginal = (workload.viOriginalRate > 0) && (workloadConfig.targetRate > workload.viOriginalRate);
+-                    generateInterpolatedFrames = !workload.paused && displayRateAboveOriginal && !interpolationTargetKey.isEmpty();
++                    // [wcw] DIAGNOSTIC: WCW_NO_INTERP=1 disables interpolated-frame generation, to
++                    // test whether the black flicker frames are produced by the interpolation path.
++                    static const bool wcwNoInterp = getenv("WCW_NO_INTERP") != nullptr;
++                    generateInterpolatedFrames = !workload.paused && displayRateAboveOriginal && !interpolationTargetKey.isEmpty() && !wcwNoInterp;
+ 
+                     const bool resetTicks = !generateInterpolatedFrames || (originalRateForTicks != workload.viOriginalRate) || (displayRateForTicks != workloadConfig.targetRate) || !displayRateAboveOriginal;
+                     if (resetTicks) {
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index 9fae0d4..f1f0ab1 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -484,6 +484,10 @@ namespace RT64 {
+             worker->commandList->setGraphicsDescriptorSet(descTextureSet->get(), 1);
+             worker->commandList->setGraphicsDescriptorSet(descTextureSet->get(), 2);
+             worker->commandList->setGraphicsDescriptorSet(depthState ? descRealFbSet : descDummyFbSet, 3);
++            // [wcw] DIAGNOSTIC: log the actual GPU viewport used for the workload draws.
++            { static int vp = 0; if ((vp++ % 100) == 0) fprintf(stderr, "[wcw][gpuviewport#%d] x=%.1f y=%.1f w=%.1f h=%.1f minD=%.2f maxD=%.2f\n",
++                vp, framebuffer.viewport.x, framebuffer.viewport.y, framebuffer.viewport.width, framebuffer.viewport.height,
++                framebuffer.viewport.minDepth, framebuffer.viewport.maxDepth); }
+             worker->commandList->setViewports(framebuffer.viewport);
+         };
+ 
+@@ -546,6 +550,15 @@ namespace RT64 {
+                 assert(triangles.pipeline != nullptr);
+ 
+                 // Draw calls can sometimes end up with empty scissors and cause validation errors. We just skip them.
++                // [wcw] DIAGNOSTIC: count draws skipped due to empty scissor vs executed, log sample rects.
++                { static int skipped = 0, executed = 0, logged = 0;
++                  if (triangles.scissor.isEmpty()) {
++                    skipped++;
++                    if (logged < 8) { logged++; fprintf(stderr, "[wcw][SKIP-emptyscissor] #%d scissor=(%d,%d)-(%d,%d) viewport=(%.1f,%.1f %.1fx%.1f)\n",
++                        skipped, triangles.scissor.left, triangles.scissor.top, triangles.scissor.right, triangles.scissor.bottom,
++                        framebuffer.viewport.x, framebuffer.viewport.y, framebuffer.viewport.width, framebuffer.viewport.height); }
++                  } else { executed++; }
++                  if (((skipped + executed) % 2000) == 1) fprintf(stderr, "[wcw][drawexec] executed=%d skippedEmptyScissor=%d\n", executed, skipped); }
+                 if (triangles.scissor.isEmpty()) {
+                     continue;
+                 }
+@@ -576,6 +589,12 @@ namespace RT64 {
+                 rasterParams.screenOffset = triangles.screenOffset;
+                 worker->commandList->setGraphicsPushConstants(0, &rasterParams);
+ 
++                // [wcw] DIAGNOSTIC: log per-draw transform + count (degenerate scale = invisible).
++                { static int pd = 0; if ((pd++ % 500) == 0) fprintf(stderr, "[wcw][draw#%d] type=%d faces=%d scale=(%.3f,%.3f) offset=(%.3f,%.3f)\n",
++                    pd, (int)drawCall.type, (int)triangles.faceCount,
++                    (float)triangles.screenScale.x, (float)triangles.screenScale.y,
++                    (float)triangles.screenOffset.x, (float)triangles.screenOffset.y); }
++
+                 drawCallTriangles(drawCall);
+ 
+                 // Simulate dither noise.
+@@ -1607,6 +1626,8 @@ namespace RT64 {
+                     {
+                         triangles.shaderDesc = call.shaderDesc;
+ 
++                        // [wcw] NOTE (2026-06-12): forcing ubershader-only here was tested — same
++                        // all-black result, so uber and specialized raster shaders fail identically.
+                         RasterShader *gpuShader = p.ubershadersOnly ? nullptr : p.rasterShaderCache->getGPUShader(call.shaderDesc);
+                         if (gpuShader != nullptr) {
+                             triangles.pipeline = gpuShader->pipeline.get();
+@@ -1618,6 +1639,11 @@ namespace RT64 {
+                                 !copyMode && call.shaderDesc.otherMode.zUpd(),
+                                 (call.shaderDesc.otherMode.cvgDst() == CVG_DST_WRAP) || (call.shaderDesc.otherMode.cvgDst() == CVG_DST_SAVE));
+                         }
++                        // [wcw] DIAGNOSTIC: count draws and whether they got a real pipeline.
++                        { static int dc = 0, nullpipe = 0, uber = 0;
++                          if (triangles.pipeline == nullptr) nullpipe++;
++                          if (gpuShader == nullptr) uber++;
++                          if ((dc++ % 500) == 0) fprintf(stderr, "[wcw][drawcall#%d] nullPipelines=%d uberFallbacks=%d\n", dc, nullpipe, uber); }
+                         
+                         triangles.faceCount = call.callDesc.triangleCount;
+                         triangles.vertexTestZ = (vertexTestZCallIndex >= 0);
+diff --git a/src/render/rt64_raster_shader.cpp b/src/render/rt64_raster_shader.cpp
+index 721a01e..41ee077 100644
+--- a/src/render/rt64_raster_shader.cpp
++++ b/src/render/rt64_raster_shader.cpp
+@@ -348,6 +348,14 @@ namespace RT64 {
+     }
+     
+     RenderMultisampling RasterShader::generateMultisamplingPattern(RenderSampleCounts sampleCount, bool sampleLocationsSupported) {
++        // [wcw] WORKAROUND: force single-sampling. RenderDoc proved the game renders PERFECTLY
++        // into the MSAA target (the ASMIK logo is in the framebuffer), but the MSAA resolve the
++        // present blit samples comes out black — so with MSAA the screen shows nothing. Single
++        // sampling makes the blit sample the rendered texture directly. (Root-cause the resolve
++        // path later: RenderTarget::resolveTarget / recordRasterResolve.)
++        { static bool once = false; if (!once) { once = true;
++            fprintf(stderr, "[wcw][msaa] requested sampleCount=%d (forcing 1; see resolve workaround)\n", (int)sampleCount); } }
++        sampleCount = 1;
+ #   if SAMPLE_LOCATIONS_REQUIRED
+         if (!sampleLocationsSupported) {
+             return RenderMultisampling();
+diff --git a/src/render/rt64_render_target_manager.cpp b/src/render/rt64_render_target_manager.cpp
+index 494d99e..d3d406a 100644
+--- a/src/render/rt64_render_target_manager.cpp
++++ b/src/render/rt64_render_target_manager.cpp
+@@ -119,6 +119,18 @@ namespace RT64 {
+             assert((storage.depthTarget == depthTarget) && "Storage does not match the requested depth target.");
+             assert((colorTarget == nullptr) || (storage.colorTargetRevision == colorTarget->textureRevision) && "Storage does not match the requested color texture revision.");
+             assert((depthTarget == nullptr) || (storage.depthTargetRevision == depthTarget->textureRevision) && "Storage does not match the requested depth texture revision.");
++            // [wcw] The integrity checks above are asserts only — compiled out in Release. A stale
++            // entry here makes every draw render into a destroyed texture while the present samples
++            // the new one (silent black screen). Make the check real: detect and rebuild.
++            const bool stale =
++                (storage.colorTarget != colorTarget) || (storage.depthTarget != depthTarget) ||
++                ((colorTarget != nullptr) && (storage.colorTargetRevision != colorTarget->textureRevision)) ||
++                ((depthTarget != nullptr) && (storage.depthTargetRevision != depthTarget->textureRevision));
++            if (stale) {
++                static int n = 0;
++                if (n++ < 20) fprintf(stderr, "[wcw][fbcache] STALE framebuffer storage detected - rebuilding (hit #%d)\n", n);
++                storage.setup(device, framebufferKey, colorTarget, depthTarget);
++            }
+             return storage;
+         }
+ 
+diff --git a/src/render/rt64_vi_renderer.cpp b/src/render/rt64_vi_renderer.cpp
+index b4ff4e9..4f608d7 100644
+--- a/src/render/rt64_vi_renderer.cpp
++++ b/src/render/rt64_vi_renderer.cpp
+@@ -77,6 +77,15 @@ namespace RT64 {
+         pushConstants.videoResolution = computeHDSize(hlslpp::float2(p.vi->fbSize()), p.resolutionScale, p.downsamplingScale);
+         pushConstants.textureResolution = { float(p.textureWidth), float(p.textureHeight) };
+         pushConstants.gamma = p.vi->gamma();
++        // [wcw] DIAGNOSTIC: the shader samples with a BORDER sampler (out of range = black).
++        // Log the size math to catch a VI-vs-texture mismatch producing an all-border quad.
++        { static int vr = 0; if ((vr++ % 120) == 0) {
++            hlslpp::uint2 fbsz = p.vi->fbSize();
++            fprintf(stderr, "[wcw][viblit#%d] vi.fbSize=%ux%u videoRes=(%.0f,%.0f) texRes=(%.0f,%.0f) gamma=%d\n",
++                vr, (unsigned)fbsz.x, (unsigned)fbsz.y,
++                (float)pushConstants.videoResolution.x, (float)pushConstants.videoResolution.y,
++                (float)pushConstants.textureResolution.x, (float)pushConstants.textureResolution.y,
++                (int)pushConstants.gamma); } }
+ 
+         p.commandList->setPipeline(shader->pipeline.get());
+         p.commandList->setGraphicsPipelineLayout(shader->pipelineLayout.get());

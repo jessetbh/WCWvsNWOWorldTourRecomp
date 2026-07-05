@@ -1,0 +1,17 @@
+diff --git a/include/recomp.h b/include/recomp.h
+index 73f3e73..85578a2 100644
+--- a/include/recomp.h
++++ b/include/recomp.h
+@@ -468,6 +468,12 @@ void recomp_syscall_handler(uint8_t* rdram, recomp_context* ctx, int32_t instruc
+ 
+ void pause_self(uint8_t *rdram);
+ 
++// [wcw] SI/PIF primitives reimplemented in librecomp (src/si.cpp) for WCW's raw-SI controller
++// code. These are in N64Recomp's `ignored_funcs` (so no auto-generated funcs.h declaration);
++// declare them here since recomp.h is included by every recompiled translation unit.
++void __osSiRawStartDma_recomp(uint8_t* rdram, recomp_context* ctx);
++void __osSiDeviceBusy_recomp(uint8_t* rdram, recomp_context* ctx);
++
+ #ifdef __cplusplus
+ }
+ #endif

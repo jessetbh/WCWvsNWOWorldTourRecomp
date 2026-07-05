@@ -1,0 +1,64 @@
+diff --git a/plume_d3d12.cpp b/plume_d3d12.cpp
+index 8c239f4..527178a 100644
+--- a/plume_d3d12.cpp
++++ b/plume_d3d12.cpp
+@@ -2312,7 +2312,11 @@ namespace plume {
+ 
+         const D3D12_TEXTURE_COPY_LOCATION copyDstLocation = toD3D12(dstLocation);
+         const D3D12_TEXTURE_COPY_LOCATION copySrcLocation = toD3D12(srcLocation);
+-        setSamplePositions(dstLocation.texture);
++        // [wcw fix] dstLocation.texture is null for buffer (PlacedFootprint) destinations,
++        // i.e. texture->buffer readbacks; setSamplePositions dereferenced it unconditionally.
++        if (dstLocation.texture != nullptr) {
++            setSamplePositions(dstLocation.texture);
++        }
+         d3d->CopyTextureRegion(&copyDstLocation, dstX, dstY, dstZ, &copySrcLocation, (srcBox != nullptr) ? &copyBox : nullptr);
+         resetSamplePositions();
+     }
+@@ -3648,9 +3652,11 @@ namespace plume {
+         HRESULT res;
+         UINT adapterIndex = 0;
+         IDXGIAdapter1 *adapterOption = nullptr;
++        fprintf(stderr, "[d3d12dev] ctor start; enumerating adapters\n");
+         while (renderInterface->dxgiFactory->EnumAdapters1(adapterIndex++, &adapterOption) != DXGI_ERROR_NOT_FOUND) {
+             DXGI_ADAPTER_DESC1 adapterDesc;
+             adapterOption->GetDesc1(&adapterDesc);
++            fprintf(stderr, "[d3d12dev] adapter %u: '%ls' flags=0x%X\n", adapterIndex - 1, adapterDesc.Description, adapterDesc.Flags);
+ 
+             // Ignore remote or software adapters.
+             if (adapterDesc.Flags & (DXGI_ADAPTER_FLAG_REMOTE | DXGI_ADAPTER_FLAG_SOFTWARE)) {
+@@ -3660,6 +3666,7 @@ namespace plume {
+ 
+             ID3D12Device8 *deviceOption = nullptr;
+             res = D3D12CreateDevice(adapterOption, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&deviceOption));
++            fprintf(stderr, "[d3d12dev]   D3D12CreateDevice(Device8) res=0x%lX dev=%p\n", (unsigned long)res, (void*)deviceOption);
+             if (FAILED(res)) {
+                 adapterOption->Release();
+                 continue;
+@@ -4176,6 +4183,7 @@ namespace plume {
+     // D3D12Interface
+ 
+     D3D12Interface::D3D12Interface() {
++        fprintf(stderr, "[plumed3d12] ctor start\n");
+         // Create DXGI Factory.
+         UINT dxgiFactoryFlags = 0;
+ 
+@@ -4192,7 +4200,9 @@ namespace plume {
+         }
+ #   endif
+ 
+-        HRESULT res = CreateDXGIFactory2(dxgiFactoryFlags, IID_PPV_ARGS(&dxgiFactory));
++        fprintf(stderr, "[plumed3d12] calling CreateDXGIFactory1 (workaround)\n");
++        HRESULT res = CreateDXGIFactory1(IID_PPV_ARGS(&dxgiFactory));
++        fprintf(stderr, "[plumed3d12] CreateDXGIFactory1 res=0x%lX factory=%p\n", res, (void*)dxgiFactory);
+         if (FAILED(res)) {
+             fprintf(stderr, "CreateDXGIFactory2 failed with error code 0x%lX.\n", res);
+             return;
+@@ -4223,6 +4233,7 @@ namespace plume {
+ 
+             adapterOption->Release();
+         }
++        fprintf(stderr, "[plumed3d12] ctor done, %zu adapters\n", deviceNames.size());
+     }
+ 
+     D3D12Interface::~D3D12Interface() {
