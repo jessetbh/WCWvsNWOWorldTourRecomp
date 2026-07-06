@@ -183,8 +183,11 @@ wcw.toml patches.toml recompcontrollerdb.txt .gitmodules .gitignore
          too, until WCWSyms goes public).
       2. Actions secrets on the main repo: `WCW_CI_PAT` = that PAT,
          `WCW_ROM_REPO` = `jessetbh/wcw-rom-secret`.
-      3. An `external` environment (Settings → Environments) with required reviewers —
-         gates fork-PR builds in validate-external.yml.
+      3. ~~An `external` environment with required reviewers~~ → MOVED to Publish
+         step 3: environment protection rules (required reviewers) are a
+         public-repo-only feature on the Free plan, so it can't be configured while
+         the repo is private. No exposure meanwhile — private personal repos can't
+         be forked, so validate-external.yml can never fire before the flip.
 - [x] **D2: adapt `validate.yml`.** DONE 2026-07-06: `.github/workflows/` has
       validate.yml (workflow_call; inputs SDL2_VERSION / N64RECOMP_COMMIT (upstream
       `ffb39cd`, what RecompiledFuncs was generated with) / LLVM_VERSION; Windows-only
@@ -236,7 +239,12 @@ wcw.toml patches.toml recompcontrollerdb.txt .gitmodules .gitignore
 
 1. Phases A–B (repo shape) → push to GitHub as PRIVATE first; wire CI (D) against it.
 2. Phase C polish + E docs; QA (F) from a CI-built zip.
-3. Flip repo public; tag; GitHub release with zip + SHA256SUMS + template notes.
+3. Flip repo public (+ WCWSyms public at the same time); **immediately** create the
+   `external` environment: Settings → Environments → New environment → name exactly
+   `external` → check "Required reviewers" → add jessetbh → Save. (The checkbox only
+   appears once the repo is public — Free-plan limitation. This gates fork-PR access
+   to the ROM secret in validate-external.yml; do it before announcing the repo.)
+   Then tag; GitHub release with zip + SHA256SUMS + template notes.
 4. Post-release: watch issues; hotfix branch policy.
 
 ## Decisions needed from the project owner
