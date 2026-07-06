@@ -56,9 +56,11 @@ target_sources(RecompiledFuncs PRIVATE ${FUNC_C_SOURCES})
 # Mirrors BMHero's pipeline: make builds patches/patches.elf with a MIPS-capable clang,
 # N64Recomp (patches.toml) recompiles it into RecompiledPatches/patches.c + patches.bin,
 # file_to_c embeds the bin, and PatchesLib links it all into the exe.
-# NOTE: BOTH the VS BuildTools and llvm.org WINDOWS clang builds are trimmed to x86/ARM
-# backends (no MIPS), so the compiler here is `zig cc` (Zig bundles a full LLVM). lld's
-# MIPS support is unconditional, so any ld.lld links fine. Override on the configure
+# NOTE: the VS BuildTools clang and the llvm.org Windows INSTALLER are trimmed to
+# x86/ARM backends (no MIPS); use `zig cc` (Zig bundles a full LLVM) or the clang from
+# the portable llvm.org release archive (LLVM-<ver>-Windows-X64.tar.xz — full backend
+# set; CI uses it). lld's MIPS support is unconditional, so any ld.lld links fine.
+# ld.lld also ships inside VS BuildTools' LLVM (VC\Tools\Llvm\x64\bin). Override on the configure
 # line (-DPATCHES_C_COMPILER=... -DPATCHES_LD=... -DPATCHES_MAKE=...), put the tools on
 # PATH, or set them in an uncommitted local-config.cmake. See BUILDING.md.
 include(${CMAKE_SOURCE_DIR}/local-config.cmake OPTIONAL)
@@ -199,6 +201,10 @@ if (WIN32)
     if (MSVC)
         target_link_options(WCWRecompiled PRIVATE /OPT:NOICF)
     endif()
+    # Always emit a linker map: release crash backtraces print RVAs that are resolved
+    # against this file (see cycle.ps1 / BUILDING.md). Previously this came from an
+    # uncached local configure flag, which fresh clones and CI would silently lose.
+    target_link_options(WCWRecompiled PRIVATE /MAP:WCWRecompiled.map)
     # Bump the default thread stack reserve: ultramodern's gfx_thread (a std::thread, which
     # uses this PE default) reaches D3D12CreateDevice deep in its call stack, and that call
     # is very stack-hungry — on the default 1 MB it overflows (0xC0000409). 16 MB is safe.

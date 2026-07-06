@@ -72,9 +72,9 @@ RSPRecomp's job, handled separately in `../rsp/`.
 ## Symbols: how they're produced (symbol-TOML mode, not ELF)
 We do **not** assemble an ELF (no MIPS assembler on this machine). Instead
 `../tools/gen_symbols.py --overlays` parses these `.s` files (each function has a
-`nonmatching <name>, <size>` line + an address comment) and emits `../syms/dump.toml`
+`nonmatching <name>, <size>` line + an address comment) and emits `../WCWSyms/dump.toml`
 directly in N64Recomp's symbol-TOML format (1763 functions). N64Recomp then recompiles
-against the raw ROM in symbol-TOML mode. See `../syms/README.md`.
+against the raw ROM in symbol-TOML mode. See `../WCWSyms/README.md`.
 
 ## Status: this phase is DONE — the port boots and runs on these symbols
 The libultra identification that this disassembly enabled is complete enough that the

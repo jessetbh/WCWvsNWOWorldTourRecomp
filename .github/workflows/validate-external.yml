@@ -1,0 +1,23 @@
+# Fork PRs: pull_request_target exposes secrets, so the build is gated behind the
+# "external" GitHub environment — configure it in repo Settings > Environments with
+# required reviewers, so a maintainer approves each run before the ROM secret is used.
+name: validate-external
+on:
+  pull_request_target:
+    types: [opened, synchronize]
+jobs:
+  authorize:
+    if: github.repository != github.event.pull_request.head.repo.full_name
+    environment:
+      ${{ github.event_name == 'pull_request_target' &&
+      github.event.pull_request.head.repo.full_name != github.repository &&
+      'external' || 'internal' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ✓
+  build:
+    needs: authorize
+    uses: ./.github/workflows/validate.yml
+    secrets:
+      WCW_CI_PAT: ${{ secrets.WCW_CI_PAT }}
+      WCW_ROM_REPO: ${{ secrets.WCW_ROM_REPO }}

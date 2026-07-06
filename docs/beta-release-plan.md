@@ -47,8 +47,11 @@ Corrections to the earlier draft of this plan:
   theme. Trim with care and verify the menus still render; don't assume it's unused.
 - BMHero's Windows CI cross-compiles patches with the plain
   `LLVM-19.1.3-Windows-X64.tar.xz` release archive (NOT the `-pc-windows-msvc` one we
-  tried) — that artifact evidently includes the MIPS backend. Worth one test; if it
-  works we can drop the zig dependency and match BMHero's CI verbatim.
+  tried) — that artifact evidently includes the MIPS backend. ~~Worth one test~~
+  **TESTED AND CONFIRMED (2026-07-06)**: its clang has the full backend set and accepts
+  our Makefile flags unchanged; patches.elf → N64Recomp → boot+render+audio all
+  verified (output differs from zig only by FP register allocation). CI uses it; zig
+  remains a supported local alternative.
 
 ---
 
@@ -174,33 +177,45 @@ wcw.toml patches.toml recompcontrollerdb.txt .gitmodules .gitignore
 ## Phase D — CI + packaging (mirror BMHero's workflows)
 
 - [x] **D1: private ROM repo.** DONE 2026-07-05 (repo part): jessetbh/wcw-rom-secret
-      (verified PRIVATE) with wcw.z64 on main. Still pending: fine-grained read PAT +
-      Actions secrets on the main repo (do together with D2's workflow).
-- [ ] **D2: adapt `validate.yml`** (BMHero's is the template, workflow_call + inputs
-      for SDL2_VERSION / pinned N64RECOMP_COMMIT): checkout w/ submodules → fetch ROM
-      from secret repo → build N64Recomp/RSPRecomp at pinned commit → `N64Recomp
-      wcw.toml` + `RSPRecomp rsp/wcw_audio.toml` → cmake build → package. Windows job
-      first (beta is Windows-only); keep the Linux/mac/flatpak lattice of BMHero's file
-      as commented scaffolding for later. Plus `validate-internal.yml` /
-      `validate-external.yml` (fork PRs, no secrets) and `update-pr-artifacts.yml`.
-- [ ] **D3: package step**: `WCWRecompiled-<tag>-Windows.zip` = `WCWRecompiled.exe`,
-      `assets/`, `recompcontrollerdb.txt`, `SDL2.dll`, `dxil.dll`, `dxcompiler.dll`,
-      `COPYING`, short `README.txt`. Assert no `*.z64`/`saves/`/`*.json`/`*.map` in the
-      zip. PDB/map as a separate CI artifact. SHA256SUMS on the release.
-- [ ] **D4: versioning + release notes template.** Tag `v0.1.0` (ecosystem starts at
-      1.0.0 when "done"; a beta tag like `v0.1.0` or `v1.0.0-beta.1` signals status) —
-      owner picks. Notes structure per Zelda: changelog bullets, then evergreen notes
-      (save data location/compat, GPU driver advisories, SmartScreen "unsigned exe"
-      note).
+      (verified PRIVATE) with wcw.z64 on main. **Still pending (OWNER, on github.com)**:
+      1. Fine-grained PAT, Contents: read-only, scoped to WCWvsNWOWorldTourRecomp +
+         WCWSyms + wcw-rom-secret (checkout needs it for the private WCWSyms submodule
+         too, until WCWSyms goes public).
+      2. Actions secrets on the main repo: `WCW_CI_PAT` = that PAT,
+         `WCW_ROM_REPO` = `jessetbh/wcw-rom-secret`.
+      3. An `external` environment (Settings → Environments) with required reviewers —
+         gates fork-PR builds in validate-external.yml.
+- [x] **D2: adapt `validate.yml`.** DONE 2026-07-06: `.github/workflows/` has
+      validate.yml (workflow_call; inputs SDL2_VERSION / N64RECOMP_COMMIT (upstream
+      `ffb39cd`, what RecompiledFuncs was generated with) / LLVM_VERSION; Windows-only
+      job — BMHero's Linux/mac/flatpak jobs dropped, resurrect from their file later),
+      validate-internal.yml (main + same-repo PRs), validate-external.yml
+      (environment-gated fork PRs), update-pr-artifacts.yml (nightly.link PR links).
+      Patches toolchain in CI = portable LLVM archive (tested, see corrections above).
+      NOT yet validated on GitHub (needs D1's secrets; first push will tell).
+- [x] **D3: package step.** DONE 2026-07-06: validate.yml packages exe + assets/ +
+      recompcontrollerdb.txt + SDL2/dxil/dxcompiler DLLs + COPYING + README.txt (from
+      .github/release-readme.txt), with a stray-file assertion (*.z64/*.json/*.map/
+      *.pdb/*.log/saves/). Map(+PDB) uploaded as a separate DebugSyms artifact —
+      CMakeLists now always emits WCWRecompiled.map (was an uncached local configure
+      flag). release.yml (tag v*) builds, zips `WCWRecompiled-<tag>-Windows.zip`,
+      writes SHA256SUMS, creates a DRAFT release.
+- [x] **D4: versioning + release notes template.** DONE 2026-07-06 (template part):
+      .github/RELEASE_NOTES_TEMPLATE.md = changelog placeholder + evergreen notes
+      (ROM/SmartScreen/saves/GPU-log). Tag `v0.1.0` when releasing (owner decision
+      already recorded); release.yml drafts the release for manual publish.
 
 ## Phase E — Docs rewrite (match the template)
 
 - [ ] **README.md** in BMHero's exact section order (see conventions above), with
       screenshots of the running port; status framed as beta with known issues.
-      "Building is not required to play — see Releases."
-- [ ] **BUILDING.md**: any-machine instructions (prereqs incl. the portable-LLVM-or-zig
-      patches toolchain, clone + submodules, provide ROM, three commands, where the exe
-      lands). Validate by following it verbatim on a clean checkout.
+      "Building is not required to play — see Releases." (Rewrite itself done in
+      Phase A; REMAINING: screenshots.)
+- [x] **BUILDING.md**: DONE 2026-07-06 — rewritten for any-machine builds (prereqs
+      incl. portable-LLVM-or-zig patches toolchain, clone --recursive, ROM, build
+      N64Recomp@pin, recompile, port build, local-config.cmake, patches gotchas,
+      symbol regen, lib/ fork workflow). REMAINING: validate by following it verbatim
+      on a clean checkout (fold into Phase F).
 - [ ] **FAQ entries** (copy the ecosystem's): what is static recompilation / relation
       to decomp (none exists for WCW — we made our own symbols) / where are saves /
       how to change ROM / portable mode.

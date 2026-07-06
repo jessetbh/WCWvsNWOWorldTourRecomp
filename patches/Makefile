@@ -1,9 +1,12 @@
 TARGET = patches.elf
 
-# MIPS-capable cross tools. NOTE: both the VS BuildTools and llvm.org WINDOWS builds of
-# clang are trimmed to x86/ARM backends only, so on this machine the compiler is
-# `zig cc` (Zig bundles a full LLVM incl. MIPS). ld.lld's MIPS support is unconditional,
-# so any lld works. CMake passes CC/LD explicitly (see PATCHES_C_COMPILER/PATCHES_LD).
+# MIPS-capable cross tools. NOTE: the VS BuildTools clang and the llvm.org Windows
+# INSTALLER are trimmed to x86/ARM backends only — use either `zig cc` (Zig bundles a
+# full LLVM incl. MIPS) or the clang from the portable llvm.org release ARCHIVE
+# (LLVM-<ver>-Windows-X64.tar.xz — full backend set; verified 2026-07-06 to produce a
+# functionally identical patches.elf with these exact flags; CI uses it). ld.lld's MIPS
+# support is unconditional, so any lld works. CMake passes CC/LD explicitly (see
+# PATCHES_C_COMPILER/PATCHES_LD).
 # (make predefines CC=cc / LD=ld, so `?=` won't fire — test the origin instead.)
 # Defaults assume `zig` and `ld.lld` are on PATH; the CMake build passes explicit
 # paths via the environment (PATCHES_C_COMPILER / PATCHES_LD — see BUILDING.md).

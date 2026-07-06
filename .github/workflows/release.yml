@@ -1,0 +1,54 @@
+# Tag push (v*) -> full CI build -> WCWRecompiled-<tag>-Windows.zip + SHA256SUMS
+# attached to a DRAFT GitHub release. Fill in the changelog section of the notes
+# (template: .github/RELEASE_NOTES_TEMPLATE.md) and publish manually.
+name: release
+on:
+  push:
+    tags:
+      - 'v*'
+jobs:
+  build:
+    uses: ./.github/workflows/validate.yml
+    secrets: inherit
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Download Windows build
+        uses: actions/download-artifact@v4
+        with:
+          name: WCWRecompiled-Windows-Release
+          path: package
+      - name: Assemble release assets
+        run: |
+          TAG='${{ github.ref_name }}'
+          cd package
+          zip -r "../WCWRecompiled-$TAG-Windows.zip" .
+          cd ..
+          sha256sum "WCWRecompiled-$TAG-Windows.zip" > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG='${{ github.ref_name }}'
+          gh release create "$TAG" \
+            --draft \
+            --title "WCW vs. nWo World Tour: Recompiled $TAG" \
+            --notes-file .github/RELEASE_NOTES_TEMPLATE.md \
+            "WCWRecompiled-$TAG-Windows.zip" \
+            SHA256SUMS
+      - name: Archive debug symbols with the run
+        uses: actions/download-artifact@v4
+        with:
+          name: WCWRecompiled-DebugSyms-Release
+          path: debug-syms
+      - name: Upload debug symbols artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WCWRecompiled-${{ github.ref_name }}-DebugSyms
+          path: debug-syms
