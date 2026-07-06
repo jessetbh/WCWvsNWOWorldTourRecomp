@@ -109,13 +109,14 @@ a decompilation.**
 It isn't — no public decompilation of WCW vs. nWo World Tour exists. Unlike most
 recompilation ports, which borrow symbol names from a decomp, this project generated
 its own symbol metadata from scratch via a [splat](https://github.com/ethteck/splat)
-disassembly (see `disasm/` and `syms/`).
+disassembly (see `disasm/` and the `WCWSyms` submodule).
 
 #### Where is the savefile stored?
 
-- Windows: `%LOCALAPPDATA%\WCWRecompiled\saves`
+- Windows: `%LOCALAPPDATA%\WCWRecompiled\` (the save is `wcw.nwo.worldtour.us.bin`)
 
-Configuration files live in the same folder. Save data is preserved across updates.
+Configuration files and the log file live in the same folder. Save data is preserved
+across updates.
 
 #### Can you run this project as a portable application?
 
@@ -128,6 +129,11 @@ saves, config files, and the stored ROM will be kept next to the executable inst
 accepts one specific ROM: the US (NTSC-U) N64 release
 (SHA1 `5AD2D8359058C8BB71F08E3D3433B7A50D3BB645`). **It is not an emulator and it
 cannot run any arbitrary ROM.**
+
+You can't accidentally load the wrong file — the launcher validates the ROM before
+storing its own copy (so the original file can be moved or deleted afterwards). If the
+stored copy ever goes missing or gets corrupted, the launcher simply offers **Load
+ROM** again.
 
 ## Known Issues
 

@@ -33,6 +33,12 @@ set(RT64_SDL_WINDOW_VULKAN TRUE)
 add_compile_definitions(HLSL_CPU)
 add_subdirectory(${RT64DIR} ${CMAKE_BINARY_DIR}/rt64)
 target_include_directories(rt64 PRIVATE ${CMAKE_BINARY_DIR}/rt64/src)
+if (WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    # rt64's vendored SDL 2.26.3 (mupen64plus-win32-deps) defines _m_prefetch in
+    # SDL_endian.h; newer clang (CI's clang-cl 22) makes it a builtin and errors on the
+    # redefinition. Accepted (silently ignored) by older clang too — verified on 19.1.5.
+    target_compile_options(rt64 PRIVATE -fno-builtin-_m_prefetch)
+endif()
 
 # --- Runtime core (ultramodern + librecomp) ---
 set(BUILD_SHARED_LIBS OFF)
