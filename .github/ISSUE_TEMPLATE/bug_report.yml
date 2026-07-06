@@ -1,0 +1,49 @@
+name: Bug report
+description: Report a crash, rendering issue, or other problem
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: make sure your graphics drivers are up to date, and check
+        the Known Issues section of the README.
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver version
+      placeholder: e.g. NVIDIA RTX 3060, driver 555.99
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: e.g. Windows 11 23H2
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Release version
+      placeholder: e.g. v0.1.0
+    validations:
+      required: true
+  - type: input
+    id: romsha
+    attributes:
+      label: ROM SHA1
+      description: The only supported ROM is the US release, SHA1 5AD2D8359058C8BB71F08E3D3433B7A50D3BB645. You can compute yours in PowerShell with Get-FileHash -Algorithm SHA1 <rom>.
+      placeholder: 5AD2D8359058C8BB71F08E3D3433B7A50D3BB645
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log output
+      description: Attach or paste the log/console output if available.

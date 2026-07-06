@@ -5,11 +5,13 @@ TARGET = patches.elf
 # `zig cc` (Zig bundles a full LLVM incl. MIPS). ld.lld's MIPS support is unconditional,
 # so any lld works. CMake passes CC/LD explicitly (see PATCHES_C_COMPILER/PATCHES_LD).
 # (make predefines CC=cc / LD=ld, so `?=` won't fire — test the origin instead.)
+# Defaults assume `zig` and `ld.lld` are on PATH; the CMake build passes explicit
+# paths via the environment (PATCHES_C_COMPILER / PATCHES_LD — see BUILDING.md).
 ifeq ($(origin CC),default)
-CC      := C:/Users/selki/toolchains/zig-windows-x86_64-0.14.0/zig.exe cc
+CC      := zig cc
 endif
 ifeq ($(origin LD),default)
-LD      := C:/Users/selki/toolchains/clang+llvm-19.1.5-x86_64-pc-windows-msvc/bin/ld.lld.exe
+LD      := ld.lld
 endif
 
 # Cross-compile the patches as MIPS so the recompiler can ingest patches.elf.

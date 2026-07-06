@@ -79,3 +79,6 @@ Thumbs.db
 
 # Claude Code local (per-machine) settings
 .claude/settings.local.json
+
+# Machine-local toolchain overrides
+local-config.cmake

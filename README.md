@@ -1,106 +1,185 @@
 # WCW vs. nWo World Tour: Recompiled
 
-A work-in-progress native PC port of the Nintendo 64 game **WCW vs. nWo World Tour (USA)**,
-built by statically recompiling the original game with
-[N64Recomp](https://github.com/N64Recomp/N64Recomp) and running it on the
-[N64ModernRuntime](https://github.com/N64Recomp/N64ModernRuntime) +
-[RT64](https://github.com/rt64/rt64) stack.
+WCW vs. nWo World Tour: Recompiled is a project that uses
+[N64Recomp](https://github.com/N64Recomp/N64Recomp) to **statically recompile** the
+Nintendo 64 game *WCW vs. nWo World Tour (USA)* into a native PC port, running on the
+[N64ModernRuntime](https://github.com/N64Recomp/N64ModernRuntime) with
+[RT64](https://github.com/rt64/rt64) as the rendering engine.
 
-> **This repository does not contain game assets.** A legally obtained copy of the
-> original ROM is required to build and run.
+### **This repository and its releases do not contain game assets. The original game is required to build or run this project.**
 
-## Status — FULLY PLAYABLE: matches, sound, input, menus, and saves (2026-07-05)
+> **Status: beta.** The game is fully playable end to end — boots, renders, full
+> matches with sound, keyboard + gamepad input, menus, local multiplayer, rumble, and
+> persistent saves. See [Known Issues](#known-issues) for what's still rough.
 
-The port builds, boots to a window, and plays the game's complete attract/demo cycle
-indefinitely: intro (spinning WCW mat), attract match (3D ring + crowd + animated
-wrestlers), wrestler intro cinematics, title screen — looping, stable, no crashes.
-**Audio works** (the RSP audio ucode is recompiled — it turned out to be the stock
-Nintendo aspMain, byte-identical to Bomberman Hero's), and the audio crackle + video
-flicker that followed are fixed (audio buffer-depth reporting; presentation mode
-Console instead of PresentEarly — WCW frames span multiple gfx tasks that pre-clear
-the next framebuffer, which PresentEarly then presented as a black frame). **Input works**
-(keyboard + gamepad; two fixes: the raw-SI path never triggered recompinput's poll, and
-single-player mode was never enabled) — **full matches verified playable end to end**.
-**Menus render cleanly** (frame interpolation now defaults off — RT64 assumes one RSP
-workload per frame, WCW uses several, so interpolated frames came out black/partial).
-**Saves work**: WCW saves only to the Controller Pak, which the recomp stack doesn't
-support — but WCW's raw joybus driver goes through our PIF emulation, which now emulates
-a 32 KB pak in port 1 backed by the standard recomp save file.
+## Table of Contents
+* [System Requirements](#system-requirements)
+* [Features](#features)
+  * [Plug and Play](#plug-and-play)
+  * [Fully Intact N64 Effects](#fully-intact-n64-effects)
+  * [Local Multiplayer for up to 4 Players](#local-multiplayer-for-up-to-4-players)
+  * [Widescreen Support](#widescreen-support)
+  * [Easy-to-Use Menus](#easy-to-use-menus)
+  * [Controls Tailored to This Game](#controls-tailored-to-this-game)
+  * [Saves and Rumble Without Pak Juggling](#saves-and-rumble-without-pak-juggling)
+* [Planned Features](#planned-features)
+* [FAQ](#faq)
+* [Known Issues](#known-issues)
+* [Building](#building)
+* [Libraries Used and Projects Referenced](#libraries-used-and-projects-referenced)
+* [Special Thanks](#special-thanks)
 
-| Phase | What | State |
-|------:|------|-------|
-| 0 | Scaffolding, configs, project structure | ✅ done |
-| 1 | splat disassembly; **overlay system fully mapped** (2 fixed-addr overlays) | ✅ done |
-| 2 | Build N64Recomp; generate symbols; **clean recompile → 16 MB of C (1763 funcs)** | ✅ done |
-| 3 | libultra→ultramodern integration (~40 funcs named), `src/main` wiring, RT64 build, **BOOTS + RENDERS**, full demo loop stable | ✅ done |
-| 3 | **Audio** — RSPRecomp'd (`rsp/wcw_audio.toml`), real sound verified | ✅ done |
-| 3 | In-game **input** (keyboard + gamepad) — **matches playable end to end** | ✅ done |
-| 3 | **Menu flicker/missing assets fixed** (RT64 interpolation off by default; user-verified) | ✅ done |
-| 3 | **Saves** — Controller Pak emulated over raw joybus, persists to the recomp save file | ✅ done |
-| 4 | **Patches build foundation** (data symbols, MIPS cross-compile, RECOMP_PATCH verified in-game) | ✅ done |
-| 4 | **Widescreen** (game-side projection patch + host aspect API, Aspect Ratio: Expand) | ✅ done |
-| 4 | **Overscan-edge crop** (CRT-style per-edge crop; garbage line at frame top gone) | ✅ done |
-| 4 | **Input options** (in-game config menu — Esc/gamepad Back; rebinding verified, persists) | ✅ done |
-| 4 | More PC enhancements (high-FPS interpolation) | 🔶 next |
+## System Requirements
 
-Getting here required fixing two runtime-stack bugs that likely affect other recomp
-projects too (documented in `disasm/libultra.md`, fixes tagged `[wcw fix]` in `lib/`):
-- **RT64**: games that only submit composed MVPs via `G_FORCEMTX` (all AKI wrestling
-  titles) never load a projection matrix; RT64 inverted the zero matrix → NaN vertex
-  positions → nothing rasterized (black screen).
-- **N64ModernRuntime**: the external-message pump processed one message per wake and
-  immediately re-enqueued failed deliveries; moodycamel's producer-biased dequeue then
-  starved all other messages (VI retrace included) → total game deadlock.
+Currently a **Windows** build is provided; other operating systems may be supported
+later.
 
-See [`CLAUDE.md`](CLAUDE.md) for the full state, technical detail, and the step-by-step
-plan; [`BUILDING.md`](BUILDING.md) for how to build and run it today.
+A GPU supporting Direct3D 12.0 (Shader Model 6) or Vulkan 1.2 is required. A CPU
+supporting the SSE4.1 instruction set is also required (Intel Core 2 Penryn series or
+AMD Bulldozer and newer).
 
-## What works today
-- **The whole game**: `build-msvc\WCWRecompiled.exe` boots to the title screen and plays
-  full matches end to end — hardware-accelerated rendering (RT64, D3D12/Vulkan) at 4x
-  resolution, audio (recompiled RSP audio ucode → SDL), keyboard + gamepad input, clean
-  menus, and persistent saves (emulated Controller Pak → `saves/<game id>.bin`).
-- **Widescreen**: with Aspect Ratio set to Expand, 3D renders at the window's aspect
-  with a correctly widened FOV (the game's single projection-setup function is patched
-  to take the display ratio; 2D stays 4:3-anchored). The first real gameplay patch —
-  `patches/widescreen.c`.
-- **In-game options menu**: press Esc (or the gamepad Back/Select button) during play to
-  open the config menu — General (deadzone, background input), Graphics, Controls (full
-  N64 button/stick rebinding for keyboard and controller, two slots per input), Sound.
-  Changes persist next to the exe (`controls.json` etc.).
-- **WCW-tailored default controls**: this game moves on the N64 d-pad and taunts with the
-  analog stick, so the defaults map move to the left stick + d-pad, taunt to the right
-  stick, and the defensive pair to mirrored triggers — duck (N64 L) = left trigger, block
-  (N64 R) = right trigger. Grapple = A, attack = X, run = B, climb/flip = Y, switch
-  focus = bumpers. Keyboard: WASD moves, IJKL taunts.
-- `splat` disassembly of the ROM (`disasm/`), with the overlay table decoded.
-- `N64Recomp` recompiles the whole game to C with `tools/recompile.ps1`; the fast
-  edit-compile-run loop is `tools/cycle.ps1`.
-- A scriptable RenderDoc capture/analysis workflow for GPU debugging (see `CLAUDE.md`).
+If you have crashes on startup, make sure your graphics drivers are fully up to date.
 
-## Not working yet
-- **Frame interpolation** (Framerate: Display) produces black/partial frames in menus —
-  RT64's frame matching assumes one RSP workload per frame, WCW uses several. The default
-  is now Framerate: Original (native pacing, renders correctly); interpolation is a
-  Phase-4 item (needs multi-workload frame detection + matrix-group patches).
+## Features
 
-## Target ROM
-- WCW vs. nWo World Tour (USA), `.z64`, SHA1 `5AD2D8359058C8BB71F08E3D3433B7A50D3BB645`,
-  internal name `WCWvs.NWO:World Tour`, game code `NWNE`, entrypoint `0x80000400`, IDO compiler.
+#### Plug and Play
 
-## Approach in brief
-1. Disassemble the ROM (splat) to produce symbol metadata — *no public decomp exists*, so
-   we generate it ourselves (`tools/gen_symbols.py` → `syms/dump.toml`).
-2. Run N64Recomp to translate the MIPS code into C.
-3. Identify the game's embedded **libultra** and hand it to ultramodern (the runtime).
-4. Compile that C against the modern runtime + RT64 renderer; boot.
-5. Apply behavior fixes and PC enhancements as MIPS-compiled patches.
+Provide your copy of the US version of the game and start playing! The project loads
+assets directly from your ROM, so there is no separate extraction or build step.
 
-Modeled closely on **Bomberman Hero: Recompiled**.
+#### Fully Intact N64 Effects
 
-## Credits / references
-- [N64Recomp](https://github.com/N64Recomp/N64Recomp) and
-  [N64ModernRuntime](https://github.com/N64Recomp/N64ModernRuntime) by Wiseguy et al.
-- [RT64](https://github.com/rt64/rt64) renderer by DarioSamo.
-- [splat](https://github.com/ethteck/splat) / spimdisasm for disassembly.
-- Bomberman Hero: Recompiled as the reference project.
+Rendering is hardware-accelerated through RT64 at high resolution, with the game's
+original visual effects intact — no emulator-style workarounds or hacks.
+
+#### Local Multiplayer for up to 4 Players
+
+Plug in up to four controllers and each pad is automatically assigned to the next free
+player — no setup needed. The keyboard always drives player 1 by default, and a
+player-assignment menu is available for custom arrangements (e.g. keyboard as player 2).
+
+#### Widescreen Support
+
+With Aspect Ratio set to **Expand** (the default), the 3D scene renders at your
+window's aspect ratio with a correctly widened field of view, while 2D interface
+elements stay at their original proportions.
+
+#### Easy-to-Use Menus
+
+Press Esc (or your gamepad's Back/Select button) during play to open the config menu:
+general settings, graphics settings, full input rebinding for keyboard and controller
+(two bindings per input), and audio settings. Menus can be used with mouse, keyboard,
+or controller.
+
+#### Controls Tailored to This Game
+
+World Tour moves on the N64 **d-pad** and taunts with the analog stick, so the default
+mappings are built for that: move on the left stick *and* d-pad, taunt on the right
+stick, and the defensive pair on mirrored triggers (duck = left trigger, block = right
+trigger). Grapple = A, attack = X, run = B, climb/turnbuckle = Y, switch focus =
+bumpers. Keyboard: WASD moves, IJKL taunts, Space/Shift/Q/E/R for the face buttons.
+Everything is rebindable in the in-game menu.
+
+#### Saves and Rumble Without Pak Juggling
+
+On real hardware this game saves **only** to a Controller Pak and rumbles **only**
+with a Rumble Pak — one slot, physically swapped. The port emulates a hybrid pak:
+saves always work and persist automatically, and if you answer the game's "Insert a
+Rumble Pak now" prompt at the title screen, rumble works too, with no risk to your
+save data.
+
+## Planned Features
+
+* High framerate support (frame interpolation) — see [Known Issues](#known-issues)
+* Linux support
+* Mod support
+
+## FAQ
+
+#### What is static recompilation?
+
+Static recompilation is the process of automatically translating an application from
+one platform to another — here, the game's original MIPS machine code is translated
+into C and compiled for modern PCs. For details, see
+[N64Recomp](https://github.com/N64Recomp/N64Recomp). **This is not an emulator and not
+a decompilation.**
+
+#### How is this related to a decompilation project?
+
+It isn't — no public decompilation of WCW vs. nWo World Tour exists. Unlike most
+recompilation ports, which borrow symbol names from a decomp, this project generated
+its own symbol metadata from scratch via a [splat](https://github.com/ethteck/splat)
+disassembly (see `disasm/` and `syms/`).
+
+#### Where is the savefile stored?
+
+<!-- TODO(beta-release-plan C2): update once config/saves move to %LOCALAPPDATA%\WCWRecompiled -->
+Saves and configuration files are currently stored next to the executable (`saves/`,
+`*.json`).
+
+#### How do I choose a different ROM?
+
+**You don't.** This project is **only** a port of WCW vs. nWo World Tour, and it only
+accepts one specific ROM: the US (NTSC-U) N64 release
+(SHA1 `5AD2D8359058C8BB71F08E3D3433B7A50D3BB645`). **It is not an emulator and it
+cannot run any arbitrary ROM.**
+
+## Known Issues
+
+* **Frame interpolation is disabled** (Framerate is locked to Original). The game
+  builds each visual frame from several RSP tasks and submits fully composed matrices,
+  which defeats RT64's frame-interpolation heuristics — interpolated frames warp
+  geometry. High-framerate support needs game-side matrix-group patches and is planned.
+* **Rumble works for player 1 only** — the emulated pak lives in controller port 1,
+  matching the game's own pak handling.
+* Overlays such as MSI Afterburner and other software such as Wallpaper Engine can
+  cause performance issues that prevent the game from rendering correctly. Disabling
+  such software is recommended.
+
+## Building
+
+Building is **not** required to play — grab a release instead. To build from source,
+see [BUILDING.md](BUILDING.md).
+
+## Libraries Used and Projects Referenced
+
+* [N64Recomp](https://github.com/N64Recomp/N64Recomp) — the static recompiler this
+  port is built with
+* [N64ModernRuntime](https://github.com/N64Recomp/N64ModernRuntime) — the modern
+  runtime (ultramodern + librecomp)
+* [RT64](https://github.com/rt64/rt64) — the rendering engine
+* [RecompFrontend](https://github.com/N64Recomp/RecompFrontend) — launcher, config
+  menus, and input stack
+* [RmlUi](https://github.com/mikke89/RmlUi) for building the menus and launcher
+* [lunasvg](https://github.com/sammycage/lunasvg) for SVG rendering, used by RmlUi
+* [FreeType](https://freetype.org/) for font rendering, used by RmlUi
+* [SDL2](https://www.libsdl.org/) for windowing, input, and audio
+* [moodycamel::ConcurrentQueue](https://github.com/cameron314/concurrentqueue) for
+  semaphores and fast, lock-free MPMC queues
+* [Gamepad Motion Helpers](https://github.com/JibbSmart/GamepadMotionHelpers) for
+  sensor fusion and calibration algorithms
+* [DirectX Shader Compiler](https://github.com/microsoft/DirectXShaderCompiler),
+  [zstd](https://github.com/facebook/zstd),
+  [nativefiledialog-extended](https://github.com/btzy/nativefiledialog-extended), and
+  [plume](https://github.com/renderbag/plume) via RT64
+* [splat](https://github.com/ethteck/splat) / spimdisasm for the disassembly that
+  produced this project's symbol metadata
+* [Inter](https://rsms.me/inter/), [Noto Emoji](https://fonts.google.com/noto), and
+  [PromptFont](https://shinmera.com/promptfont) fonts (OFL; PromptFont license in
+  `assets/promptfont/`)
+* [SDL_GameControllerDB](https://github.com/gabomdq/SDL_GameControllerDB) for
+  community controller mappings
+* [Bomberman Hero: Recompiled](https://github.com/RevoSucks/BMHeroRecomp) and
+  [Zelda64Recomp](https://github.com/Zelda64Recomp/Zelda64Recomp) as reference
+  projects for structure and conventions
+
+## Special Thanks
+
+* [Wiseguy](https://github.com/Mr-Wiseguy) and
+  [DarioSamo](https://github.com/DarioSamo) for creating N64Recomp and RT64.
+* [RevoSucks](https://github.com/RevoSucks) and the Bomberman Hero: Recompiled project,
+  the direct template for this port.
+* The Zelda64Recomp team for establishing the conventions the whole recomp ecosystem
+  follows.
+* ethteck and the splat/spimdisasm contributors — the disassembly tooling that made a
+  no-decomp recompilation possible.

@@ -54,17 +54,12 @@ Corrections to the earlier draft of this plan:
 
 ## Phase A — Legal & licensing
 
-- [ ] `COPYING` = GPLv3 (ecosystem standard; also the pragmatic choice given GPL
-      dependencies in the stack).
-- [ ] README banner + FAQ language mirroring BMHero's (no assets distributed; ROM
-      required; "only accepts one specific ROM: the US version").
-- [ ] Third-party credits section ("Libraries Used and Projects Referenced"): N64Recomp,
-      N64ModernRuntime, RecompFrontend, RT64, SDL2, RmlUi, moodycamel, dxc, nfd, zstd,
-      plume, fonts (Inter/OFL, Noto Emoji/OFL, promptfont), splat/spimdisasm, and
-      BMHero + Zelda64Recomp as reference projects.
-- [ ] Decide the public name + exe name now (pattern: `WCWRecompiled` /
-      "WCW vs. nWo World Tour: Recompiled"). Trademark exposure is the owner's call;
-      the ecosystem precedent is nominative use of the full game title.
+- [x] `COPYING` = GPLv3 — DONE 2026-07-05.
+- [x] README banner + FAQ language mirroring BMHero's — DONE 2026-07-05 (full README
+      rewrite in BMHero section order; savefile-location FAQ has a TODO gated on C2).
+- [x] Third-party credits section — DONE 2026-07-05 (in README).
+- [x] Public name decided (owner, 2026-07-05): **"WCW vs. nWo World Tour: Recompiled"**,
+      exe `WCWRecompiled` (full-title precedent).
 
 ## Phase B — Repo restructure (target = BMHero layout)
 
@@ -91,7 +86,14 @@ wcw.toml patches.toml recompcontrollerdb.txt .gitmodules .gitignore
       a new `WCWSyms` repo, submodule at root (matches BMHeroSyms/Zelda64RecompSyms).
       The checked-in TOMLs make builds independent of splat/gen_symbols.py;
       `disasm/` + `tools/gen_symbols.py` remain as the regeneration tooling.
-- [ ] **B3: assets/.** Create tracked `assets/` from BMHero's, TRIMMED: keep
+- [x] **B3: assets/.** DONE 2026-07-05: tracked `assets/` created (28 files, 1.4 MB) —
+      recomp.rcss, InterVariable, NotoEmoji, promptfont/, icons/ only. All Banjo-era
+      art dropped; verified unreferenced by the frontend source (only BMHero's own
+      launcher rml used it), and the `register_extra_font("NimbusSansNarrow-Bold.ttf")`
+      call removed from main.cpp. CMake post-build now copies `assets/` +
+      `recompcontrollerdb.txt` next to the exe. Boot-verified against the trimmed set
+      (25 s run: no asset/font errors, audio healthy). Original spec kept below:
+      Create tracked `assets/` from BMHero's, TRIMMED: keep
       `recomp.rcss`, `InterVariable.ttf`, `NotoEmoji-Regular.ttf`, `promptfont/`,
       `icons/`; replace/remove Banjo-era art (`Banjo.svg`, `Jiggy*.svg`, `Kazooie.svg`,
       `BMHeroLogo.svg`, clouds/embers, `Suplexmentary Comic NC.ttf`,
@@ -99,18 +101,27 @@ wcw.toml patches.toml recompcontrollerdb.txt .gitmodules .gitignore
       originals where the launcher theme needs them. `recomp.rcss` references some of
       these — adjust it and verify launcher + config menus render. Add CMake post-build
       copy so a fresh clone works.
-- [ ] **B4: recompcontrollerdb.txt.** BMHero/Zelda ship SDL's controller db at root and
-      in the zip; we don't have it — check whether recompinput loads it, add it.
-- [ ] **B5: de-personalize the build.** CMakeLists PATCHES_* defaults → `find_program`
-      + clear errors (test BMHero's portable-LLVM approach first, see corrections
-      above); sweep `rg -i selki` across CMakeLists/BUILDING/tools/patches Makefile.
-- [ ] **B6: docs shuffle.** CLAUDE.md's historical log → `docs/devlog.md`; CLAUDE.md
-      becomes lean contributor instructions. `upstream/` → `docs/upstream/`. Keep
-      `run/` (standalone harness) and `cmake/coretest/` or fold their READMEs into docs
-      and drop the code — owner's preference.
-- [ ] **B7: history scrub + publish prep.** `git filter-repo` the three MinGW DLL blobs
-      out (or accept); confirm author-email choice; repo description/topics; issue
-      template (asks GPU, driver, log, ROM SHA1) + PR template; `CONTRIBUTING.md`.
+- [x] **B4: recompcontrollerdb.txt.** DONE 2026-07-05: recompinput does NOT load it —
+      BMHero loads it in its own main.cpp via `SDL_GameControllerAddMappingsFromFile`
+      (program dir). Copied the db to root, added the same load to our main.cpp
+      (needed `#include "util/file.h"`), CMake copies it next to the exe.
+- [x] **B5: de-personalize the build.** DONE 2026-07-05: CMake PATCHES_* → optional
+      uncommitted `local-config.cmake` (gitignored; holds this machine's paths) then
+      `find_program` on PATH with FATAL_ERROR guidance; patches/Makefile defaults to
+      `zig cc`/`ld.lld` on PATH; cycle.ps1 derives root from $PSScriptRoot; env.ps1
+      uses WCW_MINGW/WCW_NINJA_DIR/WCW_CMAKE_DIR env overrides. Remaining `selki`
+      mentions: BUILDING.md (rewritten in Phase E) + historical docs (fine). NOT yet
+      tested: BMHero's portable-LLVM archive as a zig replacement (optional).
+- [x] **B6: docs shuffle.** DONE 2026-07-05: CLAUDE.md → `docs/devlog.md` (verbatim,
+      with a preface); new lean CLAUDE.md (contributor instructions + hard-won
+      invariants); `upstream/` → `docs/upstream/`. Owner decision: keep `run/` +
+      `cmake/coretest/`.
+- [x] **B7: history scrub + publish prep.** DONE 2026-07-05 (scoped): history audit
+      found ONLY the 3 MinGW DLLs (~3.6 MB, initial commit) — no ROM/exe blobs ever
+      committed. Decision: ACCEPT (no filter-repo; owner also chose to keep his real
+      author email, so no history rewrite at all). Issue template (GPU/driver/OS/
+      version/ROM-SHA1/log), PR template, CONTRIBUTING.md written. Still pending:
+      repo description/topics (needs the repo to exist, Publish step 1).
 
 ## Phase C — Runtime polish (match "Plug and Play")
 
@@ -196,13 +207,15 @@ wcw.toml patches.toml recompcontrollerdb.txt .gitmodules .gitignore
 
 ## Decisions needed from the project owner
 
-| Decision | Options | Recommendation |
-|---|---|---|
-| License | — | GPLv3 / `COPYING` (settled by ecosystem survey) |
-| Repo home | Personal account vs org | Personal is fine (Goemon, BMHero); org if a team forms |
-| lib/ strategy | Forks + submodules vs patch script | Forks (our fixes were declined upstream) |
-| Syms | Separate WCWSyms repo vs keep syms/ in-tree | Separate repo (both templates do it) |
-| Version scheme | v1.0.0-beta.1 vs v0.x | v0.1.0 reads clearly as beta |
-| Name | Full game title vs safer variant | Owner's call (precedent: full title) |
-| Author email in history | Keep vs rewrite | Owner's call |
-| run/ + coretest | Keep vs docs-only | Keep (cheap, documented) |
+All decided (owner, 2026-07-05):
+
+| Decision | Outcome |
+|---|---|
+| License | GPLv3 / `COPYING` ✅ |
+| Repo home | Personal account |
+| lib/ strategy | Forks + submodules (fixes were declined upstream) |
+| Syms | Separate WCWSyms repo |
+| Version scheme | **v0.1.0** |
+| Name | **Full title: "WCW vs. nWo World Tour: Recompiled"**, exe `WCWRecompiled` |
+| Author email in history | **Keep as-is** (no history rewrite; MinGW DLL blobs also accepted) |
+| run/ + coretest | Keep |

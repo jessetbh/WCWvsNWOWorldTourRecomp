@@ -58,16 +58,36 @@ target_sources(RecompiledFuncs PRIVATE ${FUNC_C_SOURCES})
 # file_to_c embeds the bin, and PatchesLib links it all into the exe.
 # NOTE: BOTH the VS BuildTools and llvm.org WINDOWS clang builds are trimmed to x86/ARM
 # backends (no MIPS), so the compiler here is `zig cc` (Zig bundles a full LLVM). lld's
-# MIPS support is unconditional, so the llvm.org ld.lld links fine. Override on the
-# configure line if your tools live elsewhere. See BUILDING.md.
+# MIPS support is unconditional, so any ld.lld links fine. Override on the configure
+# line (-DPATCHES_C_COMPILER=... -DPATCHES_LD=... -DPATCHES_MAKE=...), put the tools on
+# PATH, or set them in an uncommitted local-config.cmake. See BUILDING.md.
+include(${CMAKE_SOURCE_DIR}/local-config.cmake OPTIONAL)
 if(NOT DEFINED PATCHES_C_COMPILER)
-    set(PATCHES_C_COMPILER "C:/Users/selki/toolchains/zig-windows-x86_64-0.14.0/zig.exe cc")
+    find_program(ZIG_EXE zig)
+    if(ZIG_EXE)
+        set(PATCHES_C_COMPILER "${ZIG_EXE} cc")
+    else()
+        message(FATAL_ERROR "Patches need a MIPS-capable C compiler. Install zig and put it on PATH, "
+                            "or configure with -DPATCHES_C_COMPILER=\"<path-to-zig> cc\" (see BUILDING.md).")
+    endif()
 endif()
 if(NOT DEFINED PATCHES_LD)
-    set(PATCHES_LD "C:/Users/selki/toolchains/clang+llvm-19.1.5-x86_64-pc-windows-msvc/bin/ld.lld.exe")
+    find_program(PATCHES_LD_EXE ld.lld)
+    if(PATCHES_LD_EXE)
+        set(PATCHES_LD "${PATCHES_LD_EXE}")
+    else()
+        message(FATAL_ERROR "Patches need ld.lld (any LLVM release; MIPS support is unconditional). "
+                            "Put it on PATH or configure with -DPATCHES_LD=<path> (see BUILDING.md).")
+    endif()
 endif()
 if(NOT DEFINED PATCHES_MAKE)
-    set(PATCHES_MAKE "C:/Users/selki/toolchains/mingw64/bin/mingw32-make.exe")
+    find_program(PATCHES_MAKE_EXE NAMES mingw32-make make)
+    if(PATCHES_MAKE_EXE)
+        set(PATCHES_MAKE "${PATCHES_MAKE_EXE}")
+    else()
+        message(FATAL_ERROR "Patches need GNU make (mingw32-make or make). "
+                            "Put it on PATH or configure with -DPATCHES_MAKE=<path> (see BUILDING.md).")
+    endif()
 endif()
 
 add_custom_target(PatchesBin
@@ -176,6 +196,14 @@ if (WIN32)
             "${RT64DIR}/src/contrib/dxc/bin/x64/dxcompiler.dll"
             $<TARGET_FILE_DIR:WCWRecompiled>)
 endif()
+
+# Copy the runtime UI assets and SDL controller db next to the exe so a fresh build runs
+# from the build dir (recompui loads ./assets relative to the program dir).
+add_custom_command(TARGET WCWRecompiled POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_SOURCE_DIR}/assets" "$<TARGET_FILE_DIR:WCWRecompiled>/assets"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/recompcontrollerdb.txt" "$<TARGET_FILE_DIR:WCWRecompiled>")
 
 # PatchesLib MUST come before RecompiledFuncs: patched functions share their C symbol
 # name with the base recompiled copies, and the patch takes effect by winning static-lib

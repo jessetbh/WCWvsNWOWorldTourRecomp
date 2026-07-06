@@ -1,7 +1,7 @@
 # Dev helper: regen symbols -> N64Recomp -> clang-cl build -> run -> symbolize crash frames.
 # Usage:  . .\tools\cycle.ps1   (run from repo root; loads both toolchains itself)
 $ErrorActionPreference = "Continue"  # native-tool stderr (N64Recomp [Info]) must not abort
-$root = "C:\Users\selki\depot\WcwNwoWorldTour"
+$root = Split-Path $PSScriptRoot -Parent
 $build = "$root\build-msvc"
 
 # --- Phase 1: regen + recompile (MinGW/python env) ---

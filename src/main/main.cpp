@@ -21,6 +21,7 @@
 #include "recompui/renderer.h"
 #include "recompui/config.h"
 #include "recompui/program_config.h"
+#include "util/file.h"
 #include "recompinput/recompinput.h"
 #include "recompinput/profiles.h"
 #include "recompinput/input_events.h"
@@ -411,6 +412,13 @@ int main(int argc, char** argv) {
     SDL_InitSubSystem(SDL_INIT_AUDIO);
     reset_audio(32000);
 
+    // Source controller mappings file (SDL_GameControllerDB), same as BMHero: lets SDL
+    // recognize third-party pads that lack built-in mappings. Missing file is non-fatal.
+    std::u8string controller_db_path = (recompui::file::get_program_path() / "recompcontrollerdb.txt").u8string();
+    if (SDL_GameControllerAddMappingsFromFile(reinterpret_cast<const char *>(controller_db_path.c_str())) < 0) {
+        fprintf(stderr, "Failed to load controller mappings: %s\n", SDL_GetError());
+    }
+
     // Register the game. The entry is stored in the global `supported_games` vector because
     // recompui's launcher reads supported_games[0] (e.g. default_launcher_init_callback) to
     // build the game-options menu; leaving it empty access-violates during boot.
@@ -442,7 +450,6 @@ int main(int argc, char** argv) {
     // Register UI fonts (loaded from ./assets during render-context init). Without a primary
     // font, recompui throws during boot. Matches BMHero's font registration.
     recompui::register_primary_font("InterVariable.ttf", "Inter Variable");
-    recompui::register_extra_font("NimbusSansNarrow-Bold.ttf");
 
     // Local multiplayer (WCW is a 4-player game). recompinput's multiplayer mode normally
     // requires every pad to be claimed through the player-assignment modal before it produces
