@@ -159,10 +159,10 @@ index 62656ad..99b67eb 100644
              ultramodern::enqueue_external_message(mq, 0, false, true);
 diff --git a/librecomp/src/si.cpp b/librecomp/src/si.cpp
 new file mode 100644
-index 0000000..d1c0266
+index 0000000..a509e22
 --- /dev/null
 +++ b/librecomp/src/si.cpp
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,216 @@
 +// [wcw] SI / PIF (joybus) emulation for games that use the RAW libultra SI primitives
 +// (__osSiRawStartDma / __osSiDeviceBusy) instead of the high-level osCont* API.
 +//
@@ -197,6 +197,32 @@ index 0000000..d1c0266
 +// save buffer / save file (saves/<game id>.bin) with async persistence + backup for free.
 +void save_write_ptr(const void* in, uint32_t offset, uint32_t count);
 +void save_read_ptr(void* out, uint32_t offset, uint32_t count);
++
++// [wcw] Hybrid pak identity for rumble support. A real N64 has ONE pak slot per controller:
++// WCW saves to the Controller Pak but also supports the Rumble Pak ("Insert a Rumble Pak
++// now" prompt at the title), and on hardware the player physically swaps them. Our virtual
++// pak can be both: it answers as a Controller Pak by default (save filesystem in the
++// <0x8000 data region), but when the game runs a Rumble Pak probe — writing a uniform
++// 0x80 block to the bank/ID region, libultra osMotorInit-style — it switches identity and
++// answers bank-region reads with 0x80s (Rumble Pak signature) until any other bank value
++// is written (0xFE = the mempak-probe reset in osMotorInit; 0x00 = mempak bank select).
++// Motor commands are pak writes to the 0xC000 region: data 0x01 = on, 0x00 = off,
++// forwarded to the host controller via ultramodern::input::set_rumble. Save-region reads
++// and writes are honored regardless of identity, so saves can never be lost to rumble.
++static bool wcw_pak_is_rumble = false;
++
++// Bounded diagnostic log of bank/ID-region pak traffic (dedup'd), to observe the game's
++// accessory-detect and rumble-probe sequences.
++static void wcw_log_pak_bank_op(char op, uint16_t addr, uint8_t value) {
++    static int lines = 0;
++    static uint32_t last = 0xFFFFFFFF;
++    uint32_t key = ((uint32_t)op << 24) | ((uint32_t)addr << 8) | value;
++    if (key == last || lines >= 64) return;
++    last = key;
++    lines++;
++    fprintf(stderr, "[wcw][pak] %s addr=0x%04X data=0x%02X identity=%s\n",
++            op == 'W' ? "write" : "read ", addr, value, wcw_pak_is_rumble ? "rumble" : "mempak");
++}
 +
 +// Standard joybus mempak data CRC (poly 0x85 over the 32 data bytes + one zero byte).
 +static uint8_t wcw_pak_data_crc(const uint8_t* data) {
@@ -275,8 +301,13 @@ index 0000000..d1c0266
 +                save_read_ptr(res, offset, 32);          // pak RAM <- save buffer
 +            }
 +            else {
-+                memset(res, 0, 32);                      // bank-select/ID region: reads as zeros
-+            }                                            // (a Rumble Pak would return 0x80s here)
++                // Bank/ID region: answer with the current pak identity — 0x80s is the Rumble
++                // Pak signature (only in its 0x8000..0x8FFF window, like real hardware),
++                // zeros is the Controller Pak one.
++                uint8_t fill = (wcw_pak_is_rumble && offset < 0x9000) ? 0x80 : 0x00;
++                memset(res, fill, 32);
++                wcw_log_pak_bank_op('R', addr, fill);
++            }
 +            res[32] = wcw_pak_data_crc(res);
 +            static bool logged = false;
 +            if (!logged) { logged = true; fprintf(stderr, "[wcw] first Controller Pak read (addr=0x%04X)\n", addr); }
@@ -288,7 +319,29 @@ index 0000000..d1c0266
 +            if (offset < 0x8000) {
 +                save_write_ptr(data, offset, 32);        // persists asynchronously (librecomp)
 +            }
-+            // Writes to the bank-select region (>= 0x8000) are acknowledged but not stored.
++            else if (offset >= 0xC000) {
++                // Rumble Pak motor command: a block of 0x01s starts the motor, 0x00s stops it.
++                bool on = (data[0] & 1) != 0;
++                ultramodern::input::set_rumble(0, on);
++                static bool logged_on = false, logged_off = false;
++                bool& logged = on ? logged_on : logged_off;
++                if (!logged) { logged = true; fprintf(stderr, "[wcw][pak] first motor %s (addr=0x%04X data=0x%02X)\n", on ? "ON" : "OFF", addr, data[0]); }
++            }
++            else {
++                // Bank/ID-region write: not stored, but a uniform 0x80 block is the Rumble Pak
++                // probe/init — switch the pak's identity so the probe's readback sees 0x80s.
++                // Any other value (0xFE mempak-probe reset, 0x00 bank select) reverts to mempak.
++                bool uniform = true;
++                for (int b = 1; b < 32; b++) { if (data[b] != data[0]) { uniform = false; break; } }
++                bool want_rumble = uniform && data[0] == 0x80;
++                if (want_rumble != wcw_pak_is_rumble) {
++                    wcw_pak_is_rumble = want_rumble;
++                    if (!want_rumble) ultramodern::input::set_rumble(0, false);
++                    fprintf(stderr, "[wcw][pak] identity -> %s (bank write addr=0x%04X data=0x%02X)\n",
++                            want_rumble ? "RUMBLE PAK" : "CONTROLLER PAK", addr, data[0]);
++                }
++                wcw_log_pak_bank_op('W', addr, data[0]);
++            }
 +            res[0] = wcw_pak_data_crc(data);
 +            static bool logged = false;
 +            if (!logged) { logged = true; fprintf(stderr, "[wcw] first Controller Pak write (addr=0x%04X)\n", addr); }
@@ -356,10 +409,10 @@ index ae0f44f..9a6e7dc 100644
          //printf("[sp] Gfx task: %08X\n", (uint32_t)ctx->r4);
      } else if (task->t.type == M_AUDTASK) {
 diff --git a/ultramodern/include/ultramodern/input.hpp b/ultramodern/include/ultramodern/input.hpp
-index 1dab1b8..dae7046 100644
+index 1dab1b8..8fb216d 100644
 --- a/ultramodern/include/ultramodern/input.hpp
 +++ b/ultramodern/include/ultramodern/input.hpp
-@@ -57,6 +57,12 @@ namespace ultramodern {
+@@ -57,6 +57,18 @@ namespace ultramodern {
          };
  
          void set_callbacks(const callbacks_t& callbacks);
@@ -369,6 +422,12 @@ index 1dab1b8..dae7046 100644
 +        // raw SI/PIF (e.g. WCW's homegrown controller layer) never call that, so the raw-SI
 +        // emulation must trigger the poll itself before sampling input.
 +        void poll_input();
++
++        // [wcw fix] Run the set_rumble callback directly. Games that bypass the osCont*/osMotor*
++        // API and drive the Rumble Pak with raw joybus pak writes (address 0xC000 through the
++        // raw-SI/PIF path) never reach __osMotorAccess, so the PIF emulation (librecomp si.cpp)
++        // must forward motor commands itself.
++        void set_rumble(int controller_num, bool on);
      }
  }
  
@@ -688,10 +747,10 @@ index 090cc42..79a2c27 100644
  }
  
 diff --git a/ultramodern/src/input.cpp b/ultramodern/src/input.cpp
-index a170407..89df3d0 100644
+index a170407..07b6997 100644
 --- a/ultramodern/src/input.cpp
 +++ b/ultramodern/src/input.cpp
-@@ -104,11 +104,17 @@ extern "C" s32 osContStartQuery(RDRAM_ARG PTR(OSMesgQueue) mq) {
+@@ -104,11 +104,25 @@ extern "C" s32 osContStartQuery(RDRAM_ARG PTR(OSMesgQueue) mq) {
      return 0;
  }
  
@@ -703,6 +762,14 @@ index a170407..89df3d0 100644
          input_callbacks.poll_input();
      }
      update_poll_time();
++}
++
++// [wcw fix] Exposed so the raw-SI/PIF emulation (librecomp si.cpp) can forward raw joybus
++// Rumble Pak motor commands (pak writes to 0xC000); games using raw SI never call osMotor*.
++void ultramodern::input::set_rumble(int controller_num, bool on) {
++    if (input_callbacks.set_rumble != nullptr) {
++        input_callbacks.set_rumble(controller_num, on);
++    }
 +}
 +
 +extern "C" s32 osContStartReadData(RDRAM_ARG PTR(OSMesgQueue) mq) {

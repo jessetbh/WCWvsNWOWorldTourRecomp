@@ -24,6 +24,7 @@
 #include "recompinput/recompinput.h"
 #include "recompinput/profiles.h"
 #include "recompinput/input_events.h"
+#include "recompinput/input_state.h"
 #include "recompinput/players.h"
 #include "librecomp/game.hpp"
 #include "librecomp/rsp.hpp"
@@ -468,9 +469,11 @@ int main(int argc, char** argv) {
     // the gfx thread throws "General config has not been created yet" -> std::terminate.
     // (We skip the launcher UI but still need the config state. Mirrors BMHero init_config.)
     recompui::config::GeneralTabOptions general_options{};
-    // WCW never uses the Rumble Pak (it's a Controller Pak game and the port emulates a
-    // mempak in port 1), so hide the dead Rumble Strength slider.
-    general_options.has_rumble_strength = false;
+    // Rumble works: the game's raw-SI Rumble Pak probe/motor commands are handled by the
+    // hybrid pak emulation in librecomp si.cpp (answer the title-screen "Insert a Rumble Pak
+    // now" prompt to enable it in-game). The slider must be on — recompinput::update_rumble
+    // is a no-op when has_rumble_strength is false.
+    general_options.has_rumble_strength = true;
     recompui::config::create_general_tab(general_options);
     recompui::config::create_graphics_tab();
     recompui::config::create_controls_tab();
@@ -519,7 +522,9 @@ int main(int argc, char** argv) {
         .set_rumble = recompinput::set_rumble,
         .get_connected_device_info = get_connected_device_info,
     };
-    ultramodern::events::callbacks_t events_callbacks{ .vi_callback = nullptr, .gfx_init_callback = nullptr };
+    // update_rumble runs every VI to ramp/decay the host controller's rumble motor toward the
+    // state last set via set_rumble (BMHero registers it the same way).
+    ultramodern::events::callbacks_t events_callbacks{ .vi_callback = recompinput::update_rumble, .gfx_init_callback = nullptr };
     ultramodern::error_handling::callbacks_t error_callbacks{ .message_box = recompui::message_box };
     ultramodern::threads::callbacks_t threads_callbacks{ .get_game_thread_name = [](const OSThread*) -> std::string { return "game"; } };
 

@@ -55,7 +55,9 @@ verification evidence. **OVERSCAN-EDGE CROP DONE (2026-07-05)** — see the ✅
 fixed with a per-edge CRT-style crop in rt64_vi.cpp, env `WCW_CROP`). **INPUT OPTIONS
 DONE (2026-07-05, verified in-game)** — see the ✅ "INPUT OPTIONS" bullet: the recompui
 config menu (General/Graphics/Controls/Sound) opens in-game via Esc / gamepad Back and
-the full rebinding flow works and persists. Next up: more Phase-4 enhancements (real
+the full rebinding flow works and persists. **RUMBLE WORKS (2026-07-05, user-verified)** —
+see the ✅ "RUMBLE" bullet: hybrid Controller/Rumble Pak identity in si.cpp, motor
+commands → SDL rumble, slider restored. Next up: more Phase-4 enhancements (real
 high-FPS interpolation needs RT64 multi-workload frame detection + matrix-group patches).
 Dropped permanently
 (decision 2026-07-05): upstreaming the general runtime bugs — the drafts in `upstream/`
@@ -400,8 +402,8 @@ Still NOT done (later phases):
   a full UI rebind (A: Space→P) wrote controls.json (input_id 44→19, restored afterward);
   Esc again closes back to a clean game view. Two small changes landed: one-shot
   `[wcw][ui] config menu opened` marker in ui_state.cpp (exported to lib-patches), and
-  `GeneralTabOptions.has_rumble_strength = false` in main.cpp (WCW has no rumble — it's a
-  Controller Pak game; the slider was dead weight; verified hidden). Test scripts pattern:
+  `GeneralTabOptions.has_rumble_strength = false` in main.cpp (SUPERSEDED same day: rumble
+  now works via the hybrid pak — see the ✅ "RUMBLE" bullet; slider is back). Test scripts pattern:
   poll `wcw_present_lum.csv` for present N, PostMessage WM_KEYDOWN/WM_MOUSE* to the SDL_app
   window (FindWindowW from PS marshals $null class as "" — enumerate windows by pid
   instead), BMP-dump a window aimed past the interaction. Tab-switch fake keys (F16/F17)
@@ -425,9 +427,27 @@ Still NOT done (later phases):
   .json silently reloaded the old layout from the backup). (2) Rumble correction to the
   2026-07-05 slider decision: the game DOES support the Rumble Pak on hardware ("Rumble
   Pak supported — Insert a Rumble Pak now" prompt after Start at the title, waits for a
-  button), but the port's PIF pak emulation always answers as a Controller Pak (mempak
-  semantics), so rumble stays inert and the hidden slider remains correct; making the
-  emulated pak switchable/hybrid is a possible future enhancement.
+  button) — RESOLVED same day by the hybrid pak (see the ✅ "RUMBLE" bullet).
+- ✅ **RUMBLE WORKS (2026-07-05, user-verified): hybrid Controller/Rumble Pak.** A real N64
+  has one pak slot per controller — WCW saves to the Controller Pak but rumbles with the
+  Rumble Pak, physically swapped on hardware. The port's virtual pak in librecomp
+  `si.cpp` (`[wcw fix]`) is now BOTH via an identity state machine: default identity is
+  mempak (bank/ID-region reads = zeros → saves keep working exactly as before); a uniform
+  0x80 block written to the bank region (the Rumble Pak probe/init, sent when the player
+  answers the title-screen "Insert a Rumble Pak now" prompt) flips identity to rumble
+  (bank reads = 0x80s in the 0x8000..0x8FFF window, like hardware) until any other bank
+  value is written (0xFE probe-reset / 0x00 bank select → back to mempak, motor forced
+  off). Pak writes to the 0xC000 region are motor commands (data 0x01=on/0x00=off) →
+  new public `ultramodern::input::set_rumble()` (input.hpp/cpp `[wcw fix]`, mirrors the
+  poll_input exposure — WCW's raw-SI driver never calls osMotor*) → recompinput's SDL
+  rumble. Save-region (<0x8000) reads/writes are honored regardless of identity, so saves
+  can never be lost to rumble. `src/main/main.cpp`: `vi_callback =
+  recompinput::update_rumble` (was nullptr — update_rumble ramps/decays the actual SDL
+  motor each VI; BMHero registers it the same way) and `has_rumble_strength = true`
+  (update_rumble is a NO-OP when the option is absent; slider restored, no longer dead
+  weight). Bounded `[wcw][pak]` stderr diagnostics remain (dedup'd bank-op log, capped 64
+  lines + one-shot motor ON/OFF markers). Enable in-game: press Start at the title,
+  answer the Rumble Pak prompt with a button.
 - ✅ **VI display + AI + RSP-task submission — NAMED; first frame REACHES RT64.** osViSetMode/
   Black/SetEvent/SwapBuffer/GetCurrent+NextFramebuffer/SetSpecialFeatures (0x80012xxx),
   osAiGetLength/SetNextBuffer (0x80016xxx), osSpTaskLoad/StartGo + osDpSetNextBuffer. `vi.mq`
