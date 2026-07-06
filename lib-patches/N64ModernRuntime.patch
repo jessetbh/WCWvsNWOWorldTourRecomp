@@ -482,7 +482,7 @@ index 3198be0..31ee871 100644
  // If there's ever any audio popping, check here first. Some games are very sensitive to
  // the remaining sample count and reporting a number that's too high here can lead to issues.
 diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
-index 090cc42..a62476c 100644
+index 090cc42..56ab0fe 100644
 --- a/ultramodern/src/events.cpp
 +++ b/ultramodern/src/events.cpp
 @@ -29,6 +29,7 @@ struct SpTaskAction {
@@ -555,7 +555,7 @@ index 090cc42..a62476c 100644
  }
  
  uint64_t total_vis = 0;
-@@ -224,27 +255,94 @@ void vi_thread_func() {
+@@ -224,27 +255,99 @@ void vi_thread_func() {
  
          // Queue a screen update for the graphics thread with the current VI register state.
          // Doing this before the VI update is equivalent to updating the screen after the previous frame's scanout finished.
@@ -567,6 +567,11 @@ index 090cc42..a62476c 100644
          // Update VI registers and swap VI modes.
          events_context.vi.update_vi();
  
++        { // [wcw] DIAGNOSTIC: 1/s health line (game frame rate + external-message backlog).
++            extern void wcw_health_tick();
++            wcw_health_tick();
++        }
++
 +        { // [wcw] DIAGNOSTIC (env WCW_VI_LOG=1): scanout health — log origin changes
 +          // (framebuffer cycling pattern) and black scanouts (hStart==0 = VI_STATE_BLACK),
 +          // to characterize visual flicker. First ~200 origin changes individually + 1/s summary.
@@ -654,7 +659,7 @@ index 090cc42..a62476c 100644
                  ultramodern::enqueue_external_message(events_context.ai.mq, events_context.ai.msg, false, false);
              }
          }
-@@ -255,15 +353,20 @@ void vi_thread_func() {
+@@ -255,15 +358,20 @@ void vi_thread_func() {
      }
  }
  
@@ -675,7 +680,7 @@ index 090cc42..a62476c 100644
      ultramodern::enqueue_external_message(events_context.dp.mq, events_context.dp.msg, false, true);
  }
  
-@@ -355,8 +458,35 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+@@ -355,8 +463,35 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
  
      while (!exited) {
          // Try to pull an action from the queue
@@ -713,7 +718,7 @@ index 090cc42..a62476c 100644
              // Determine the action type and act on it
              if (const auto* task_action = std::get_if<SpTaskAction>(&action)) {
                  // Tell the game that the RSP completed instantly. This will allow it to queue other task types, but it won't
-@@ -372,6 +502,18 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+@@ -372,6 +507,18 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                  [[maybe_unused]] auto renderer_start = std::chrono::high_resolution_clock::now();
                  renderer_context->send_dl(&task_action->task);
                  [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
@@ -732,7 +737,7 @@ index 090cc42..a62476c 100644
  
                  dp_complete();
                  // TODO hook the parsed event up to the actual parsing point when a callback is added to RT64.
-@@ -380,6 +522,18 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+@@ -380,6 +527,18 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                  // printf("Renderer ProcessDList time: %d us\n", static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(renderer_end - renderer_start).count()));
              }
              else if (const auto* screen_update_action = std::get_if<ScreenUpdateAction>(&action)) {
@@ -751,7 +756,7 @@ index 090cc42..a62476c 100644
                  events_context.vi.update_screen_regs = screen_update_action->regs;
                  renderer_context->update_screen();
                  display_refresh_rate = renderer_context->get_display_framerate();
-@@ -395,6 +549,7 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+@@ -395,6 +554,7 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
              else if (const auto* dummy_workload_action = std::get_if<DummyWorkloadAction>(&action)) {
                  renderer_context->send_dummy_workload(dummy_workload_action->fb_address);
              }
@@ -759,10 +764,18 @@ index 090cc42..a62476c 100644
          }
      }
  
-@@ -456,6 +611,21 @@ void set_dummy_vi(bool odd) {
+@@ -454,8 +614,29 @@ void set_dummy_vi(bool odd) {
+     }
+ }
  
++// [wcw] DIAGNOSTIC: per-second game-frame counter, reported in the [wcw][health] line
++// (mesgqueue.cpp). osViSwapBuffer fires once per rendered game frame, so a drop in this
++// rate is a direct measure of "the game slowed down" regardless of host present rate.
++std::atomic_int wcw_viswaps{0};
++
  extern "C" void osViSwapBuffer(RDRAM_ARG PTR(void) frameBufPtr) {
      std::lock_guard lock{ events_context.message_mutex };
++    wcw_viswaps.fetch_add(1);
 +    // [wcw] DIAGNOSTIC: log swaps — if this never fires, VI scans out nothing (black screen)
 +    // regardless of what the RDP rendered.
 +    { static int n = 0; if (n++ < 30) fprintf(stderr, "[wcw][viswap#%d] fb=0x%08X\n", n, (unsigned)frameBufPtr); }
@@ -813,11 +826,15 @@ index a170407..07b6997 100644
      ultramodern::send_si_message();
  
 diff --git a/ultramodern/src/mesgqueue.cpp b/ultramodern/src/mesgqueue.cpp
-index 961de3d..79d66e2 100644
+index 961de3d..9e129e9 100644
 --- a/ultramodern/src/mesgqueue.cpp
 +++ b/ultramodern/src/mesgqueue.cpp
-@@ -1,4 +1,8 @@
+@@ -1,4 +1,12 @@
  #include <thread>
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
 +#ifdef _WIN32
 +#define WIN32_LEAN_AND_MEAN
 +#include <windows.h>
@@ -825,9 +842,120 @@ index 961de3d..79d66e2 100644
  
  #include "blockingconcurrentqueue.h"
  
-@@ -34,10 +38,30 @@ void dequeue_external_messages(RDRAM_ARG1) {
+@@ -10,34 +18,148 @@ struct QueuedMessage {
+     OSMesg mesg;
+     bool jam;
+     bool requeue_if_blocked;
++    int64_t enqueue_ms; // [wcw fix] set at enqueue; bounds how long an undeliverable message may requeue
+ };
+ 
+ static moodycamel::BlockingConcurrentQueue<QueuedMessage> external_messages {};
+ 
++// [wcw fix] Grace window for undeliverable requeue_if_blocked messages, after which they are
++// dropped. On hardware, completion/event messages (PI DMA done, SI/VI/AI events) are posted with
++// OS_MESG_NOBLOCK and silently DROPPED if the target queue is full — a game may legally
++// fire-and-forget DMAs (WCW does, from three separate DMA queues) and never receive them.
++// requeue_if_blocked exists because librecomp's DMAs complete instantly (the completion can
++// arrive while the game's queue is momentarily full, where real DMA latency would have let the
++// game drain it first), so messages must be retried briefly — but retrying FOREVER makes every
++// orphaned completion permanent: the external_messages backlog grows without bound (~55/s
++// during WCW gameplay) and every osSendMesg/osRecvMesg drains-and-requeues the whole backlog,
++// i.e. O(backlog) work per call under message_mutex. Measured result: game slowdown and starved
++// message delivery (SFX loss) after ~4 minutes of play, persisting until restart. One second is
++// orders of magnitude longer than any transient queue-full window (a frame or two) yet still
++// emulates the hardware drop.
++constexpr int64_t requeue_grace_ms = 1000;
++
++static int64_t wcw_steady_ms() {
++    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
+ void ultramodern::enqueue_external_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, bool requeue_if_blocked) {
+-    external_messages.enqueue({mq, msg, jam, requeue_if_blocked});
++    external_messages.enqueue({mq, msg, jam, requeue_if_blocked, wcw_steady_ms()});
  }
  
+ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block);
+ 
++// [wcw] DIAGNOSTIC counters for the 1/s [wcw][health] line: requeue churn (undeliverable
++// requeue_if_blocked messages put back on external_messages), per-second delivery counts,
++// and messages dropped after exhausting the requeue grace window.
++std::atomic_int wcw_requeues{0}, wcw_extmsg_delivered{0}, wcw_extmsg_dropped{0};
++
++// [wcw] DIAGNOSTIC: small histogram of the (mq, msg) pairs being requeued, to identify WHICH
++// message is undeliverable when the backlog grows. Lossy/racy by design (diagnostic only).
++struct WcwRequeueSlot { std::atomic<uint64_t> key{0}; std::atomic<uint32_t> count{0}; };
++static WcwRequeueSlot wcw_requeue_hist[4];
++static void wcw_note_requeue(PTR(OSMesgQueue) mq, OSMesg msg) {
++    uint64_t key = ((uint64_t)(uint32_t)mq << 32) | (uint32_t)msg;
++    for (auto& slot : wcw_requeue_hist) {
++        uint64_t cur = slot.key.load(std::memory_order_relaxed);
++        if (cur == key) { slot.count.fetch_add(1, std::memory_order_relaxed); return; }
++        if (cur == 0) { slot.key.store(key, std::memory_order_relaxed); slot.count.fetch_add(1, std::memory_order_relaxed); return; }
++    }
++}
++
+ void dequeue_external_messages(RDRAM_ARG1) {
+     QueuedMessage to_send;
+     std::vector<QueuedMessage> requeued_messages{};
++    int64_t now_ms = wcw_steady_ms();
+     while (external_messages.try_dequeue(to_send)) {
+         if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
+-            requeued_messages.push_back(to_send);
++            // [wcw fix] Undeliverable: retry within the grace window, then drop (hardware
++            // semantics — NOBLOCK completion posts into a full queue are lost).
++            if (now_ms - to_send.enqueue_ms <= requeue_grace_ms) {
++                requeued_messages.push_back(to_send);
++                wcw_note_requeue(to_send.mq, to_send.mesg);
++            }
++            else {
++                wcw_extmsg_dropped.fetch_add(1);
++            }
++        }
++        else {
++            wcw_extmsg_delivered.fetch_add(1);
+         }
+     }
++    wcw_requeues.fetch_add((int)requeued_messages.size());
+     for (QueuedMessage& cur_mesg : requeued_messages) {
+         external_messages.enqueue(cur_mesg);
+     }
+ }
+ 
++// [wcw] DIAGNOSTIC (env WCW_HEALTH_LOG=1, 1 line/s): game health snapshot. viswaps/s = real
++// game frame rate; ext=N = external_messages backlog (undeliverable requeued messages make
++// this grow — every osSendMesg/osRecvMesg on a game thread drains this queue, so a standing
++// backlog is O(N) work per call and a direct slowdown mechanism); rq/s = requeue churn;
++// del/s = deliveries; drop/s = orphaned messages expired by the requeue grace window. This is
++// the instrumentation that root-caused the 4-minute in-match slowdown/SFX-loss (see the
++// requeue_grace_ms comment above).
++void wcw_health_tick() {
++    static const bool enabled = getenv("WCW_HEALTH_LOG") != nullptr;
++    if (!enabled) {
++        return;
++    }
++    extern std::atomic_int wcw_viswaps;
++    static int64_t last_ms = 0;
++    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++    if (last_ms == 0) { last_ms = now; return; }
++    if (now - last_ms < 1000) { return; }
++    last_ms = now;
++    char hist[128] = "";
++    for (auto& slot : wcw_requeue_hist) {
++        uint64_t key = slot.key.load(std::memory_order_relaxed);
++        uint32_t cnt = slot.count.exchange(0, std::memory_order_relaxed);
++        if (key != 0 && cnt != 0) {
++            size_t len = strlen(hist);
++            snprintf(hist + len, sizeof(hist) - len, " mq=0x%X/msg=0x%X:%u",
++                (uint32_t)(key >> 32), (uint32_t)key, cnt);
++        }
++    }
++    fprintf(stderr, "[wcw][health] vis/s=%d ext=%zu rq/s=%d del/s=%d drop/s=%d%s\n",
++        wcw_viswaps.exchange(0), external_messages.size_approx(),
++        wcw_requeues.exchange(0), wcw_extmsg_delivered.exchange(0),
++        wcw_extmsg_dropped.exchange(0), hist);
++}
++
  void ultramodern::wait_for_external_message(RDRAM_ARG1) {
 +    // [wcw fix] Drain every available message per wake instead of processing exactly one.
 +    // The single-message version deadlocked: on delivery failure it re-enqueued immediately,
@@ -841,14 +969,23 @@ index 961de3d..79d66e2 100644
      external_messages.wait_dequeue(to_send);
 -    if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
 -        external_messages.enqueue(to_send);
++    int64_t now_ms = wcw_steady_ms();
 +    do {
 +        if (do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false)) {
 +            delivered_any = true;
 +        }
 +        else if (to_send.requeue_if_blocked) {
-+            requeued_messages.push_back(to_send);
++            // [wcw fix] Same grace-window drop as dequeue_external_messages above.
++            if (now_ms - to_send.enqueue_ms <= requeue_grace_ms) {
++                requeued_messages.push_back(to_send);
++                wcw_note_requeue(to_send.mq, to_send.mesg);
++            }
++            else {
++                wcw_extmsg_dropped.fetch_add(1);
++            }
 +        }
 +    } while (external_messages.try_dequeue(to_send));
++    wcw_requeues.fetch_add((int)requeued_messages.size());
 +    for (QueuedMessage& cur_mesg : requeued_messages) {
 +        external_messages.enqueue(cur_mesg);
 +    }
@@ -858,7 +995,22 @@ index 961de3d..79d66e2 100644
      }
  }
  
-@@ -72,22 +96,54 @@ s32 MQ_IS_FULL(OSMesgQueue* mq) {
+@@ -45,7 +167,13 @@ void ultramodern::wait_for_external_message_timed(RDRAM_ARG u32 millis) {
+     QueuedMessage to_send;
+     if (external_messages.wait_dequeue_timed(to_send, std::chrono::milliseconds{millis})) {
+         if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
+-            external_messages.enqueue(to_send);
++            // [wcw fix] Same grace-window drop as dequeue_external_messages above.
++            if (wcw_steady_ms() - to_send.enqueue_ms <= requeue_grace_ms) {
++                external_messages.enqueue(to_send);
++            }
++            else {
++                wcw_extmsg_dropped.fetch_add(1);
++            }
+         }
+     }
+ }
+@@ -72,22 +200,54 @@ s32 MQ_IS_FULL(OSMesgQueue* mq) {
      return MQ_GET_COUNT(mq) >= mq->msgCount;
  }
  
@@ -913,7 +1065,7 @@ index 961de3d..79d66e2 100644
      
      if (jam) {
          // Jams insert at the head of the message queue's buffer.
-@@ -156,9 +212,21 @@ extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags)
+@@ -156,9 +316,21 @@ extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags)
      // Handle any messages that have been received from an external thread.
      dequeue_external_messages(PASS_RDRAM1);
  
@@ -936,7 +1088,7 @@ index 961de3d..79d66e2 100644
      // Check the queue to see if this thread should swap execution to another.
      ultramodern::check_running_queue(PASS_RDRAM1);
  
-@@ -195,11 +263,26 @@ extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32
+@@ -195,11 +367,26 @@ extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32
      // Handle any messages that have been received from an external thread.
      dequeue_external_messages(PASS_RDRAM1);
  

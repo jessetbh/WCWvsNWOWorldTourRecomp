@@ -488,6 +488,35 @@ Still NOT done (later phases):
   weight). Bounded `[wcw][pak]` stderr diagnostics remain (dedup'd bank-op log, capped 64
   lines + one-shot motor ON/OFF markers). Enable in-game: press Start at the title,
   answer the Rumble Pak prompt with a button.
+- ✅ **4-MINUTE IN-MATCH SLOWDOWN + SFX LOSS SOLVED (2026-07-06): unbounded
+  external-message backlog.** User report: ~4 minutes into play the game slows down
+  drastically and sound EFFECTS stop (music keeps playing); persists across matches,
+  cleared only by restarting the app. Root cause (found by a new 1/s `[wcw][health]`
+  metric line, now env-gated `WCW_HEALTH_LOG=1`, in ultramodern `mesgqueue.cpp`): WCW
+  fires PI DMAs from three DMA queues (`0x80047C40`/`0x80047CCC`/`0x80045138`) whose
+  completion messages it NEVER receives — fire-and-forget, legal on hardware where the
+  PI manager posts completions `OS_MESG_NOBLOCK` and a full queue silently drops them.
+  librecomp instead posts them with `requeue_if_blocked=true`, so each orphan became a
+  permanent resident of ultramodern's `external_messages` queue: backlog grew ~55/s
+  during gameplay (measured `ext=14k` at the 4-minute mark), and since EVERY
+  osSendMesg/osRecvMesg on a game thread drains-and-requeues the entire backlog
+  (`dequeue_external_messages`), per-call cost is O(backlog) under `message_mutex` —
+  measured 25M requeue cycles/s. That progressively starves game threads (the slowdown)
+  and delays legitimate deliveries like the sound driver's sample-DMA handshakes (SFX
+  silent; sequenced music survives). Matches "persists across matches / reset on
+  restart": the orphaned queues are never drained by the game, and the backlog lives in
+  the host process. **Fix (`[wcw fix]` b8a4af0, N64ModernRuntime fork)**: stamp each
+  external message at enqueue; retry undeliverable requeue-if-blocked messages for a 1 s
+  grace window (requeue exists to paper over librecomp's instant-DMA timing — a
+  completion can land while the game's queue is momentarily full, where real DMA latency
+  would have let the game drain it first), then DROP, exactly as hardware would have at
+  DMA time. Verified over 10+ min of continuous scripted matches (synthetic keyboard
+  input): backlog bounded ≤74 (was unbounded), orphans expired at the previous growth
+  rate (~10–55/s, scales with gameplay activity), steady 30 viswaps/s, zero audio
+  underruns. Note for later: the user's prior session log ends with an access violation
+  INSIDE `do_send` (delivering to `0x80047C40`) at app exit — a teardown race (runtime
+  threads still delivering after rdram is freed) made ~million× likelier by the old
+  backlog churn; if it ever recurs post-fix, that's the spot.
 - âœ… **VI display + AI + RSP-task submission â€” NAMED; first frame REACHES RT64.** osViSetMode/
   Black/SetEvent/SwapBuffer/GetCurrent+NextFramebuffer/SetSpecialFeatures (0x80012xxx),
   osAiGetLength/SetNextBuffer (0x80016xxx), osSpTaskLoad/StartGo + osDpSetNextBuffer. `vi.mq`
