@@ -49,10 +49,11 @@ see `BUILDING.md`.
 
 ## Hard-won invariants — do not break these
 
-- **`lib/` is gitignored** (N64ModernRuntime, RecompFrontend, rt64 clones). All local
-  `[wcw fix]` changes are preserved as `lib-patches/*.patch`. **After ANY edit under
-  `lib/`, run `.\lib-patches\export.ps1` and commit**; after a reclone, run
-  `.\lib-patches\apply.ps1`. (An unexported fix was nearly lost once — see devlog.)
+- **`lib/` = submodules of the jessetbh forks** (N64ModernRuntime, RecompFrontend,
+  rt64; nested N64Recomp + plume forks inside them), each with the `[wcw fix]` set on
+  a `wcw` branch. **After ANY edit under `lib/`: commit on that repo's `wcw` branch,
+  push to the fork, bump the submodule pin in the superproject, and rerun
+  `.\lib-patches\export.ps1`** (keeps the diff-vs-upstream record current).
 - **libultra naming**: game functions are mapped to libultra names via the `RENAME`
   map in `tools/gen_symbols.py` (N64Recomp auto-ignores known names; the runtime
   provides them). Do **not** add them to `wcw.toml` `ignored`. Do **not** rename

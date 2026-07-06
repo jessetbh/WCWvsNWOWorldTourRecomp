@@ -1,3 +1,17 @@
+diff --git a/.gitmodules b/.gitmodules
+index 4b3ed99..f77f97a 100644
+--- a/.gitmodules
++++ b/.gitmodules
+@@ -6,7 +6,8 @@
+ 	url = https://github.com/richgel999/miniz
+ [submodule "N64Recomp"]
+ 	path = N64Recomp
+-	url = https://github.com/N64Recomp/N64Recomp
++	url = https://github.com/jessetbh/N64Recomp
++	branch = wcw
+ [submodule "thirdparty/o1heap"]
+ 	path = thirdparty/o1heap
+ 	url = https://github.com/N64Recomp/o1heap
 diff --git a/librecomp/CMakeLists.txt b/librecomp/CMakeLists.txt
 index 716d48b..bbc5b5f 100644
 --- a/librecomp/CMakeLists.txt
@@ -468,7 +482,7 @@ index 3198be0..31ee871 100644
  // If there's ever any audio popping, check here first. Some games are very sensitive to
  // the remaining sample count and reporting a number that's too high here can lead to issues.
 diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
-index 090cc42..79a2c27 100644
+index 090cc42..a62476c 100644
 --- a/ultramodern/src/events.cpp
 +++ b/ultramodern/src/events.cpp
 @@ -29,6 +29,7 @@ struct SpTaskAction {
@@ -541,7 +555,7 @@ index 090cc42..79a2c27 100644
  }
  
  uint64_t total_vis = 0;
-@@ -224,27 +255,89 @@ void vi_thread_func() {
+@@ -224,27 +255,94 @@ void vi_thread_func() {
  
          // Queue a screen update for the graphics thread with the current VI register state.
          // Doing this before the VI update is equivalent to updating the screen after the previous frame's scanout finished.
@@ -553,9 +567,10 @@ index 090cc42..79a2c27 100644
          // Update VI registers and swap VI modes.
          events_context.vi.update_vi();
  
-+        { // [wcw] DIAGNOSTIC: scanout health — log origin changes (framebuffer cycling
-+          // pattern) and black scanouts (hStart==0 = VI_STATE_BLACK), to characterize
-+          // visual flicker. First ~200 origin changes logged individually + 1/s summary.
++        { // [wcw] DIAGNOSTIC (env WCW_VI_LOG=1): scanout health — log origin changes
++          // (framebuffer cycling pattern) and black scanouts (hStart==0 = VI_STATE_BLACK),
++          // to characterize visual flicker. First ~200 origin changes individually + 1/s summary.
++            static const bool wcw_vi_log = getenv("WCW_VI_LOG") != nullptr;
 +            static uint32_t last_origin = 0xFFFFFFFF; static int vis = 0, changes = 0, blacks = 0, logged = 0;
 +            uint32_t org = events_context.vi.regs.VI_ORIGIN_REG;
 +            uint32_t hs = events_context.vi.regs.VI_H_START_REG;
@@ -563,16 +578,19 @@ index 090cc42..79a2c27 100644
 +            if (hs == 0) blacks++;
 +            if (org != last_origin) {
 +                changes++;
-+                if (logged < 200) { fprintf(stderr, "[wcw][scan] vi=%llu origin 0x%08X -> 0x%08X hstart=0x%X\n", (unsigned long long)total_vis, last_origin, org, hs); logged++; }
++                if (logged < 200 && wcw_vi_log) { fprintf(stderr, "[wcw][scan] vi=%llu origin 0x%08X -> 0x%08X hstart=0x%X\n", (unsigned long long)total_vis, last_origin, org, hs); logged++; }
 +                last_origin = org;
 +            }
 +            if (vis >= 60) {
 +                extern std::atomic_int wcw_ai_del, wcw_ai_drop, wcw_vi_del, wcw_vi_drop;
 +                extern std::atomic<int64_t> wcw_ai_maxlat, wcw_vi_maxlat;
-+                fprintf(stderr, "[wcw][scan] 60 VIs: origin-changes=%d blacks=%d | ai del=%d drop=%d maxlat=%lldms | vi del=%d drop=%d maxlat=%lldms\n",
-+                    changes, blacks,
-+                    wcw_ai_del.exchange(0), wcw_ai_drop.exchange(0), (long long)wcw_ai_maxlat.exchange(0),
-+                    wcw_vi_del.exchange(0), wcw_vi_drop.exchange(0), (long long)wcw_vi_maxlat.exchange(0));
++                int ai_del = wcw_ai_del.exchange(0), ai_drop = wcw_ai_drop.exchange(0);
++                int vi_del = wcw_vi_del.exchange(0), vi_drop = wcw_vi_drop.exchange(0);
++                long long ai_maxlat = wcw_ai_maxlat.exchange(0), vi_maxlat = wcw_vi_maxlat.exchange(0);
++                if (wcw_vi_log) {
++                    fprintf(stderr, "[wcw][scan] 60 VIs: origin-changes=%d blacks=%d | ai del=%d drop=%d maxlat=%lldms | vi del=%d drop=%d maxlat=%lldms\n",
++                        changes, blacks, ai_del, ai_drop, ai_maxlat, vi_del, vi_drop, vi_maxlat);
++                }
 +                vis = 0; changes = 0; blacks = 0;
 +            }
 +        }
@@ -584,12 +602,13 @@ index 090cc42..79a2c27 100644
              std::lock_guard lock{ events_context.message_mutex };
              ViState* cur_state = events_context.vi.get_cur_state();
 -            if (remaining_retraces == 0) {
-+            { // [wcw] DIAGNOSTIC: report VI/AI retrace-queue registration once a second, plus the
-+              // fixed-segment game-mode state var @ 0x80034834 (0=overlay A, 1=overlay B — it
-+              // advances 0->1 when B loads then sticks, i.e. the overlay-B internal state is the
-+              // stall). Read from rdram with the recomp byte-swap (byte at game offset X = rdram[X^3]).
++            { // [wcw] DIAGNOSTIC (env WCW_VI_LOG=1): report VI/AI retrace-queue registration once a
++              // second, plus the fixed-segment game-mode state var @ 0x80034834 (0=overlay A,
++              // 1=overlay B — it advances 0->1 when B loads then sticks, i.e. the overlay-B internal
++              // state is the stall). Read from rdram with the recomp byte-swap (byte at offset X = rdram[X^3]).
++                static const bool wcw_vi_log = getenv("WCW_VI_LOG") != nullptr;
 +                static int tick = 0;
-+                if ((tick++ % 60) == 0) {
++                if (((tick++ % 60) == 0) && wcw_vi_log) {
 +                    uint8_t* rd = events_context.rdram;
 +                    auto rd32 = [rd](uint32_t off) -> uint32_t {
 +                        return ((uint32_t)rd[(off+0)^3] << 24) | ((uint32_t)rd[(off+1)^3] << 16)
@@ -635,7 +654,7 @@ index 090cc42..79a2c27 100644
                  ultramodern::enqueue_external_message(events_context.ai.mq, events_context.ai.msg, false, false);
              }
          }
-@@ -255,15 +348,20 @@ void vi_thread_func() {
+@@ -255,15 +353,20 @@ void vi_thread_func() {
      }
  }
  
@@ -656,7 +675,7 @@ index 090cc42..79a2c27 100644
      ultramodern::enqueue_external_message(events_context.dp.mq, events_context.dp.msg, false, true);
  }
  
-@@ -355,8 +453,35 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+@@ -355,8 +458,35 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
  
      while (!exited) {
          // Try to pull an action from the queue
@@ -694,7 +713,7 @@ index 090cc42..79a2c27 100644
              // Determine the action type and act on it
              if (const auto* task_action = std::get_if<SpTaskAction>(&action)) {
                  // Tell the game that the RSP completed instantly. This will allow it to queue other task types, but it won't
-@@ -372,6 +497,18 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+@@ -372,6 +502,18 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                  [[maybe_unused]] auto renderer_start = std::chrono::high_resolution_clock::now();
                  renderer_context->send_dl(&task_action->task);
                  [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
@@ -713,7 +732,7 @@ index 090cc42..79a2c27 100644
  
                  dp_complete();
                  // TODO hook the parsed event up to the actual parsing point when a callback is added to RT64.
-@@ -380,6 +517,18 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+@@ -380,6 +522,18 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                  // printf("Renderer ProcessDList time: %d us\n", static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(renderer_end - renderer_start).count()));
              }
              else if (const auto* screen_update_action = std::get_if<ScreenUpdateAction>(&action)) {
@@ -732,7 +751,7 @@ index 090cc42..79a2c27 100644
                  events_context.vi.update_screen_regs = screen_update_action->regs;
                  renderer_context->update_screen();
                  display_refresh_rate = renderer_context->get_display_framerate();
-@@ -395,6 +544,7 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+@@ -395,6 +549,7 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
              else if (const auto* dummy_workload_action = std::get_if<DummyWorkloadAction>(&action)) {
                  renderer_context->send_dummy_workload(dummy_workload_action->fb_address);
              }
@@ -740,7 +759,7 @@ index 090cc42..79a2c27 100644
          }
      }
  
-@@ -456,6 +606,21 @@ void set_dummy_vi(bool odd) {
+@@ -456,6 +611,21 @@ void set_dummy_vi(bool odd) {
  
  extern "C" void osViSwapBuffer(RDRAM_ARG PTR(void) frameBufPtr) {
      std::lock_guard lock{ events_context.message_mutex };

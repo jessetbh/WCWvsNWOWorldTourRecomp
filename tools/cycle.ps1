@@ -21,6 +21,7 @@ Write-Host "build OK"
 
 # --- Phase 3: run with timeout, capture merged output ---
 $psi = New-Object System.Diagnostics.ProcessStartInfo
+$env:WCW_AUTOBOOT = "1"   # dev loop: skip the launcher menu, boot wcw.z64 from the cwd
 $psi.FileName = "cmd.exe"; $psi.Arguments = "/c `".\WCWRecompiled.exe`" > bt.txt 2>&1"
 $psi.WorkingDirectory = $build; $psi.UseShellExecute = $false
 $p = [System.Diagnostics.Process]::Start($psi)

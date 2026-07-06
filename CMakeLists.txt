@@ -158,6 +158,18 @@ add_subdirectory(${CMAKE_SOURCE_DIR}/lib/RecompFrontend)
 
 # --- Main executable ---
 add_executable(WCWRecompiled)
+
+# App icon: exe resource (Windows title bar/taskbar/Explorer) + embedded PNG bytes for
+# the launcher thumbnail (GameEntry.thumbnail_bytes).
+add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/icon_bytes.c ${CMAKE_CURRENT_BINARY_DIR}/icon_bytes.h
+    COMMAND file_to_c ${CMAKE_SOURCE_DIR}/icons/app.png icon_bytes ${CMAKE_CURRENT_BINARY_DIR}/icon_bytes.c ${CMAKE_CURRENT_BINARY_DIR}/icon_bytes.h
+    DEPENDS ${CMAKE_SOURCE_DIR}/icons/app.png file_to_c
+)
+target_sources(WCWRecompiled PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/icon_bytes.c)
+if (WIN32)
+    enable_language(RC)
+    target_sources(WCWRecompiled PRIVATE ${CMAKE_SOURCE_DIR}/icons/app.rc)
+endif()
 set(SOURCES
     ${CMAKE_SOURCE_DIR}/src/main/main.cpp
     ${CMAKE_SOURCE_DIR}/src/main/register_overlays.cpp
@@ -178,9 +190,12 @@ if (WIN32)
     target_include_directories(WCWRecompiled PRIVATE ${sdl2_SOURCE_DIR}/include)
     target_link_directories(WCWRecompiled PRIVATE ${sdl2_SOURCE_DIR}/lib/x64)
     target_link_libraries(WCWRecompiled PRIVATE SDL2 Winmm.lib)
+    # Release is a windowed app (no console flash on double-click); stdio goes to a log
+    # file in the app folder unless launched with --show-console or redirected handles
+    # (see wcw_setup_logging in src/main/main.cpp). Debug keeps the console.
     set_target_properties(WCWRecompiled PROPERTIES
         LINK_FLAGS_DEBUG "/SUBSYSTEM:CONSOLE"
-        LINK_FLAGS_RELEASE "/SUBSYSTEM:CONSOLE")
+        LINK_FLAGS_RELEASE "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup")
     if (MSVC)
         target_link_options(WCWRecompiled PRIVATE /OPT:NOICF)
     endif()

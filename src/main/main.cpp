@@ -3,6 +3,7 @@
 // the game, auto-loads the ROM (no UI launcher yet), and calls recomp::start.
 // Adapted from Bomberman Hero: Recompiled's src/main/main.cpp.
 #include <cstdio>
+#include <cstring>
 #include <cassert>
 #include <vector>
 #include <array>
@@ -30,6 +31,7 @@
 #include "librecomp/game.hpp"
 #include "librecomp/rsp.hpp"
 #include "ovl_patches.hpp"
+#include "icon_bytes.h"
 #ifdef _WIN32
 #include "renderdoc_app.h" // [wcw] RenderDoc in-app capture API (diagnostic)
 #endif
@@ -38,6 +40,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <timeapi.h>
+#include <io.h>
+#include <fcntl.h>
 #include <dxgi1_4.h>
 #include <d3d12.h>
 #include <dbghelp.h>
@@ -298,9 +302,12 @@ void queue_samples(int16_t* audio_data, size_t sample_count) {
     if (queued_frames_before < min_lvl) min_lvl = queued_frames_before;
     batches++;
     for (size_t i = 0; i < sample_count; i++) { int v = audio_data[i] < 0 ? -audio_data[i] : audio_data[i]; if (v > peak) peak = v; }
+    static const bool audio_log = getenv("WCW_AUDIO_LOG") != nullptr;
     if (now - report_ms >= 1000) {
-        fprintf(stderr, "[audio] t=%llus batches=%u minlvl=%u underruns=%u maxgap=%llums peak=%d rate=%u\n",
-            (unsigned long long)(now / 1000), batches, min_lvl, underruns, (unsigned long long)max_gap, peak, g_sample_rate);
+        if (audio_log) {
+            fprintf(stderr, "[audio] t=%llus batches=%u minlvl=%u underruns=%u maxgap=%llums peak=%d rate=%u\n",
+                (unsigned long long)(now / 1000), batches, min_lvl, underruns, (unsigned long long)max_gap, peak, g_sample_rate);
+        }
         report_ms = now; underruns = 0; min_lvl = UINT32_MAX; max_gap = 0; peak = 0; batches = 0;
     }
 }
@@ -339,8 +346,72 @@ RspUcodeFunc* get_rsp_microcode(const OSTask* task) {
     return &wcw_null_ucode;
 }
 
+#ifdef _WIN32
+// [wcw] C4: release builds link as /SUBSYSTEM:WINDOWS (no console window). When launched
+// without usable stdio (double-click), route stdout+stderr to a log file in the app folder
+// so bug reports have something to attach (the terminate/SEH backtraces land there too).
+// --show-console allocates a console instead. If the parent provided std handles (a dev
+// console, or cycle.ps1's `> bt.txt` redirection), stdio is left untouched.
+static void wcw_setup_logging(bool show_console) {
+    if (show_console) {
+        if (AllocConsole()) {
+            FILE* f = nullptr;
+            freopen_s(&f, "CONOUT$", "w", stdout);
+            freopen_s(&f, "CONOUT$", "w", stderr);
+        }
+        return;
+    }
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+    if ((out != nullptr && out != INVALID_HANDLE_VALUE) || (err != nullptr && err != INVALID_HANDLE_VALUE)) {
+        return;
+    }
+    std::filesystem::path app_folder = recompui::file::get_app_folder_path();
+    std::error_code ec;
+    std::filesystem::create_directories(app_folder, ec);
+    std::filesystem::path log_path = app_folder / "WCWRecompiled.log";
+    // Open with read sharing (freopen would deny it) so the log can be copied/viewed while
+    // the game is running; route both streams through dups of the same fd (shared offset).
+    HANDLE log_handle = CreateFileW(log_path.c_str(), GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (log_handle == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    int log_fd = _open_osfhandle(reinterpret_cast<intptr_t>(log_handle), _O_WRONLY);
+    if (log_fd == -1) {
+        CloseHandle(log_handle);
+        return;
+    }
+    // In a handle-less GUI launch the CRT streams have no fd (-2); freopen to NUL first to
+    // materialize one, then dup the log fd over it.
+    FILE* f = nullptr;
+    freopen_s(&f, "NUL", "w", stderr);
+    _dup2(log_fd, _fileno(stderr));
+    freopen_s(&f, "NUL", "w", stdout);
+    _dup2(log_fd, _fileno(stdout));
+    _close(log_fd);
+}
+#endif
+
 int main(int argc, char** argv) {
-    (void)argc; (void)argv;
+    bool show_console = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--show-console") == 0) {
+            show_console = true;
+        }
+    }
+    (void)show_console;
+
+    // Program identity. The program id names the config/save folder
+    // (%LOCALAPPDATA%\WCWRecompiled on Windows) — keep it matched to the exe name.
+    // Set before anything that resolves the app folder (logging below, config path later).
+    recompui::programconfig::set_program_name("WCW vs. nWo World Tour: Recompiled");
+    recompui::programconfig::set_program_id(u8"WCWRecompiled");
+
+#ifdef _WIN32
+    wcw_setup_logging(show_console);
+#endif
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
     fprintf(stderr, "[wcw] main start\n");
@@ -405,10 +476,6 @@ int main(int argc, char** argv) {
     SDL_SetMainReady();
     NFD_Init();
 
-    // Program identity (used for the config/save folder name and window/app metadata).
-    recompui::programconfig::set_program_name("WCW vs. nWo World Tour: Recompiled");
-    recompui::programconfig::set_program_id(u8"WCWNWOWorldTourRecompiled");
-
     SDL_InitSubSystem(SDL_INIT_AUDIO);
     reset_audio(32000);
 
@@ -428,6 +495,7 @@ int main(int argc, char** argv) {
     game.display_name = "WCW vs. nWo World Tour";
     game.game_id = u8"wcw.nwo.worldtour.us";
     game.mod_game_id = "wcwnwoworldtour";
+    game.thumbnail_bytes = std::span<const char>(icon_bytes);
     // Sram = a 32 KB save buffer — the exact size of a Controller Pak, which is WCW's only
     // save medium (no cart EEPROM/SRAM). The raw-SI PIF emulation (librecomp si.cpp) maps
     // joybus pak reads/writes onto this buffer, so pak contents persist via librecomp's
@@ -443,7 +511,14 @@ int main(int argc, char** argv) {
     supported_games.push_back(game);
     recomp::register_game(supported_games[0]);
 
-    recomp::register_config_path(std::filesystem::current_path());
+    // Config/saves/stored-ROM location: %LOCALAPPDATA%\WCWRecompiled (or next to the exe
+    // if a portable.txt file exists in the working dir — handled by get_app_folder_path).
+    // librecomp doesn't create the folder itself, and select_rom's stored-ROM write plus
+    // the json config writes all assume it exists.
+    std::filesystem::path app_folder = recompui::file::get_app_folder_path();
+    std::error_code app_folder_ec;
+    std::filesystem::create_directories(app_folder, app_folder_ec);
+    recomp::register_config_path(app_folder);
     wcw::register_wcw_overlays();
     wcw::register_wcw_patches();
 
@@ -519,11 +594,37 @@ int main(int argc, char** argv) {
     recompui::config::create_sound_tab();
     recompui::config::finalize();
 
-    // Auto-load the ROM and request a boot (no launcher UI yet).
+    // ROM intake. Default: the recompui launcher menu — first run shows "Load ROM" (nfd
+    // file dialog, validated against the registered hash, then stored/remembered in the
+    // config path); later runs show "Start Game" (librecomp's check_all_stored_roms, run
+    // inside recomp::start, revalidates the stored copy). WCW_AUTOBOOT=<path|1> bypasses
+    // the launcher for dev iteration (tools/cycle.ps1, capture scripts): loads the given
+    // ROM path ("1" = wcw.z64 in the working dir) and boots immediately.
     std::u8string game_id = u8"wcw.nwo.worldtour.us";
-    auto rom_err = recomp::select_rom("wcw.z64", game_id);
-    if (rom_err != recomp::RomValidationError::Good) {
-        exit_error("ROM validation failed (err=%d). Put a valid wcw.z64 in the working dir.\n", (int)rom_err);
+    const char* autoboot = getenv("WCW_AUTOBOOT");
+    if (autoboot != nullptr) {
+        std::filesystem::path autoboot_rom = (autoboot[0] != '\0' && strcmp(autoboot, "1") != 0)
+            ? std::filesystem::path(autoboot) : std::filesystem::path("wcw.z64");
+        auto rom_err = recomp::select_rom(autoboot_rom, game_id);
+        if (rom_err != recomp::RomValidationError::Good) {
+            exit_error("WCW_AUTOBOOT ROM validation failed (err=%d) for %ls.\n", (int)rom_err, autoboot_rom.c_str());
+        }
+    }
+    else {
+        // Launcher menu options: no Mods entry (add_default_options has one) until mod
+        // support is actually wired up.
+        recompui::register_launcher_init_callback([](recompui::LauncherMenu* menu) {
+            auto* game_options_menu = menu->init_game_options_menu(
+                supported_games[0].game_id,
+                supported_games[0].mod_game_id,
+                supported_games[0].display_name,
+                supported_games[0].thumbnail_bytes,
+                recompui::GameOptionsMenuLayout::Center);
+            game_options_menu->add_start_game_or_load_rom_option();
+            game_options_menu->add_setup_controls_option();
+            game_options_menu->add_settings_option();
+            game_options_menu->add_exit_option();
+        });
     }
 
     // Callbacks.
@@ -567,13 +668,16 @@ int main(int argc, char** argv) {
     ultramodern::error_handling::callbacks_t error_callbacks{ .message_box = recompui::message_box };
     ultramodern::threads::callbacks_t threads_callbacks{ .get_game_thread_name = [](const OSThread*) -> std::string { return "game"; } };
 
-    // Kick off the boot once the runtime is up.
-    std::thread starter([game_id]() {
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        std::u8string gid = game_id;
-        recomp::start_game(gid, "");
-    });
-    starter.detach();
+    // Dev auto-boot only: kick off the game once the runtime is up. In the normal flow the
+    // launcher's Start Game option calls recomp::start_game from its click handler.
+    if (autoboot != nullptr) {
+        std::thread starter([game_id]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            std::u8string gid = game_id;
+            recomp::start_game(gid, "");
+        });
+        starter.detach();
+    }
 
 #ifdef _WIN32
     // DIAGNOSTIC watchdog (opt-in): set WCW_SAMPLE=<seconds> to dump all thread stacks that

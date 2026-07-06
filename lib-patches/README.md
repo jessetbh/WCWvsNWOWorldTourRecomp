@@ -1,12 +1,18 @@
-# lib-patches/ — required local fixes for the gitignored `lib/` clones
+# lib-patches/ — diff-vs-upstream record for the `lib/` forks
 
-The runtime libraries in `lib/` (N64ModernRuntime, RecompFrontend, rt64) are **plain
-gitignored clones**, pinned to the same commits BMHero uses, **plus local `[wcw fix]`
-patches the game NEEDS to boot, render, hear, and take input**. This directory checks
-those patches into the repo so a reclone of `lib/` can't silently lose them.
+**Since 2026-07-05 the canonical home of the `[wcw fix]` changes is the fork set**:
+`lib/` contains submodules of the `jessetbh` forks (N64ModernRuntime, RecompFrontend,
+rt64 — plus nested N64Recomp and plume forks), each carrying the fixes as commits on a
+`wcw` branch atop the upstream base commit below. This directory keeps a
+human-reviewable record of exactly what differs from upstream.
 
-Regenerate after changing anything under `lib/`: `.\lib-patches\export.ps1`
-Reapply onto fresh clones: `.\lib-patches\apply.ps1`
+Workflow for changing anything under `lib/` now:
+1. Edit, then commit on that repo's `wcw` branch and `git push origin wcw`.
+2. Commit the submodule pointer bump in the superproject.
+3. Rerun `.\lib-patches\export.ps1` (diffs upstream-base..HEAD) and commit the patches.
+
+`apply.ps1` is legacy — it applied the patches to plain upstream clones and is only
+useful for reconstructing the forks from scratch.
 
 ## Manifest (base commits the patches apply onto)
 
@@ -42,7 +48,8 @@ Clone with `git clone --recursive <url> <dir> && git -C <dir> checkout --recurse
   (upstream bug; crashes any texture→buffer readback).
 
 ## Notes
-- Patches are exact snapshots of the working trees (verified by reverse-apply at export).
-- If a patch no longer applies after moving a lib to a newer commit, resolve manually and
-  re-export. (Upstreaming the general fixes was considered and permanently declined,
-  2026-07-05 — these patches are carried locally for good; `upstream/` documents the bugs.)
+- Patches are `git diff <upstream base>..HEAD` of each fork's `wcw` branch.
+- If the forks are ever rebased onto newer upstream, update the base SHAs in
+  `export.ps1` and this manifest, then re-export. (Upstreaming the general fixes was
+  considered and permanently declined, 2026-07-05 — the forks carry them for good;
+  `docs/upstream/` documents the bugs.)

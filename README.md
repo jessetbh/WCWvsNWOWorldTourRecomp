@@ -113,9 +113,14 @@ disassembly (see `disasm/` and `syms/`).
 
 #### Where is the savefile stored?
 
-<!-- TODO(beta-release-plan C2): update once config/saves move to %LOCALAPPDATA%\WCWRecompiled -->
-Saves and configuration files are currently stored next to the executable (`saves/`,
-`*.json`).
+- Windows: `%LOCALAPPDATA%\WCWRecompiled\saves`
+
+Configuration files live in the same folder. Save data is preserved across updates.
+
+#### Can you run this project as a portable application?
+
+Yes — place a file named `portable.txt` in the same folder as the executable and
+saves, config files, and the stored ROM will be kept next to the executable instead.
 
 #### How do I choose a different ROM?
 

@@ -1,3 +1,14 @@
+diff --git a/.gitmodules b/.gitmodules
+index 21df8c2..5635c09 100644
+--- a/.gitmodules
++++ b/.gitmodules
+@@ -45,4 +45,5 @@
+ 	url = https://github.com/rt64/re-spirv
+ [submodule "src/contrib/plume"]
+ 	path = src/contrib/plume
+-	url = https://github.com/renderbag/plume.git
++	url = https://github.com/jessetbh/plume.git
++	branch = wcw
 diff --git a/src/common/rt64_enhancement_configuration.cpp b/src/common/rt64_enhancement_configuration.cpp
 index 1194a96..432e1ab 100644
 --- a/src/common/rt64_enhancement_configuration.cpp
@@ -93,7 +104,7 @@ index 785de27..cb5f3b9 100644
          state->updateScreen(core.decodeVI(), false);
      }
 diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
-index 3227ab1..2710429 100644
+index 3227ab1..7d6cd99 100644
 --- a/src/hle/rt64_present_queue.cpp
 +++ b/src/hle/rt64_present_queue.cpp
 @@ -116,6 +116,8 @@ namespace RT64 {
@@ -171,18 +182,20 @@ index 3227ab1..2710429 100644
                  // Use a scratch framebuffer to upload the RAM to the render target.
                  hlslpp::uint2 fbSize = present.screenVI.fbSize();
                  scratchFb.addressStart = fbAddress;
-@@ -266,6 +303,10 @@ namespace RT64 {
+@@ -266,6 +303,12 @@ namespace RT64 {
              }
          }
          
-+        // [wcw] DIAGNOSTIC: if framesToPresent is 0, nothing is ever blitted to the swap chain.
-+        { static int fp = 0; if ((fp++ % 60) == 0) fprintf(stderr, "[wcw][present-loop#%d] framesToPresent=%d counters.count=%u avail=%u target=%p swapValid=%d\n",
++        // [wcw] DIAGNOSTIC (env WCW_PRESENT_LOG=1): if framesToPresent is 0, nothing is ever
++        // blitted to the swap chain.
++        { static const bool wcwPlog = getenv("WCW_PRESENT_LOG") != nullptr;
++          static int fp = 0; if (((fp++ % 60) == 0) && wcwPlog) fprintf(stderr, "[wcw][present-loop#%d] framesToPresent=%d counters.count=%u avail=%u target=%p swapValid=%d\n",
 +            fp, framesToPresent, frameCounters.count, frameCounters.available, (void*)colorTarget, (int)swapChainValid); }
 +
          for (int32_t i = 0; i < framesToPresent; i++) {
              uint32_t frameCountersNextPresented = 0;
              if ((framesToPresent > 1) && (usingMSAA || (i > 0))) {
-@@ -299,8 +340,11 @@ namespace RT64 {
+@@ -299,8 +342,11 @@ namespace RT64 {
  
              uint32_t swapChainIndex = 0;
              const bool presentFrame = (i < framesToPresent) && swapChainValid;
@@ -194,20 +207,24 @@ index 3227ab1..2710429 100644
              }
  
              if (presentFrame && swapChainValid) {
-@@ -340,6 +384,20 @@ namespace RT64 {
+@@ -340,6 +386,24 @@ namespace RT64 {
                      }
                  }
                  
-+                { // [wcw] DIAGNOSTIC: per-60-presents outcome accounting. A null source texture
-+                  // means this present draws ONLY the clear -> a pure black frame on screen.
++                { // [wcw] DIAGNOSTIC (env WCW_PRESENT_LOG=1): per-60-presents outcome accounting.
++                  // A null source texture means this present draws ONLY the clear -> a pure black
++                  // frame on screen.
++                    static const bool wcwPresentLog = getenv("WCW_PRESENT_LOG") != nullptr;
 +                    static int prCnt = 0, prBlack = 0, prReason[4] = {};
 +                    static double acqSum = 0.0, acqMax = 0.0;
 +                    if (renderParams.texture == nullptr) prBlack++;
 +                    prReason[wcw_reason]++;
 +                    acqSum += wcwAcqMs; if (wcwAcqMs > acqMax) acqMax = wcwAcqMs;
 +                    if (++prCnt >= 60) {
-+                        fprintf(stderr, "[wcw][present] last %d presents: black=%d | notvis=%d ok=%d empty=%d scratch=%d | acquire avg=%.1fms max=%.1fms\n",
-+                            prCnt, prBlack, prReason[0], prReason[1], prReason[2], prReason[3], acqSum / prCnt, acqMax);
++                        if (wcwPresentLog) {
++                            fprintf(stderr, "[wcw][present] last %d presents: black=%d | notvis=%d ok=%d empty=%d scratch=%d | acquire avg=%.1fms max=%.1fms\n",
++                                prCnt, prBlack, prReason[0], prReason[1], prReason[2], prReason[3], acqSum / prCnt, acqMax);
++                        }
 +                        prCnt = prBlack = 0; prReason[0] = prReason[1] = prReason[2] = prReason[3] = 0;
 +                        acqSum = 0.0; acqMax = 0.0;
 +                    }
@@ -215,7 +232,7 @@ index 3227ab1..2710429 100644
                  commandList->setFramebuffer(swapChainFramebuffer);
                  commandList->clearColor();
  
-@@ -358,7 +416,38 @@ namespace RT64 {
+@@ -358,7 +422,38 @@ namespace RT64 {
                      if (inspector != nullptr) {
                          inspector->draw(commandList);
                      }
@@ -255,7 +272,7 @@ index 3227ab1..2710429 100644
                      commandList->barriers(RenderBarrierStage::NONE, RenderTextureBarrier(swapChainTexture, RenderTextureLayout::PRESENT));
                      commandList->end();
                      const RenderCommandList *commandList = ext.presentGraphicsWorker->commandList.get();
-@@ -366,6 +455,44 @@ namespace RT64 {
+@@ -366,6 +461,44 @@ namespace RT64 {
                      RenderCommandSemaphore *signalSemaphore = drawSemaphores[swapChainIndex].get();
                      ext.presentGraphicsWorker->commandQueue->executeCommandLists(&commandList, 1, &waitSemaphore, 1, &signalSemaphore, 1, ext.presentGraphicsWorker->commandFence.get());
                      ext.presentGraphicsWorker->wait();
@@ -300,7 +317,7 @@ index 3227ab1..2710429 100644
                  }
              }
  
-@@ -460,6 +587,18 @@ namespace RT64 {
+@@ -460,6 +593,18 @@ namespace RT64 {
                      processCursor = threadCursor;
                      threadCursor = (threadCursor + 1) % presents.size();
                      skipPresent = (writeCursor != threadCursor);
@@ -455,7 +472,7 @@ index ee2030b..cdba99d 100644
          const uint32_t cycleType = state->rdp->otherMode.cycleType();
          assert(cycleType != G_CYC_COPY);
 diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
-index d249a97..24a228b 100644
+index d249a97..9bfeec9 100644
 --- a/src/hle/rt64_state.cpp
 +++ b/src/hle/rt64_state.cpp
 @@ -1747,6 +1747,21 @@ namespace RT64 {
@@ -480,13 +497,14 @@ index d249a97..24a228b 100644
          // Advance the workload queue at the end of a full synchronization.
          advanceWorkload(workload, false);
          ext.workloadQueue->advanceToNextWorkload();
-@@ -1870,6 +1885,20 @@ namespace RT64 {
+@@ -1870,6 +1885,21 @@ namespace RT64 {
          screenCpuProfiler.start();
          bool fbChangesMade = false;
          bool screenChangesMade = false;
-+        // [wcw] DIAGNOSTIC: once a second, report what the present path sees.
-+        { static int n = 0;
-+          if ((n++ % 60) == 0) {
++        // [wcw] DIAGNOSTIC (env WCW_PRESENT_LOG=1): once a second, report what the present path sees.
++        { static const bool wcwPlog = getenv("WCW_PRESENT_LOG") != nullptr;
++          static int n = 0;
++          if (((n++ % 60) == 0) && wcwPlog) {
 +            Framebuffer* dbgFb = framebufferManager.find(screenFbAddress);
 +            fprintf(stderr, "[wcw][present] visible=%d fbAddr=0x%X fbFound=%d fbW=%d viW=%d siz=%d/%d serrate=%d origin=0x%X h=%u..%u v=%u..%u xs=0x%X/0x%X ys=0x%X/0x%X\n",
 +                (int)newVI.visible(), screenFbAddress, dbgFb ? 1 : 0,
@@ -548,15 +566,17 @@ index a870166..bc0aec8 100644
              const bool interlacedStep = status.serrate && (vCurrentLine & 0x1);
              const uint32_t rowBytes = width * (1U << (siz - 1));
 diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
-index 5a331aa..ea37684 100644
+index 5a331aa..752bba6 100644
 --- a/src/hle/rt64_workload_queue.cpp
 +++ b/src/hle/rt64_workload_queue.cpp
-@@ -452,6 +452,22 @@ namespace RT64 {
+@@ -452,6 +452,24 @@ namespace RT64 {
                      if (colorFb != nullptr) {
                          fbKey.colorTargetKey = RenderTargetKey(colorFb->addressStart, colorFb->width, colorFb->siz, Framebuffer::Type::Color);
                          colorTarget = &targetManager.get(fbKey.colorTargetKey);
-+                        // [wcw] DIAGNOSTIC: which color targets does the workload render into?
-+                        { static int rt = 0; if ((rt++ % 60) == 0) fprintf(stderr, "[wcw][render-target#%d] addr=0x%X w=%d siz=%d ptr=%p\n",
++                        // [wcw] DIAGNOSTIC (env WCW_PRESENT_LOG=1): which color targets does the
++                        // workload render into?
++                        { static const bool wcwPlog = getenv("WCW_PRESENT_LOG") != nullptr;
++                          static int rt = 0; if (((rt++ % 60) == 0) && wcwPlog) fprintf(stderr, "[wcw][render-target#%d] addr=0x%X w=%d siz=%d ptr=%p\n",
 +                            rt, colorFb->addressStart, (int)colorFb->width, (int)colorFb->siz, (void*)colorTarget); }
 +                        { // [wcw] DIAGNOSTIC (WCW_PRESENT_LUM=1): timestamped per-fbPair render log,
 +                          // correlated offline with the present readback CSV (same steady clock).
@@ -574,7 +594,7 @@ index 5a331aa..ea37684 100644
                      }
                      else {
                          colorTarget = nullptr;
-@@ -842,6 +858,32 @@ namespace RT64 {
+@@ -842,6 +860,32 @@ namespace RT64 {
              framebufferRenderer->waitForUploaders();
              ext.workloadGraphicsWorker->execute();
              ext.workloadGraphicsWorker->wait();
@@ -607,7 +627,7 @@ index 5a331aa..ea37684 100644
              workerMutex.unlock();
  
              // Update the GPU profiler with the results from the timestamps of the frame.
-@@ -904,6 +946,32 @@ namespace RT64 {
+@@ -904,6 +948,32 @@ namespace RT64 {
              if (processCursor >= 0) {
                  std::unique_lock<std::mutex> threadLock(threadMutex);
                  Workload &workload = workloads[processCursor];
@@ -640,7 +660,7 @@ index 5a331aa..ea37684 100644
                  ext.presentQueue->waitForPresentId(workload.presentId);
  
                  if (!threadsRunning) {
-@@ -986,7 +1054,10 @@ namespace RT64 {
+@@ -986,7 +1056,10 @@ namespace RT64 {
                      matchingProfiler.log();
  
                      const bool displayRateAboveOriginal = (workload.viOriginalRate > 0) && (workloadConfig.targetRate > workload.viOriginalRate);

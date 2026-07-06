@@ -129,28 +129,43 @@ wcw.toml patches.toml recompcontrollerdb.txt .gitmodules .gitignore
 
 ## Phase C — Runtime polish (match "Plug and Play")
 
-- [ ] **C1: launcher ROM intake.** Enable the recompui launcher flow we currently
-      bypass (supported_games is populated; nfd file dialog already links): first run
-      shows the menu → user supplies ROM → validated (SHA1
-      `5AD2D8359058C8BB71F08E3D3433B7A50D3BB645`) → remembered. This is the single
-      biggest structural gap vs. the ecosystem ports. Includes the "different ROM
-      path?" FAQ behavior.
-- [ ] **C2: config/save location** → `%LOCALAPPDATA%\WCWRecompiled\` (Zelda FAQ
-      documents theirs the same way) + portable-mode note in FAQ. Saves survive
-      updates by construction; say so in release notes like Zelda does.
-- [ ] **C3: app identity.** Original-art app icon in `icons/` (no game/WWE assets),
-      window title + version, exe version resource.
-- [ ] **C4: subsystem + logging.** Release `/SUBSYSTEM:WINDOWS`; stderr/stdout → log
-      file for bug reports; add `--show-console` flag (Zelda64Recomp added exactly
-      this). KEEP the set_terminate/SEH symbolized-backtrace handlers; archive the
-      .map/PDB per release as CI artifacts (BMHero uploads PDBs separately).
-      Demote always-on `[audio]`/`[present]` 1/s lines to env-gated; keep bounded
-      one-shot markers.
+- [x] **C1: launcher ROM intake.** DONE 2026-07-05, verified end to end: main.cpp no
+      longer auto-loads wcw.z64 — the recompui launcher shows (custom init callback:
+      Start Game/Load ROM + Controls + Settings + Exit; NO Mods option until mod
+      support exists). First run: Load ROM → nfd dialog → validated → stored copy in
+      the config path; librecomp's check_all_stored_roms (inside recomp::start)
+      revalidates on later runs → "Start Game". Verified headlessly: no-autoboot run
+      showed no game markers; injected Enter on the autofocused option booted from the
+      stored ROM. Dev iteration keeps auto-boot via `WCW_AUTOBOOT=<path|1>` env
+      (cycle.ps1 sets it).
+- [x] **C2: config/save location** → `%LOCALAPPDATA%\WCWRecompiled\`. DONE 2026-07-05:
+      program_id changed to `WCWRecompiled`, register_config_path →
+      recompui::file::get_app_folder_path() (+create_directories — librecomp doesn't).
+      portable.txt support comes free from get_app_folder_path (README FAQ updated).
+      All json configs route through recomp::get_config_path (verified: mods.json
+      rewritten in the new folder during the test run). Local dev data migrated
+      (configs + saves + stored ROM copied from build-msvc).
+- [x] **C3: app identity.** DONE 2026-07-05: original-art flat top-down ring icon
+      (PIL-generated, no game/WWE assets) → icons/app.png + multi-size app.ico;
+      icons/app.rc = exe icon + VERSIONINFO 0.1.0 (verified via FileVersionInfo);
+      PNG embedded via file_to_c as GameEntry.thumbnail_bytes (launcher thumbnail).
+      Window title was already set; launcher shows v0.1.0 from recomp::Version.
+- [x] **C4: subsystem + logging.** DONE 2026-07-05: Release links /SUBSYSTEM:WINDOWS
+      /ENTRY:mainCRTStartup (verified PE subsystem=2; Debug keeps console);
+      wcw_setup_logging routes stdio → %LOCALAPPDATA%\WCWRecompiled\WCWRecompiled.log
+      when no std handles (CreateFileW with FILE_SHARE_READ so the log is readable
+      while running — freopen denies sharing; verified), `--show-console` AllocConsole
+      flag, parent-provided/redirected handles left untouched (cycle.ps1 still works).
+      set_terminate/SEH handlers KEPT (backtraces land in the log). All 1/s health
+      lines demoted to env-gated: WCW_AUDIO_LOG (main.cpp), WCW_PRESENT_LOG (rt64 ×3),
+      WCW_VI_LOG (ultramodern ×2) — verified zero periodic chatter in a 10 s log.
+      Still pending: archive .map/PDB per release (CI packaging, D3).
 - [ ] **C5: CRT/redist check** on a clean machine (static CRT or document the VC++
-      redist requirement).
-- [ ] **C6: first-run defaults**: aspect ratio Expand, Framerate locked Original (done),
-      audio buffering, fullscreen behavior.
-- [ ] **C7: known-limitation list for the beta** (documented, not fixed): no frame
+      redist requirement). → fold into Phase F fresh-machine QA.
+- [x] **C6: first-run defaults**: DONE — aspect ratio Expand is the code default
+      (ui_config_tab_graphics), Framerate locked Original, audio buffering fixed
+      (buffer_offset_frames), windowed default with F11/Alt+Enter fullscreen.
+- [x] **C7: known-limitation list for the beta** — in README Known Issues (frame
       interpolation (locked Original; geometry warps — devlog has the full analysis);
       rumble requires answering the in-game prompt and is P1-only (the emulated pak
       lives in port 1). Multiplayer is DONE (2026-07-05: plug-and-play pad→player
