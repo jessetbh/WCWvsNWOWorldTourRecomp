@@ -1,3 +1,165 @@
+diff --git a/recompinput/include/recompinput/players.h b/recompinput/include/recompinput/players.h
+index 6c59b61..cad2b5e 100644
+--- a/recompinput/include/recompinput/players.h
++++ b/recompinput/include/recompinput/players.h
+@@ -26,6 +26,16 @@ namespace recompinput {
+         bool get_player_is_assigned(int player_index, bool temp_player = false);
+         bool has_enough_players_assigned();
+         InputDevice get_player_input_device(int player_index, bool temp_player = false);
++
++        // [wcw fix] Plug-and-play multiplayer: assign a newly detected controller to the first
++        // free player slot (a vacated slot first, else the next unassigned player) without
++        // requiring the assignment modal. No-op in single-player mode, while manual assignment
++        // is active, or if the controller is already assigned.
++        void auto_assign_controller(SDL_GameController* controller);
++        // [wcw fix] Clear a removed controller from any player slot holding it (the slot stays
++        // assigned and reads neutral; replugging auto-assigns back into the vacated slot).
++        // Without this the slot keeps a dangling SDL_GameController pointer.
++        void handle_controller_removed(SDL_GameController* controller);
+     }
+ 
+     namespace playerassignment {
+diff --git a/recompinput/src/input_events.cpp b/recompinput/src/input_events.cpp
+index c76a1dc..39febba 100644
+--- a/recompinput/src/input_events.cpp
++++ b/recompinput/src/input_events.cpp
+@@ -2,6 +2,7 @@
+ #include "recompinput/input_binding.h"
+ #include "recompinput/input_events.h"
+ #include "recompinput/profiles.h"
++#include "recompinput/players.h"
+ #include "recompui/config.h"
+ #include "ultramodern/ultramodern.hpp"
+ 
+@@ -95,12 +96,20 @@ bool sdl_event_filter(void* userdata, SDL_Event* event) {
+                 profiles::add_controller(guid, profile_index);
+             }
+         }
++
++        // [wcw fix] Plug-and-play multiplayer: claim a player slot for the new pad (no-op in
++        // single-player mode or during manual assignment). Runs after the profile registration
++        // above so the pad's per-GUID profile resolves.
++        players::auto_assign_controller(controller);
+     }
+     break;
+     case SDL_EventType::SDL_CONTROLLERDEVICEREMOVED:
+     {
+         SDL_ControllerDeviceEvent* controller_event = &event->cdevice;
+         printf("Controller removed: %d\n", controller_event->which);
++        // [wcw fix] Clear the pad from any player slot before its state (and the underlying
++        // SDL_GameController) is destroyed, so the slot doesn't keep a dangling pointer.
++        players::handle_controller_removed(recompinput::get_controller_from_joystick_id(controller_event->which));
+         recompinput::remove_controller_state(controller_event->which);
+     }
+     break;
+diff --git a/recompinput/src/players.cpp b/recompinput/src/players.cpp
+index 08cb3f3..45cfcf0 100644
+--- a/recompinput/src/players.cpp
++++ b/recompinput/src/players.cpp
+@@ -129,6 +129,59 @@ InputDevice players::get_player_input_device(int player_index, bool temp_player)
+     }
+ }
+ 
++// [wcw fix] Plug-and-play multiplayer assignment (see players.h).
++void players::auto_assign_controller(SDL_GameController* controller) {
++    if (controller == nullptr || PlayerState.single_player_mode || PlayerState.is_assigning) {
++        return;
++    }
++
++    int free_slot = -1;
++    for (size_t i = 0; i < PlayerState.players.get_count(); i++) {
++        Player& player = PlayerState.players[i];
++        if (player.controller == controller) {
++            return; // already assigned
++        }
++        if (free_slot < 0 && player.controller == nullptr && !player.keyboard_enabled) {
++            free_slot = (int)i; // vacated slot (controller was unplugged)
++        }
++    }
++
++    if (free_slot >= 0) {
++        PlayerState.players[free_slot].controller = controller;
++        PlayerState.players[free_slot].button_pressed();
++    }
++    else if (PlayerState.players.get_count() < players::get_max_number_of_players()) {
++        PlayerState.players.add_controller_player(controller);
++        free_slot = (int)PlayerState.players.get_count() - 1;
++    }
++    else {
++        return; // all player slots taken
++    }
++
++    int cont_profile_index = profiles::get_controller_profile_index_from_sdl_controller(controller);
++    if (cont_profile_index >= 0) {
++        profiles::set_input_profile_for_player(free_slot, cont_profile_index, InputDevice::Controller);
++    }
++    printf("Auto-assigned controller to player %d\n", free_slot + 1);
++}
++
++// [wcw fix] See players.h.
++void players::handle_controller_removed(SDL_GameController* controller) {
++    if (controller == nullptr) {
++        return;
++    }
++    for (size_t i = 0; i < PlayerState.players.get_count(); i++) {
++        if (PlayerState.players[i].controller == controller) {
++            PlayerState.players[i].controller = nullptr;
++        }
++    }
++    for (size_t i = 0; i < PlayerState.temp_players.get_count(); i++) {
++        if (PlayerState.temp_players[i].controller == controller) {
++            PlayerState.temp_players[i].controller = nullptr;
++        }
++    }
++}
++
+ // playerassignment start
+ 
+ bool playerassignment::is_active() {
+diff --git a/recompinput/src/profiles.cpp b/recompinput/src/profiles.cpp
+index c89956e..73c8376 100644
+--- a/recompinput/src/profiles.cpp
++++ b/recompinput/src/profiles.cpp
+@@ -343,6 +343,15 @@ namespace recompinput {
+         // Set Player 1 to the SP profiles by default.
+         profiles::set_input_profile_for_player(0, keyboard_sp_profile_index, recompinput::InputDevice::Keyboard);
+         profiles::set_input_profile_for_player(0, controller_sp_profile_index, recompinput::InputDevice::Controller);
++
++        // [wcw fix] Unassigned players must have NO input profiles. players_input_profile_indices
++        // zero-initializes, and profile index 0 is the single-player KEYBOARD profile created
++        // above — so in multiplayer mode every unassigned player (2..4) would read the keyboard
++        // profile and mirror player 1's keyboard input. get_n64_input skips negative indices.
++        for (int i = 1; i < (int)recompinput::max_num_players_supported; i++) {
++            profiles::set_input_profile_for_player(i, -1, recompinput::InputDevice::Keyboard);
++            profiles::set_input_profile_for_player(i, -1, recompinput::InputDevice::Controller);
++        }
+     }
+ 
+     int profiles::get_sp_controller_profile_index() {
+@@ -362,7 +371,22 @@ namespace recompinput {
+                 InputDevice::Keyboard,
+                 false
+             );
+-            clear_all_mappings(profile_index);
++            if (player_index == 0) {
++                // [wcw fix] Player 1's multiplayer keyboard profile starts as a copy of the
++                // single-player keyboard defaults instead of empty — otherwise assigning the
++                // keyboard to player 1 in the assignment modal silently kills all keyboard
++                // input until every key is manually rebound. Later players still start empty
++                // (two players sharing one physical keyboard can't share the same bindings).
++                for (GameInput input = GameInput::A; input < GameInput::COUNT; input = static_cast<GameInput>(static_cast<int>(input) + 1)) {
++                    for (size_t binding_index = 0; binding_index < recompinput::num_bindings_per_input; binding_index++) {
++                        profiles::set_input_binding(profile_index, input, binding_index,
++                            profiles::get_input_binding(keyboard_sp_profile_index, input, binding_index));
++                    }
++                }
++            }
++            else {
++                clear_all_mappings(profile_index);
++            }
+         }
+         return profile_index;
+     }
 diff --git a/recompui/src/base/ui_state.cpp b/recompui/src/base/ui_state.cpp
 index 277a421..f5d6ad6 100644
 --- a/recompui/src/base/ui_state.cpp

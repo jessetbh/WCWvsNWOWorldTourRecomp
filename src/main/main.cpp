@@ -209,17 +209,45 @@ ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callbacks_t::
 #endif
 }
 
+// Test aid: WCW_VPADS=<n> attaches n SDL virtual gamepads that each pulse one distinct
+// button (pad 1: A/South, pad 2: B/East, pad 3: X/West, pad 4: Y/North) every 2 seconds.
+// Combined with WCW_INPUT_LOG=1 (librecomp si.cpp) this verifies per-player input
+// separation end to end without physical controllers.
+static void update_virtual_pads() {
+    static int vpad_count = -1;
+    static SDL_Joystick* vpads[4] = {};
+    if (vpad_count < 0) {
+        const char* env = getenv("WCW_VPADS");
+        vpad_count = env ? std::clamp(atoi(env), 0, 4) : 0;
+        for (int i = 0; i < vpad_count; i++) {
+            int dev = SDL_JoystickAttachVirtual(SDL_JOYSTICK_TYPE_GAMECONTROLLER,
+                                                SDL_CONTROLLER_AXIS_MAX, SDL_CONTROLLER_BUTTON_MAX, 0);
+            if (dev >= 0) vpads[i] = SDL_JoystickOpen(dev);
+            fprintf(stderr, "[wcw] virtual pad %d attached (dev=%d joy=%p)\n", i + 1, dev, (void*)vpads[i]);
+        }
+    }
+    if (vpad_count == 0) return;
+    uint32_t t = SDL_GetTicks();
+    for (int i = 0; i < vpad_count; i++) {
+        if (vpads[i] == nullptr) continue;
+        // 2 s period, 500 ms press, staggered 250 ms per pad.
+        bool pressed = ((t + i * 250) % 2000) < 500;
+        SDL_JoystickSetVirtualButton(vpads[i], SDL_CONTROLLER_BUTTON_A + i, pressed ? SDL_PRESSED : SDL_RELEASED);
+    }
+}
+
 void update_gfx(void*) {
+    update_virtual_pads();
     recompinput::handle_events();
 }
 
 ultramodern::input::connected_device_info_t get_connected_device_info(int controller_num) {
-    if (controller_num == 0) {
-        return { .connected_device = ultramodern::input::Device::Controller,
-                 .connected_pak = ultramodern::input::Pak::RumblePak };
-    }
-    return { .connected_device = ultramodern::input::Device::None,
-             .connected_pak = ultramodern::input::Pak::None };
+    // All four ports report a controller so the game considers every player slot joinable
+    // (unassigned players read as neutral input, like an idle plugged-in pad). Only port 1
+    // has a pak: the emulated hybrid Controller/Rumble Pak in librecomp si.cpp.
+    return { .connected_device = ultramodern::input::Device::Controller,
+             .connected_pak = (controller_num == 0) ? ultramodern::input::Pak::RumblePak
+                                                    : ultramodern::input::Pak::None };
 }
 
 // ---------------- audio (minimal: queue as-is, 16-bit stereo) ----------------
@@ -416,11 +444,15 @@ int main(int argc, char** argv) {
     recompui::register_primary_font("InterVariable.ttf", "Inter Variable");
     recompui::register_extra_font("NimbusSansNarrow-Bold.ttf");
 
-    // Single-player input mode (matches BMHero): all connected controllers drive player 1.
-    // Without this, recompinput defaults to multiplayer mode, where controller reads require
-    // a pad explicitly assigned to the player via the player-assignment UI (which we never
-    // run) — so gamepads are silently ignored while keyboard still works.
-    recompinput::players::set_single_player_mode(true);
+    // Local multiplayer (WCW is a 4-player game). recompinput's multiplayer mode normally
+    // requires every pad to be claimed through the player-assignment modal before it produces
+    // any input; our recompinput fork adds auto-assignment ([wcw fix]) so pads claim player
+    // slots in plug-in order (pad 1 -> P1, pad 2 -> P2, ...). The keyboard always drives P1
+    // via the default player-0 profiles, so solo keyboard/pad play needs no ceremony. The
+    // "Assign players" flow in the Controls tab remains for custom arrangements (e.g. making
+    // the keyboard P2). Must run before create_controls_tab (the tab snapshots the mode).
+    recompinput::players::set_single_player_mode(false);
+    recompinput::players::set_player_count_range(1, 4);
 
     // WCW-specific default bindings (must run before the config tabs load / any profile is
     // created — recompinput forbids changing defaults after first use). WCW's in-ring scheme

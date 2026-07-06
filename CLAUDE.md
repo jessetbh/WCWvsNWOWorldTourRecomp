@@ -57,7 +57,10 @@ DONE (2026-07-05, verified in-game)** — see the ✅ "INPUT OPTIONS" bullet: th
 config menu (General/Graphics/Controls/Sound) opens in-game via Esc / gamepad Back and
 the full rebinding flow works and persists. **RUMBLE WORKS (2026-07-05, user-verified)** —
 see the ✅ "RUMBLE" bullet: hybrid Controller/Rumble Pak identity in si.cpp, motor
-commands → SDL rumble, slider restored. Next up: more Phase-4 enhancements (real
+commands → SDL rumble, slider restored. **MULTIPLAYER WORKS (2026-07-05, user-verified)**
+— see the ✅ "MULTIPLAYER" bullet: plug-and-play pad→player auto-assignment (recompinput
+fork), 4 ports live, per-channel separation verified. Next up: public beta prep
+(`docs/beta-release-plan.md`) and more Phase-4 enhancements (real
 high-FPS interpolation needs RT64 multi-workload frame detection + matrix-group patches).
 Dropped permanently
 (decision 2026-07-05): upstreaming the general runtime bugs — the drafts in `upstream/`
@@ -302,7 +305,33 @@ Still NOT done (later phases):
   ignored while keyboard (which skips assignment) worked. Verified: user's XInput pad
   produces A/D-pad N64 bits end to end. **User confirmed full matches playable end to end
   with menus navigable (2026-07-05).** The temporary `[inpoll]`/`[input]` diagnostics were
-  removed after verification (si.cpp / input_state.cpp).
+  removed after verification (si.cpp / input_state.cpp). NOTE: set_single_player_mode(true)
+  was SUPERSEDED same day by full multiplayer — see the ✅ "MULTIPLAYER" bullet.
+- ✅ **MULTIPLAYER WORKS (2026-07-05, user-verified): plug-and-play 4-player.** main.cpp now
+  boots recompinput in multiplayer mode (`set_single_player_mode(false)` +
+  `set_player_count_range(1, 4)`, BEFORE create_controls_tab — the tab snapshots the mode)
+  with a recompinput fork addition (`[wcw fix]`, in lib-patches/RecompFrontend.patch):
+  **auto-assignment** — `players::auto_assign_controller()` claims the first free player
+  slot for each detected/hotplugged pad (pad 1→P1, pad 2→P2, ...; a vacated slot is refilled
+  first, so replug returns a pad to its old player), called from the CONTROLLERDEVICEADDED
+  handler; keyboard always drives P1 via the default player-0 profiles, so solo play needs
+  no ceremony and the Controls-tab "Assign players" modal remains for custom setups (e.g.
+  keyboard as P2). Three upstream latent bugs fixed along the way (single-player-only games
+  never hit them): (1) `players_input_profile_indices` zero-initializes and profile 0 is the
+  SP KEYBOARD profile → unassigned players 2-4 mirrored the keyboard in MP mode (fixed:
+  init to -1; get_n64_input skips negatives); (2) CONTROLLERDEVICEREMOVED left a dangling
+  SDL_GameController* in the player slot (fixed: `players::handle_controller_removed()`
+  nulls it; slot stays assigned/neutral); (3) assigning the keyboard to P1 via the modal
+  created an EMPTY mp keyboard profile → all keys dead until manually rebound (fixed: P1's
+  mp keyboard profile seeds from the SP defaults; P2+ still start empty on purpose).
+  `get_connected_device_info` now reports all 4 ports as Controller (pak still port 1 only)
+  so every slot is joinable. Verified headlessly with `WCW_VPADS=<n>` (main.cpp attaches n
+  SDL virtual gamepads pulsing distinct buttons) + `WCW_INPUT_LOG=1` (throttled per-channel
+  log in si.cpp, both kept env-gated): vpad1→ch0 A-bit, vpad2→ch1 C-Down-bit, no
+  cross-mirroring, keyboard-only run drives ONLY ch0; Controls tab renders the MP player
+  cards + Assign players button. **User verified real multiplayer matches work great.**
+  Rumble in MP: motor commands are port-1-only (the emulated pak lives there), so only P1's
+  pad rumbles — P2-4 pads report no pak (accurate to whatever's plugged in those ports).
 - ✅ **SAVES WORK (2026-07-05, user-verified): Controller Pak emulation.** WCW saves ONLY
   to the Controller Pak (no cart EEPROM/SRAM — unusual; most ported games have batteries),
   and the recomp stack has no pak support (`Pak` enum only has RumblePak; osPfs* is
