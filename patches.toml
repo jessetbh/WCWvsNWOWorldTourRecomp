@@ -13,8 +13,8 @@ single_file_output = true
 use_absolute_symbols = true
 # Reference syms so the recompiler can resolve relocations against the base game.
 # These are produced alongside the recompile in Phase 2 (ELF/dump pass).
-func_reference_syms_file = "syms/dump.toml"
-data_reference_syms_files = [ "syms/data_dump.toml" ]
+func_reference_syms_file = "WCWSyms/dump.toml"
+data_reference_syms_files = [ "WCWSyms/data_dump.toml" ]
 # Write the output binary directly (lets the recompiler patch MIPS32 relocs).
 output_binary_path = "patches/patches.bin"
 # clang emits many unpaired LO16s; silence those warnings.

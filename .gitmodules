@@ -1,16 +1,20 @@
-# Submodules for the runtime stack. These are NOT yet added to the working tree —
-# this file documents the intended layout (mirrors BMHero). To actually add them:
-#   git submodule add <url> <path>
-# and then `git submodule update --init --recursive`.
-#
-# Note: unlike BMHero (which adds lib/bmhero, a decomp), WCW has no decomp library to add.
+# Runtime stack submodules. These are jessetbh forks of the upstream projects,
+# each carrying the project-local [wcw fix] set on a `wcw` branch (upstream declined
+# the general fixes — see docs/upstream/). lib-patches/ remains the diff-vs-upstream
+# record. Clone with: git submodule update --init --recursive
 
 [submodule "lib/N64ModernRuntime"]
 	path = lib/N64ModernRuntime
-	url = https://github.com/N64Recomp/N64ModernRuntime.git
+	url = https://github.com/jessetbh/N64ModernRuntime.git
+	branch = wcw
 [submodule "lib/RecompFrontend"]
 	path = lib/RecompFrontend
-	url = https://github.com/N64Recomp/RecompFrontend.git
+	url = https://github.com/jessetbh/RecompFrontend.git
+	branch = wcw
 [submodule "lib/rt64"]
 	path = lib/rt64
-	url = https://github.com/rt64/rt64.git
+	url = https://github.com/jessetbh/rt64.git
+	branch = wcw
+[submodule "WCWSyms"]
+	path = WCWSyms
+	url = https://github.com/jessetbh/WCWSyms.git

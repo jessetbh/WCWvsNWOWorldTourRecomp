@@ -77,15 +77,19 @@ BUILDING.md CMakeLists.txt CONTRIBUTING.md COPYING README.md
 wcw.toml patches.toml recompcontrollerdb.txt .gitmodules .gitignore
 ```
 
-- [ ] **B1: lib/ submodules.** Fork `N64ModernRuntime`, `RecompFrontend`, `rt64` to the
-      owner's GitHub; commit the `[wcw fix]` sets on a `wcw` branch of each (source:
-      `lib-patches/*.patch` + local trees); pin as submodules. Keep `lib-patches/` as
-      the diff-vs-upstream record or retire it. (Upstream-pointing submodules à la
-      BMHero are not an option for us — our fixes were declined upstream.)
-- [ ] **B2: WCWSyms repo.** Move `syms/dump.toml` + `syms/data_dump.toml` (+ README) to
-      a new `WCWSyms` repo, submodule at root (matches BMHeroSyms/Zelda64RecompSyms).
-      The checked-in TOMLs make builds independent of splat/gen_symbols.py;
-      `disasm/` + `tools/gen_symbols.py` remain as the regeneration tooling.
+- [x] **B1: lib/ submodules.** DONE 2026-07-05. FIVE forks (not three — the nested
+      submodules carry fixes too): jessetbh/{N64ModernRuntime, N64Recomp (recomp.h,
+      pinned inside NMR), RecompFrontend, rt64, plume (copyTextureRegion guard,
+      pinned inside rt64)}, each with the `[wcw fix]` set as one commit on a `wcw`
+      branch atop the previously pinned upstream commit. Parent forks' .gitmodules
+      point at the child forks. lib/ un-gitignored, submodules registered at the
+      same paths (local clones absorbed in place; origin=fork, upstream=original).
+      lib-patches/ KEPT as the diff-vs-upstream record.
+- [x] **B2: WCWSyms repo.** DONE 2026-07-05: jessetbh/WCWSyms (private until publish),
+      submodule at root `WCWSyms/` (ecosystem convention). Paths updated in wcw.toml,
+      patches.toml, gen_symbols.py, CLAUDE.md. Verified end to end: gen_symbols
+      regenerates byte-identical into the submodule, N64Recomp (both configs) exit 0,
+      port relinks. `disasm/` + `tools/gen_symbols.py` remain the regeneration tooling.
 - [x] **B3: assets/.** DONE 2026-07-05: tracked `assets/` created (28 files, 1.4 MB) —
       recomp.rcss, InterVariable, NotoEmoji, promptfont/, icons/ only. All Banjo-era
       art dropped; verified unreferenced by the frontend source (only BMHero's own
@@ -154,9 +158,9 @@ wcw.toml patches.toml recompcontrollerdb.txt .gitmodules .gitignore
 
 ## Phase D — CI + packaging (mirror BMHero's workflows)
 
-- [ ] **D1: private ROM repo.** New PRIVATE repo (e.g. `wcw-rom-secret`) containing
-      `wcw.z64`; fine-grained PAT with read access; Actions secrets like BMHero's
-      (`*_REPO_WITH_PAT` + token). NEVER referenced outside workflow secrets.
+- [x] **D1: private ROM repo.** DONE 2026-07-05 (repo part): jessetbh/wcw-rom-secret
+      (verified PRIVATE) with wcw.z64 on main. Still pending: fine-grained read PAT +
+      Actions secrets on the main repo (do together with D2's workflow).
 - [ ] **D2: adapt `validate.yml`** (BMHero's is the template, workflow_call + inputs
       for SDL2_VERSION / pinned N64RECOMP_COMMIT): checkout w/ submodules → fetch ROM
       from secret repo → build N64Recomp/RSPRecomp at pinned commit → `N64Recomp

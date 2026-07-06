@@ -89,7 +89,7 @@ Crashes print symbolized backtraces (dbghelp + `/MAP`); resolve Release RVAs aga
 
 ```
 wcw.toml / patches.toml   recompiler configs (game / patches)
-syms/                     generated symbol TOMLs (dump.toml, data_dump.toml)
+WCWSyms/                  submodule: generated symbol TOMLs (dump.toml, data_dump.toml)
 tools/gen_symbols.py      splat output -> symbol TOMLs; the RENAME map lives here
 disasm/                   splat project + libultra.md (function-ID evidence log)
 patches/                  C patches cross-compiled to MIPS (widescreen.c, ...)
@@ -108,4 +108,4 @@ run/, cmake/coretest/     standalone execution harness + Stage-A link test (kept
 - **Never commit ROM data or extracted assets.**
 - PowerShell syntax for shell commands on Windows.
 - When adapting from BMHero: `BMHeroRecompiled`→`WCWRecompiled`, `banjo`/`bk`→`wcw`,
-  `BMHeroSyms`→`syms`.
+  `BMHeroSyms`→`WCWSyms`.

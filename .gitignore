@@ -47,11 +47,7 @@ wcw.z64
 # Generated symbol dumps live under syms/ but are produced by tooling; keep the dir,
 # decide per-file whether to track once they stabilize.
 
-# Runtime libraries (cloned for Phase 3; should become proper git submodules later).
-# Ignored for now so the ~940 MB of code isn't committed as plain files.
-lib/N64ModernRuntime/
-lib/RecompFrontend/
-lib/rt64/
+# Runtime libraries are proper submodules now (jessetbh forks, [wcw fix] on wcw branches).
 
 # Standalone run/ experiment — build artifacts (keep the source + README)
 run/obj/

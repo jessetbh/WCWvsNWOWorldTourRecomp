@@ -9,7 +9,7 @@ for every function directly from the disassembly.
 
 Usage: python gen_symbols.py [--overlays] [--data]
   (default: fixed segment only — entry + main; --overlays also adds ovl_a/ovl_b;
-   --data ALSO emits syms/data_dump.toml from the splat data/bss disassembly —
+   --data ALSO emits WCWSyms/data_dump.toml from the splat data/bss disassembly —
    needed by the patches build, see patches.toml `data_reference_syms_files`)
 """
 import re
@@ -18,8 +18,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 ASM = ROOT / "disasm" / "asm"
-OUT = ROOT / "syms" / "dump.toml"
-DATA_OUT = ROOT / "syms" / "data_dump.toml"
+OUT = ROOT / "WCWSyms" / "dump.toml"
+DATA_OUT = ROOT / "WCWSyms" / "data_dump.toml"
 
 # (section name, rom_start, vram_start, text_size, asm_file)
 FIXED = [
