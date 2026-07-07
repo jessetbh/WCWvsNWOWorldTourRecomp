@@ -163,8 +163,14 @@ wcw.toml patches.toml recompcontrollerdb.txt .gitmodules .gitignore
       lines demoted to env-gated: WCW_AUDIO_LOG (main.cpp), WCW_PRESENT_LOG (rt64 ×3),
       WCW_VI_LOG (ultramodern ×2) — verified zero periodic chatter in a 10 s log.
       Still pending: archive .map/PDB per release (CI packaging, D3).
-- [ ] **C5: CRT/redist check** on a clean machine (static CRT or document the VC++
-      redist requirement). → fold into Phase F fresh-machine QA.
+- [x] **C5: CRT/redist check.** RESOLVED 2026-07-07 analytically (dumpbin on the CI
+      artifact): exe + dxcompiler/dxil import MSVCP140/VCRUNTIME140/VCRUNTIME140_1/
+      MSVCP140_ATOMIC_WAIT (VC++ redist, NOT in stock Windows); everything else is
+      in-box (UCRT api-ms-*, d3d12, D3DCOMPILER_47) and SDL2.dll is self-contained.
+      Fix: CI package step now ships those four DLLs app-local next to the exe
+      (Microsoft-licensed for exactly this; static CRT wouldn't help since the
+      prebuilt dxc DLLs need them regardless). Fresh-machine test still worth one
+      pass for GPU/driver variety, but the DLL question is closed.
 - [x] **C6: first-run defaults**: DONE — aspect ratio Expand is the code default
       (ui_config_tab_graphics), Framerate locked Original, audio buffering fixed
       (buffer_offset_frames), windowed default with F11/Alt+Enter fullscreen.

@@ -118,6 +118,14 @@ jobs:
           Copy-Item cmake-build/SDL2.dll, cmake-build/dxil.dll, cmake-build/dxcompiler.dll package/
           Copy-Item COPYING package/
           Copy-Item .github/release-readme.txt package/README.txt
+          # App-local VC++ runtime: the exe and the dxc DLLs import MSVCP140/VCRUNTIME140/
+          # VCRUNTIME140_1/MSVCP140_ATOMIC_WAIT, which stock Windows does NOT ship (the
+          # VC++ Redistributable provides them). Placing them next to the exe makes the
+          # zip run on machines without the redist (Windows searches the app dir first;
+          # these are not KnownDLLs). Microsoft licenses these files for app-local
+          # redistribution.
+          $crt = Get-ChildItem "$env:VCToolsRedistDir\x64\Microsoft.VC*.CRT" | Select-Object -First 1
+          Copy-Item "$($crt.FullName)\msvcp140.dll", "$($crt.FullName)\vcruntime140.dll", "$($crt.FullName)\vcruntime140_1.dll", "$($crt.FullName)\msvcp140_atomic_wait.dll" package/
       - name: Assert no stray files in package
         run: |
           $stray = Get-ChildItem -Recurse package -Include *.z64,*.n64,*.v64,*.json,*.json.bak,*.map,*.pdb,*.log
