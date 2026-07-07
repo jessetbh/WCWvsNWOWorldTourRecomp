@@ -50,6 +50,15 @@ cd WCWvsNWOWorldTourRecomp
 `[wcw fix]` changes — see `lib-patches/README.md` for the diff-vs-upstream record)
 and `WCWSyms/` contains the generated symbol TOMLs.
 
+**Windows path-length warning**: the nested submodule tree produces long internal
+git paths, and cloning into a deep directory (OneDrive Documents, etc.) can fail
+with `Filename too long`. Either clone into a short path (e.g. `C:\src\`) or enable
+long-path support first:
+
+```powershell
+git config --global core.longpaths true
+```
+
 ## 3. Provide the ROM
 
 Place the **WCW vs. nWo World Tour (USA)** ROM as `wcw.z64` in the repo root —

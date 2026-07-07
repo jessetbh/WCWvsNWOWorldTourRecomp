@@ -228,8 +228,11 @@ wcw.toml patches.toml recompcontrollerdb.txt .gitmodules .gitignore
 - [x] **BUILDING.md**: DONE 2026-07-06 — rewritten for any-machine builds (prereqs
       incl. portable-LLVM-or-zig patches toolchain, clone --recursive, ROM, build
       N64Recomp@pin, recompile, port build, local-config.cmake, patches gotchas,
-      symbol regen, lib/ fork workflow). REMAINING: validate by following it verbatim
-      on a clean checkout (fold into Phase F).
+      symbol regen, lib/ fork workflow). **Clean-checkout validation PASSED
+      2026-07-07** (public clone → recompiler build @pin → recompile → port build,
+      doc followed verbatim; output exe byte-identical to the dev build). One doc
+      fix from the exercise: Windows path-length warning added (deep clone paths +
+      nested submodules exceed MAX_PATH; use a short path or core.longpaths).
 - [ ] **FAQ entries** (copy the ecosystem's): what is static recompilation / relation
       to decomp (none exists for WCW — we made our own symbols) / where are saves /
       how to change ROM / portable mode.
