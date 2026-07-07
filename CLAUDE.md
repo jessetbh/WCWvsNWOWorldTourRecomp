@@ -64,7 +64,7 @@ see `BUILDING.md`.
   After editing `patches/*.c`, **build twice** (first build links the stale table).
 - **Framerate is locked to Original** (UI disabled + saved-config coerced). Frame
   interpolation warps geometry because WCW is G_FORCEMTX-only; the full analysis and
-  a working-but-reverted implementation are at commit `bd35fac`. Don't re-enable
+  a working-but-reverted implementation are at commit `53000eb`. Don't re-enable
   without game-side matrix-group patches.
 - **Saves = emulated Controller Pak** (32 KB, port 1) inside librecomp `si.cpp`'s
   custom PIF/joybus emulation — WCW rolls its own raw-SI driver and saves ONLY to the

@@ -34,10 +34,12 @@ add_compile_definitions(HLSL_CPU)
 add_subdirectory(${RT64DIR} ${CMAKE_BINARY_DIR}/rt64)
 target_include_directories(rt64 PRIVATE ${CMAKE_BINARY_DIR}/rt64/src)
 if (WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    # rt64's vendored SDL 2.26.3 (mupen64plus-win32-deps) defines _m_prefetch in
-    # SDL_endian.h; newer clang (CI's clang-cl 22) makes it a builtin and errors on the
-    # redefinition. Accepted (silently ignored) by older clang too — verified on 19.1.5.
-    target_compile_options(rt64 PRIVATE -fno-builtin-_m_prefetch)
+    # rt64's vendored SDL 2.26.3 (mupen64plus-win32-deps submodule) defines _m_prefetch
+    # in SDL_endian.h behind #ifndef __PRFCHWINTRIN_H; clang 20+ makes _m_prefetch a
+    # target builtin and errors on that redefinition (-fno-builtin-<name> does NOT
+    # apply to target builtins — verified on CI clang-cl 22). Force-including intrin.h
+    # first lets clang's own prfchwintrin.h set the guard so SDL's hack is skipped.
+    target_compile_options(rt64 PRIVATE /FIintrin.h)
 endif()
 
 # --- Runtime core (ultramodern + librecomp) ---

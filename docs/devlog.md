@@ -505,7 +505,7 @@ Still NOT done (later phases):
   and delays legitimate deliveries like the sound driver's sample-DMA handshakes (SFX
   silent; sequenced music survives). Matches "persists across matches / reset on
   restart": the orphaned queues are never drained by the game, and the backlog lives in
-  the host process. **Fix (`[wcw fix]` b8a4af0, N64ModernRuntime fork)**: stamp each
+  the host process. **Fix (`[wcw fix]` 1ca2f84, N64ModernRuntime fork)**: stamp each
   external message at enqueue; retry undeliverable requeue-if-blocked messages for a 1 s
   grace window (requeue exists to paper over librecomp's instant-DMA timing — a
   completion can land while the game's queue is momentarily full, where real DMA latency
@@ -617,7 +617,7 @@ Still NOT done (later phases):
   (2026-07-05).** A full fix for the Framerate=Display black-frame flicker was built and
   readback-verified (multi-workload frame grouping in rt64_workload_queue + present-fb-address
   interpolation-target selection + override-target priming â€” the complete implementation and
-  analysis live in **git history at commit `bd35fac`**, lib-patches/rt64.patch of that commit),
+  analysis live in **git history at commit `53000eb`**, lib-patches/rt64.patch of that commit),
   but was **reverted the same day**: with flicker gone, the interpolated frames instead WARP
   GEOMETRY ("polygons bounce all over" â€” user-reported unplayable in real gameplay). Root
   cause of the warping is fundamental, not a bug: WCW is **G_FORCEMTX-only**, so RT64's
@@ -625,7 +625,7 @@ Still NOT done (later phases):
   (position/orientation/screen-space metrics meant for model matrices) mispairs them â€”
   interpolation then lerps between unrelated matrices. **The proper fix is Phase-4 matrix-group
   patches** (game-side stable matrix IDs via G_EX, requires locating WCW's CPU matrix
-  composition sites) â€” anyone reattempting should START from `bd35fac`, whose three findings
+  composition sites) â€” anyone reattempting should START from `53000eb`, whose three findings
   remain valid and readback-verified:
   1. WCW builds one visual frame from 1-7 RSP workloads (menus most, matches least); grouping
      by shared `presentId` + a present-submission signal works and needs GameFrame matching
@@ -637,7 +637,7 @@ Still NOT done (later phases):
   3. Interpolated override targets start undefined (the game's clear lives in the PREVIOUS
      frame's workloads) and must be primed from the live target (`copyTextureRegion`;
      `RenderTarget::copyFromTarget` is cross-format-only and null-crashes on same-format).
-  **Current state**: lib/rt64 reverted to the pre-`bd35fac` patch set (verified: Original-mode
+  **Current state**: lib/rt64 reverted to the pre-`53000eb` patch set (verified: Original-mode
   readback clean, 30/s, 0 crash). **Framerate is LOCKED to Original** in recompui
   `ui_config_tab_graphics.cpp` (`[wcw fix]`, in lib-patches/RecompFrontend.patch): the UI
   control is disabled (grayed, with an explanatory description) AND `on_json_parse_option`
@@ -645,7 +645,7 @@ Still NOT done (later phases):
   (the backup-fallback loader bit us before with controls.json). Lock verified end to end: with
   `"rr_option": "Display"` planted in graphics.json, the game runs at Original rates (300
   presents/10s max vs 550-680 when Display was live). Diagnostics `WCW_FRAME_LOG=1` /
-  `WCW_INTERP_LOG=1` were reverted with the rt64 changes (re-add from `bd35fac` if needed).
+  `WCW_INTERP_LOG=1` were reverted with the rt64 changes (re-add from `53000eb` if needed).
 - âœ… **A/V "FLICKERING" BOTH FIXED (2026-07-04).** Two independent root causes:
   1. **Audio crackle = constant SDL underruns** (~22/s: the device queue hit 0 on half the
      batches; gaps up to 79ms vs 46ms buffered). WCW registers NO AI event (verified:
