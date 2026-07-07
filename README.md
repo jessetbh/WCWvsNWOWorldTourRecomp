@@ -130,6 +130,13 @@ across updates.
 Yes — place a file named `portable.txt` in the same folder as the executable and
 saves, config files, and the stored ROM will be kept next to the executable instead.
 
+#### Can I mod the game?
+
+User-facing mod support (like the other recomp ports have) is planned but not here
+yet. What exists today is developer-level: game-behavior patches written in C and
+compiled to MIPS (the widescreen feature is implemented this way). If you want to
+write one, see the "Working on patches" section of [BUILDING.md](BUILDING.md).
+
 #### How do I choose a different ROM?
 
 **You don't.** This project is **only** a port of WCW vs. nWo World Tour, and it only
