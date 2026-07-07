@@ -232,6 +232,13 @@ wcw.toml patches.toml recompcontrollerdb.txt .gitmodules .gitignore
 
 - [ ] Fresh-machine test from the actual release zip (no dev tools): unzip → launcher
       ROM intake → title → full match → save → relaunch → save persists.
+      **Mostly done on the dev machine from the real CI artifact (2026-07-07,
+      portable mode)**: fresh launcher shows Load ROM ✓, stored-ROM revalidation →
+      Start Game ✓, full match vs COM ✓, and the fresh-save loop ✓ — which found and
+      fixed THE beta blocker: fresh installs couldn't save (zeroed pak image = "0
+      pages free"; now formatted on first use, NMR fork eeda8a0; note creation +
+      persistence + relaunch verified). REMAINING for a true fresh machine: CRT/
+      redist check (C5) + a non-dev PC + the nfd Load ROM dialog flow itself.
 - [ ] Wrong/absent ROM → friendly launcher error (not console vomit).
 - [ ] Input matrix: keyboard-only, XInput pad, hotplug, rebinding persists, rumble
       end-to-end on release build.
