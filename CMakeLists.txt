@@ -17,6 +17,16 @@ endif()
 if (WIN32)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR")
     add_compile_definitions(NOMINMAX)
+    if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        # Both SDL2 copies in this build (rt64's vendored 2.26.3 and the FetchContent
+        # 2.30.3 devel headers) define _m_prefetch in SDL_endian.h behind
+        # #ifndef __PRFCHWINTRIN_H, as a workaround for old clang. clang 20+ makes
+        # _m_prefetch a target builtin and hard-errors on that redefinition
+        # (-fno-builtin-<name> does NOT apply to target builtins — verified on CI's
+        # clang-cl 22). Force-including intrin.h first lets clang's own prfchwintrin.h
+        # set the guard, so SDL's hack is skipped in every TU that includes SDL.
+        add_compile_options(/FIintrin.h)
+    endif()
 endif()
 if (CMAKE_VERSION VERSION_GREATER_EQUAL "3.24.0")
     cmake_policy(SET CMP0135 NEW)
@@ -33,14 +43,6 @@ set(RT64_SDL_WINDOW_VULKAN TRUE)
 add_compile_definitions(HLSL_CPU)
 add_subdirectory(${RT64DIR} ${CMAKE_BINARY_DIR}/rt64)
 target_include_directories(rt64 PRIVATE ${CMAKE_BINARY_DIR}/rt64/src)
-if (WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    # rt64's vendored SDL 2.26.3 (mupen64plus-win32-deps submodule) defines _m_prefetch
-    # in SDL_endian.h behind #ifndef __PRFCHWINTRIN_H; clang 20+ makes _m_prefetch a
-    # target builtin and errors on that redefinition (-fno-builtin-<name> does NOT
-    # apply to target builtins — verified on CI clang-cl 22). Force-including intrin.h
-    # first lets clang's own prfchwintrin.h set the guard so SDL's hack is skipped.
-    target_compile_options(rt64 PRIVATE /FIintrin.h)
-endif()
 
 # --- Runtime core (ultramodern + librecomp) ---
 set(BUILD_SHARED_LIBS OFF)
