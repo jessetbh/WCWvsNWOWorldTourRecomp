@@ -9,6 +9,48 @@ the relevant section at the time, so it reads as a layered status document, not 
 diary. For current contributor instructions see the root CLAUDE.md and BUILDING.md.
 
 ---
+# 2026-07-07 — v0.1.0 public beta released
+
+**Shipped**: https://github.com/jessetbh/WCWvsNWOWorldTourRecomp/releases/tag/v0.1.0
+(repo + WCWSyms flipped public; CI-built zip + SHA256SUMS; fork-PR `external`
+environment gate armed). Release-day root-causes, in the usual evidence-log form:
+
+- **Fresh installs couldn't save (beta-QA find, would have hit every player).**
+  librecomp's save buffer starts all-zero when no save file exists; libultra's pak
+  filesystem reads a zeroed page-allocation table as "formatted, 0 pages free, no
+  notes" (free pages are marked `0x0003`), so the game booted into "Select note to
+  be erased / 0 Pages free" and could never create its note. Dev machines never saw
+  it — their save predated the bug window. Fix (`[wcw fix]` in NMR si.cpp): on first
+  data-region pak access, if the 32 KB image was never written, lay down an empty
+  formatted mempak filesystem (checksummed ID block + backups, free-page table +
+  backup), byte-for-byte per mupen64plus `format_mempak`. Verified on the release
+  package: authentic "Make new note for Controller Pak?" prompt → note created
+  (inode chain + note-table entry inspected in the save file) → persists → relaunch
+  finds it. Existing saves untouched (any nonzero byte skips formatting).
+- **The zip needed the VC++ redist (dumpbin find).** The exe and the prebuilt
+  dxcompiler/dxil import MSVCP140/VCRUNTIME140/VCRUNTIME140_1/MSVCP140_ATOMIC_WAIT —
+  not in stock Windows. CI now packages them app-local next to the exe (app dir
+  precedes System32 in DLL search; not KnownDLLs; MS-licensed for this). Static CRT
+  would NOT have sufficed (the prebuilt dxc DLLs still import them).
+- **CI runner clang (22) vs local (19): `_m_prefetch`.** Both vendored SDL2 copies
+  (rt64's 2.26.3 and FetchContent 2.30.3) define `_m_prefetch` in SDL_endian.h
+  behind `#ifndef __PRFCHWINTRIN_H`; clang 20+ makes it a target builtin and errors
+  on the redefinition. `-fno-builtin-_m_prefetch` does NOT apply to target builtins
+  (verified: flag on the command line, error persists). Fix: global `/FIintrin.h`
+  (clang's own prfchwintrin.h sets the guard first, SDL's hack is skipped).
+- **Soak (published zip, attract loop, 10h18m)**: memory flat 314–317 MB, vis/s
+  27–32 throughout, zero crashes in 32,258 health samples. Documented lead, no user
+  impact: certain attract phases cause transient requeue churn (bursts to ~100k rq/s
+  on mqs `0x80047C40`/`0x80047CCC`/`0x80045138`, always `msg=0x0`, ext peaks ≤65,
+  self-draining in seconds; the undeliverable-message expiry sheds strays). Same
+  family as the idle-thread busy-poll patched in wcw.toml, but self-recovering —
+  first place to look if attract-mode bugs are ever reported.
+- Also: commit-message history rewrite (all six repos, submodule gitlinks remapped
+  across history), `WCWRecompiled.map` emission moved from an uncached local
+  configure flag into CMakeLists, README screenshots + FAQ audit (saves live in
+  `saves\`), release pipeline (tag → zip + SHA256SUMS → draft) proven end to end.
+
+---
 # CLAUDE.md â€” WCW vs. nWo World Tour: Recompiled
 
 This file is the source of truth for this project. Read it before doing work here.
