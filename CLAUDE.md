@@ -15,11 +15,18 @@ Not an emulator, not a decompilation; no game assets are distributed — the use
 supplies their own ROM (US release, SHA1
 `5AD2D8359058C8BB71F08E3D3433B7A50D3BB645`, entrypoint `0x80000400`, IDO compiler).
 
-**Status: fully playable, user-verified (2026-07-05)** — boots, renders, full matches
-with sound, keyboard + gamepad input, menus, 4-player local multiplayer, rumble, and
-working saves. Current work: public beta prep (`docs/beta-release-plan.md`) and
-Phase-4 enhancements. The reference project for structure and conventions is
-**Bomberman Hero: Recompiled** (BMHeroRecomp) — when in doubt, mirror it.
+**Status: v0.1.0 public beta released 2026-07-07** —
+https://github.com/jessetbh/WCWvsNWOWorldTourRecomp/releases. Fully playable:
+boots, renders, full matches with sound, keyboard + gamepad input, menus, 4-player
+local multiplayer, rumble, and working saves. Post-release: watch issues, friend
+beta, then Phase-4 enhancements / mod support (`docs/mod-support-plan.md`). The
+reference project for structure and conventions is **Bomberman Hero: Recompiled**
+(BMHeroRecomp) — when in doubt, mirror it.
+
+**Sister project**: WCW/nWo Revenge recomp bootstrap at
+`C:\Users\selki\depot\WcwRevengeRecomp` (same engine family, same fork submodules —
+its CLAUDE.md cross-references this repo's docs). Changes under `lib/` affect BOTH
+projects: after the fork workflow below, update the submodule pin in each.
 
 ## Build
 
