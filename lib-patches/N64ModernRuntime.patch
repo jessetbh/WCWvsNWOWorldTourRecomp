@@ -173,10 +173,10 @@ index 62656ad..99b67eb 100644
              ultramodern::enqueue_external_message(mq, 0, false, true);
 diff --git a/librecomp/src/si.cpp b/librecomp/src/si.cpp
 new file mode 100644
-index 0000000..03c0002
+index 0000000..0503b73
 --- /dev/null
 +++ b/librecomp/src/si.cpp
-@@ -0,0 +1,232 @@
+@@ -0,0 +1,294 @@
 +// [wcw] SI / PIF (joybus) emulation for games that use the RAW libultra SI primitives
 +// (__osSiRawStartDma / __osSiDeviceBusy) instead of the high-level osCont* API.
 +//
@@ -238,6 +238,66 @@ index 0000000..03c0002
 +    lines++;
 +    fprintf(stderr, "[wcw][pak] %s addr=0x%04X data=0x%02X identity=%s\n",
 +            op == 'W' ? "write" : "read ", addr, value, wcw_pak_is_rumble ? "rumble" : "mempak");
++}
++
++// [wcw] Fresh-save Controller Pak formatting. librecomp's save buffer starts all-zero
++// when no save file exists, and libultra's pak filesystem code reads a zeroed page-
++// allocation table as "formatted, 0 pages free, no notes" (free pages are marked
++// 0x0003) — so on a fresh install the game could never create its save note and
++// showed the "Select note to be erased / 0 Pages free" screen at boot (beta QA,
++// 2026-07-07). A real pak is always formatted (checksummed ID block + free-page
++// table), so: on the first data-region access, if the entire 32 KB image has never
++// been written, lay down an empty formatted filesystem. Byte-for-byte per
++// mupen64plus's format_mempak (mempak.c) with its default device id/banks/version.
++static void wcw_pak_ensure_formatted() {
++    static bool checked = false;
++    if (checked) { return; }
++    checked = true;
++
++    uint8_t page[256];
++    for (uint32_t off = 0; off < 0x8000; off += (uint32_t)sizeof(page)) {
++        save_read_ptr(page, off, (uint32_t)sizeof(page));
++        for (size_t b = 0; b < sizeof(page); b++) {
++            if (page[b] != 0) { return; }        // save has data — leave it alone
++        }
++    }
++
++    uint8_t pages[3 * 256] = {0};
++
++    // Page 0: ID block at +0x20 (serial, device id 0x0001, 1 bank, version 0,
++    // checksum = sum of the 14 leading BE words, inverted checksum = 0xFFF2 - sum),
++    // with backup copies at +0x60, +0x80, +0xC0.
++    uint8_t* id = &pages[0x20];
++    static const uint8_t serial[24] = {          // arbitrary fixed serial (6 BE words)
++        'W', 'C', 'W', 'R', 'E', 'C', 'O', 'M',
++        'P', 'I', 'L', 'E', 'D', 'P', 'A', 'K',
++        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
++    };
++    memcpy(id, serial, sizeof(serial));
++    id[24] = 0x00; id[25] = 0x01;                // device id
++    id[26] = 0x01;                               // banks
++    id[27] = 0x00;                               // version
++    uint16_t sum = 0;
++    for (int b = 0; b < 28; b += 2) { sum = (uint16_t)(sum + ((id[b] << 8) | id[b + 1])); }
++    uint16_t isum = (uint16_t)(0xFFF2 - sum);
++    id[28] = (uint8_t)(sum >> 8);  id[29] = (uint8_t)sum;
++    id[30] = (uint8_t)(isum >> 8); id[31] = (uint8_t)isum;
++    memcpy(&pages[0x60], id, 32);
++    memcpy(&pages[0x80], id, 32);
++    memcpy(&pages[0xC0], id, 32);
++
++    // Page 1: page-allocation table — pages 5..127 marked free (0x0003), byte 1 =
++    // checksum (byte sum of the 123 entries). Page 2 is its backup. Pages 3-4 (note
++    // table) and the data pages stay zero.
++    uint8_t* inode = &pages[0x100];
++    for (int p = 5; p < 128; p++) { inode[2 * p] = 0x00; inode[2 * p + 1] = 0x03; }
++    uint8_t csum = 0;
++    for (int b = 2 * 5; b < 256; b++) { csum = (uint8_t)(csum + inode[b]); }
++    inode[1] = csum;
++    memcpy(&pages[0x200], inode, 256);
++
++    save_write_ptr(pages, 0, (uint32_t)sizeof(pages));
++    fprintf(stderr, "[wcw][pak] fresh save image - formatted empty Controller Pak filesystem\n");
 +}
 +
 +// Standard joybus mempak data CRC (poly 0x85 over the 32 data bytes + one zero byte).
@@ -328,6 +388,7 @@ index 0000000..03c0002
 +            uint16_t addr = (uint16_t)((pif_ram[i + 3] << 8) | pif_ram[i + 4]);
 +            uint32_t offset = addr & 0xFFE0u;
 +            if (offset < 0x8000) {
++                wcw_pak_ensure_formatted();
 +                save_read_ptr(res, offset, 32);          // pak RAM <- save buffer
 +            }
 +            else {
@@ -347,6 +408,7 @@ index 0000000..03c0002
 +            uint32_t offset = addr & 0xFFE0u;
 +            const uint8_t* data = &pif_ram[i + 5];
 +            if (offset < 0x8000) {
++                wcw_pak_ensure_formatted();              // format first so the game's write wins
 +                save_write_ptr(data, offset, 32);        // persists asynchronously (librecomp)
 +            }
 +            else if (offset >= 0xC000) {

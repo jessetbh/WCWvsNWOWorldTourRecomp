@@ -13,10 +13,10 @@ Nintendo 64 game *WCW vs. nWo World Tour (USA)* into a native PC port, running o
 > persistent saves. See [Known Issues](#known-issues) for what's still rough.
 
 <div align="center">
-  <img src="docs/screenshots/wrestler-select.png" width="640" alt="Wrestler select, rendered at high resolution">
+  <img src="docs/screenshots/gameplay.png" width="640" alt="In-ring gameplay rendered at high resolution">
   <br>
+  <img src="docs/screenshots/wrestler-select.png" width="318" alt="Wrestler select">
   <img src="docs/screenshots/mode-select.png" width="318" alt="Mode select menu">
-  <img src="docs/screenshots/title.png" width="318" alt="Title screen with the emulated Rumble Pak prompt">
 </div>
 
 ## Table of Contents
@@ -120,10 +120,10 @@ disassembly (see `disasm/` and the `WCWSyms` submodule).
 
 #### Where is the savefile stored?
 
-- Windows: `%LOCALAPPDATA%\WCWRecompiled\` (the save is `wcw.nwo.worldtour.us.bin`)
+- Windows: `%LOCALAPPDATA%\WCWRecompiled\saves\`
 
-Configuration files and the log file live in the same folder. Save data is preserved
-across updates.
+Configuration files and the log file live one level up in the same app folder. Save
+data is preserved across updates.
 
 #### Can you run this project as a portable application?
 
