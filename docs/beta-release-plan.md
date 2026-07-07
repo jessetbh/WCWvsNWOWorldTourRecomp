@@ -195,7 +195,12 @@ wcw.toml patches.toml recompcontrollerdb.txt .gitmodules .gitignore
       validate-internal.yml (main + same-repo PRs), validate-external.yml
       (environment-gated fork PRs), update-pr-artifacts.yml (nightly.link PR links).
       Patches toolchain in CI = portable LLVM archive (tested, see corrections above).
-      NOT yet validated on GitHub (needs D1's secrets; first push will tell).
+      **VALIDATED 2026-07-07: first green run** (28832449675) after two runner-clang-22
+      fixes (global `/FIintrin.h` — both SDL2 copies' `_m_prefetch` hack collides with
+      clang 20+ target builtins). Artifact inspected: contents exactly per D3 spec, no
+      strays; portable.txt honored by the CI-built exe (configs land next to exe);
+      boots and renders. Remaining artifact QA (launcher visuals, full match loop from
+      the zip) folded into Phase F.
 - [x] **D3: package step.** DONE 2026-07-06: validate.yml packages exe + assets/ +
       recompcontrollerdb.txt + SDL2/dxil/dxcompiler DLLs + COPYING + README.txt (from
       .github/release-readme.txt), with a stray-file assertion (*.z64/*.json/*.map/
