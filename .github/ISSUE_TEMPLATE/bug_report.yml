@@ -46,4 +46,4 @@ body:
     id: log
     attributes:
       label: Log output
-      description: Attach or paste the log/console output if available.
+      description: Attach WCWRecompiled.log — it's in %LOCALAPPDATA%\WCWRecompiled\ (or next to the exe if you use portable.txt).

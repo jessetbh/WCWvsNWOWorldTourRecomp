@@ -250,6 +250,13 @@ wcw.toml patches.toml recompcontrollerdb.txt .gitmodules .gitignore
    appears once the repo is public — Free-plan limitation. This gates fork-PR access
    to the ROM secret in validate-external.yml; do it before announcing the repo.)
    Then tag; GitHub release with zip + SHA256SUMS + template notes.
+   - Repo description (Settings → General or ⚙ next to About): `Native PC port of
+     WCW vs. nWo World Tour (N64) via static recompilation. No game assets included
+     — bring your own ROM.`
+   - Topics: `n64` `n64recomp` `static-recompilation` `game-preservation` `wcw`
+     `wrestling` `rt64` `windows`
+   - v0.1.0 changelog is pre-drafted in `docs/release-v0.1.0-notes-draft.md`; paste
+     into the CI-drafted release, then delete that draft file and archive this plan.
 4. Post-release: watch issues; hotfix branch policy.
 
 ## Decisions needed from the project owner

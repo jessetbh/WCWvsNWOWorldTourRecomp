@@ -12,6 +12,13 @@ Nintendo 64 game *WCW vs. nWo World Tour (USA)* into a native PC port, running o
 > matches with sound, keyboard + gamepad input, menus, local multiplayer, rumble, and
 > persistent saves. See [Known Issues](#known-issues) for what's still rough.
 
+<div align="center">
+  <img src="docs/screenshots/wrestler-select.png" width="640" alt="Wrestler select, rendered at high resolution">
+  <br>
+  <img src="docs/screenshots/mode-select.png" width="318" alt="Mode select menu">
+  <img src="docs/screenshots/title.png" width="318" alt="Title screen with the emulated Rumble Pak prompt">
+</div>
+
 ## Table of Contents
 * [System Requirements](#system-requirements)
 * [Features](#features)
