@@ -250,8 +250,16 @@ wcw.toml patches.toml recompcontrollerdb.txt .gitmodules .gitignore
       end-to-end on release build.
 - [ ] Graphics: windowed/fullscreen/alt-tab/monitor switch; NVIDIA D3D12 primary; AMD/
       Intel if obtainable (note Zelda's AMD-RDNA3-defaults-to-Vulkan precedent).
-- [ ] Soak: attract loop for an extended period on the release build.
-- [ ] Ship with no json configs in the zip (the controls.json.bak fallback gotcha).
+- [x] Soak: DONE 2026-07-07 — the published v0.1.0 zip (checksum-verified download),
+      attract loop 10h18m with WCW_HEALTH_LOG: memory flat 314–317 MB, vis/s 27–32
+      throughout, zero crashes in 32,258 samples. Finding (no user impact, documented
+      lead): periodic transient requeue churn during certain attract phases (bursts to
+      ~100k rq/s on mqs 0x80047C40/0x80047CCC/0x80045138 with msg=0x0, ext peaks ≤65,
+      fully self-draining within seconds; the undeliverable-message expiry sheds
+      strays as designed). Likely a game busy-poll loop under the cooperative
+      scheduler — same family as the idle-thread wcw.toml patch, but self-recovering.
+- [x] Ship with no json configs in the zip — verified 2026-07-07 (CI assertion + manual
+      artifact inspection; fresh-run QA confirmed defaults regenerate cleanly).
 
 ## Publish sequence
 
