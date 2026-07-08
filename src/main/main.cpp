@@ -171,7 +171,7 @@ static void wcw_sample_all_threads() {
 
 extern "C" void recomp_entrypoint(uint8_t* rdram, recomp_context* ctx);
 
-static const recomp::Version version { 0, 1, 1, "" };
+static const recomp::Version version { 0, 1, 2, "" };
 
 template <typename... Ts>
 [[noreturn]] static void exit_error(const char* str, Ts... args) {
