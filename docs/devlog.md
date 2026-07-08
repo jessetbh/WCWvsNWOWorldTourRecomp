@@ -9,6 +9,43 @@ the relevant section at the time, so it reads as a layered status document, not 
 diary. For current contributor instructions see the root CLAUDE.md and BUILDING.md.
 
 ---
+# 2026-07-08 — v0.1.1 (launcher branding) + v0.1.2 (aspect-ratio fix)
+
+**v0.1.1**: game logo on the launcher screen (embedded `icons/logo.png` Image element
+replaces the default text title via `remove_default_title()`) + WCW app icon. Gotcha:
+CMake's RC step does not track `app.ico` as a dependency — touch `app.rc` or the exe
+keeps the stale icon through a "successful" rebuild.
+
+**v0.1.2 — "can't get 4:3" root-caused (aspect was wrong in BOTH modes in matches).**
+Menus (320x240 fb) were always fine; matches render an anamorphic **480x240 hi-res fb**
+that hardware squeezes into the 4:3 scanout, but three places in RT64 derived aspect
+from fb *pixel* dimensions (2:1):
+
+- `rt64_workload_queue.cpp`: `aspectRatioSource = viFbSize.x/y` → in matches
+  Expand's `target = max(window, source)` collapsed to `source` (scale 1, **no
+  widening — Expand silently no-oped in matches**) and Original's present came out
+  2:1-stretched.
+- `rt64_vi_renderer.cpp` `getViewportAndScissor`: `removeBlackBorders` (RT64 default
+  **true**, never overridden by the frontend) sets the virtual SD TV to `vi.fbSize()`
+  → a 2:1 "TV", so `fromHDtoWindow`'s pillarbox/letterbox math (which is correct!)
+  letterboxed a stretched image instead of pillarboxing a 4:3 one. Note WCW's
+  `viewRectangle()` is always `{0,0,1,1}`, so rBB trimmed nothing here — it *only*
+  corrupted the aspect.
+- `rt64_framebuffer_renderer.cpp`: the full-screen-scissor similarity test compared
+  scissor (fb-pixel units) against `aspectRatioSource`.
+
+**Fix (`[wcw fix]` rt64 `8d70049`)**: source aspect = displayed aspect = 4:3 always
+(the VI scans any fb into a 4:3 frame); similarity test now uses the fb's own
+`fbWidth/fbHeight`; rBB present path keeps a 4:3 TV (`fb rows × 4/3`). Result:
+Original = true pillarboxed 4:3 in matches (user-verified in-game), Expand = real
+wide-FOV widening in matches (the widescreen patch's projection finally matches the
+presented aspect — pre-fix Expand matches were shown at 2:1 vs the 16:9 projection,
+a ~12% horizontal stretch nobody had measured). Rolled to Revenge (submodule ff,
+boot-verified; its attract also runs a 480-wide fb) and Wm2k (snapshot lib patched
+in place, boot-verified). Beware: `git apply` run inside a gitignored subtree of a
+parent repo exits 0 without applying — verify content, not exit codes.
+
+---
 # 2026-07-07 — v0.1.0 public beta released
 
 **Shipped**: https://github.com/jessetbh/WCWvsNWOWorldTourRecomp/releases/tag/v0.1.0
