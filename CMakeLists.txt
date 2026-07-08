@@ -177,7 +177,12 @@ add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/icon_bytes.c ${CMAKE_CURRE
     COMMAND file_to_c ${CMAKE_SOURCE_DIR}/icons/app.png icon_bytes ${CMAKE_CURRENT_BINARY_DIR}/icon_bytes.c ${CMAKE_CURRENT_BINARY_DIR}/icon_bytes.h
     DEPENDS ${CMAKE_SOURCE_DIR}/icons/app.png file_to_c
 )
-target_sources(WCWRecompiled PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/icon_bytes.c)
+# Wide transparent game logo shown on the launcher screen in place of the default text title.
+add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/logo_bytes.c ${CMAKE_CURRENT_BINARY_DIR}/logo_bytes.h
+    COMMAND file_to_c ${CMAKE_SOURCE_DIR}/icons/logo.png logo_bytes ${CMAKE_CURRENT_BINARY_DIR}/logo_bytes.c ${CMAKE_CURRENT_BINARY_DIR}/logo_bytes.h
+    DEPENDS ${CMAKE_SOURCE_DIR}/icons/logo.png file_to_c
+)
+target_sources(WCWRecompiled PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/icon_bytes.c ${CMAKE_CURRENT_BINARY_DIR}/logo_bytes.c)
 if (WIN32)
     enable_language(RC)
     target_sources(WCWRecompiled PRIVATE ${CMAKE_SOURCE_DIR}/icons/app.rc)

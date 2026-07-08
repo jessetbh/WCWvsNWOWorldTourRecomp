@@ -32,6 +32,8 @@
 #include "librecomp/rsp.hpp"
 #include "ovl_patches.hpp"
 #include "icon_bytes.h"
+#include "logo_bytes.h"
+#include "../../lib/RecompFrontend/recompui/src/elements/ui_image.h"
 #ifdef _WIN32
 #include "renderdoc_app.h" // [wcw] RenderDoc in-app capture API (diagnostic)
 #endif
@@ -614,6 +616,21 @@ int main(int argc, char** argv) {
         // Launcher menu options: no Mods entry (add_default_options has one) until mod
         // support is actually wired up.
         recompui::register_launcher_init_callback([](recompui::LauncherMenu* menu) {
+            // Game logo in place of the default program-name text title. The image must be
+            // queued before the Image element referencing its src is created.
+            menu->remove_default_title();
+            static const std::string logo_src = "?/game/wcw.nwo.worldtour.us/logo";
+            recompui::queue_image_from_bytes_file(logo_src,
+                std::vector<char>(logo_bytes, logo_bytes + logo_bytes_size));
+            auto context = recompui::get_current_context();
+            recompui::Image* logo = context.create_element<recompui::Image>(menu, logo_src);
+            logo->set_position(recompui::Position::Absolute);
+            logo->set_top(25.0f, recompui::Unit::Percent);
+            logo->set_left(50.0f, recompui::Unit::Percent);
+            logo->set_translate_2D(-50.0f, -50.0f, recompui::Unit::Percent);
+            logo->set_width(520.0f);
+            logo->set_height(520.0f * 364.0f / 1200.0f);  // icons/logo.png aspect
+
             auto* game_options_menu = menu->init_game_options_menu(
                 supported_games[0].game_id,
                 supported_games[0].mod_game_id,
