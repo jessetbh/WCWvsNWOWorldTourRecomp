@@ -84,8 +84,33 @@ index 4d6a01d..9e2dc24 100644
 +
 +    ctx->f0.d = ret;
 +}
+diff --git a/librecomp/src/overlays.cpp b/librecomp/src/overlays.cpp
+index 8c8e5d1..e95ff7d 100644
+--- a/librecomp/src/overlays.cpp
++++ b/librecomp/src/overlays.cpp
+@@ -200,7 +200,19 @@ extern "C" void load_overlays(uint32_t rom, int32_t ram_addr, uint32_t size) {
+     );
+     // Load the overlays that were found
+     for (auto it = lower; it != upper; ++it) {
+-        load_overlay(std::distance(&sections_info.code_sections[0], it), it->rom_addr - rom + ram_addr);
++        int32_t load_addr = it->rom_addr - rom + ram_addr;
++        // [wcw fix] Only map sections landing at their registered ram address. Revenge stores
++        // its two swap-overlays right after the fixed image (rom 0x3C770/0x834A0), INSIDE the
++        // boot DMA's 1MB window — the boot-time load_overlays(0x1000, entrypoint, 1MB) call in
++        // recomp.cpp would otherwise register them at bogus contiguous addresses (e.g. ovl_b at
++        // 0x800828A0), which later collides with the real swap-in at 0x80090000 ("Cannot
++        // partially unload section"). Every legitimate caller in this stack (boot fixed-segment
++        // map, the pi.cpp overlay-swap hook, WT's layout) loads sections at their registered
++        // address, so this filter is a no-op for them.
++        if (load_addr != it->ram_addr) {
++            continue;
++        }
++        load_overlay(std::distance(&sections_info.code_sections[0], it), load_addr);
+     }
+ }
+ 
 diff --git a/librecomp/src/pi.cpp b/librecomp/src/pi.cpp
-index 62656ad..99b67eb 100644
+index 62656ad..3be27e2 100644
 --- a/librecomp/src/pi.cpp
 +++ b/librecomp/src/pi.cpp
 @@ -8,6 +8,7 @@
@@ -135,27 +160,27 @@ index 62656ad..99b67eb 100644
      }
  }
  
-+// [wcw] WCW has two CPU overlays that both load to vram 0x80090000 (see disasm/README.md and
++// [wcw] The AKI games (WCW World Tour rom 0xA21750/0xA69570, Revenge rom 0x3C770/0x834A0) have
++// two CPU overlays that BOTH load to vram 0x80090000 (see each port's disasm docs and
 +// RecompiledFuncs/recomp_overlays.inl). The game DMAs the overlay code there and jumps to it;
 +// we must register the overlay's recompiled functions with the runtime (load_overlays) so
 +// get_function(0x80090000) resolves. Hook the cart-DMA path: when a transfer's destination is
-+// the overlay base, map the matching overlay (unloading the previously-mapped one first).
++// the overlay base and the source rom offset is a registered overlay section — looked up in the
++// game's own registered section table instead of a per-game hardcoded list — map that overlay,
++// unloading the previously-mapped one first. The 0x60000 window bounds section selection
++// (load_overlays only loads sections fully inside it, and load_overlay uses the section's own
++// size); it covers either game's largest overlay without reaching the next section.
 +static void wcw_maybe_load_overlay(gpr rdram_address, uint32_t physical_addr) {
 +    if ((uint32_t)rdram_address != 0x80090000) {
 +        return;
 +    }
-+    static const struct { uint32_t rom; uint32_t size; } ovls[] = {
-+        { 0x00A21750, 0x00033BC0 }, // overlay A
-+        { 0x00A69570, 0x00055F70 }, // overlay B
-+    };
 +    uint32_t rom_off = physical_addr - (uint32_t)recomp::rom_base;
-+    for (const auto& o : ovls) {
-+        if (rom_off == o.rom) {
-+            fprintf(stderr, "[wcw][ovl] map overlay rom=0x%06X -> 0x80090000 size=0x%X\n", o.rom, o.size);
-+            unload_overlays(0x80090000, 0x00056000); // cover the largest overlay
-+            load_overlays(o.rom, 0x80090000, o.size);
-+            return;
-+        }
++    const auto& vrom_map = recomp::overlays::get_vrom_to_section_map();
++    if (vrom_map.find(rom_off) != vrom_map.end()) {
++        fprintf(stderr, "[wcw][ovl] map overlay rom=0x%06X -> 0x80090000\n", rom_off);
++        unload_overlays(0x80090000, 0x00060000); // cover the largest overlay of either game
++        load_overlays(rom_off, 0x80090000, 0x00060000);
++        return;
 +    }
 +    fprintf(stderr, "[wcw][ovl] DMA to 0x80090000 from unrecognized rom 0x%X\n", rom_off);
 +}
