@@ -566,10 +566,26 @@ index a870166..bc0aec8 100644
              const bool interlacedStep = status.serrate && (vCurrentLine & 0x1);
              const uint32_t rowBytes = width * (1U << (siz - 1));
 diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
-index 5a331aa..752bba6 100644
+index 5a331aa..24be9f9 100644
 --- a/src/hle/rt64_workload_queue.cpp
 +++ b/src/hle/rt64_workload_queue.cpp
-@@ -452,6 +452,24 @@ namespace RT64 {
+@@ -131,7 +131,14 @@ namespace RT64 {
+         const uint32_t referenceHeight = (viFbSize[1] > 0) ? std::max(viFbSize[1], MinimumReferenceHeight) : 240;
+ 
+         // Compute the aspect ratio to be used for the frame.
+-        workloadConfig.aspectRatioSource = (viFbSize[1] > 0) ? float(viFbSize[0]) / float(viFbSize[1]) : (4.0f / 3.0f);
++        // [wcw fix] Use the DISPLAYED aspect, not the framebuffer's pixel ratio. The VI
++        // always scans the framebuffer out into a 4:3 TV frame regardless of its pixel
++        // dimensions; WCW's match mode renders an anamorphic 480x240 hi-res fb whose
++        // pixel ratio (2:1) made Original stretch on present and collapsed Expand's
++        // widening (target = max(window, 2.0) = source, scale 1). The full-screen-
++        // scissor similarity test in the framebuffer renderer now derives the pixel
++        // ratio from the fb dimensions instead of this value.
++        workloadConfig.aspectRatioSource = 4.0f / 3.0f;
+ 
+         const auto ratioMode = ext.sharedResources->userConfig.aspectRatio;
+         switch (ratioMode) {
+@@ -452,6 +459,24 @@ namespace RT64 {
                      if (colorFb != nullptr) {
                          fbKey.colorTargetKey = RenderTargetKey(colorFb->addressStart, colorFb->width, colorFb->siz, Framebuffer::Type::Color);
                          colorTarget = &targetManager.get(fbKey.colorTargetKey);
@@ -594,7 +610,7 @@ index 5a331aa..752bba6 100644
                      }
                      else {
                          colorTarget = nullptr;
-@@ -842,6 +860,32 @@ namespace RT64 {
+@@ -842,6 +867,32 @@ namespace RT64 {
              framebufferRenderer->waitForUploaders();
              ext.workloadGraphicsWorker->execute();
              ext.workloadGraphicsWorker->wait();
@@ -627,7 +643,7 @@ index 5a331aa..752bba6 100644
              workerMutex.unlock();
  
              // Update the GPU profiler with the results from the timestamps of the frame.
-@@ -904,6 +948,32 @@ namespace RT64 {
+@@ -904,6 +955,32 @@ namespace RT64 {
              if (processCursor >= 0) {
                  std::unique_lock<std::mutex> threadLock(threadMutex);
                  Workload &workload = workloads[processCursor];
@@ -660,7 +676,7 @@ index 5a331aa..752bba6 100644
                  ext.presentQueue->waitForPresentId(workload.presentId);
  
                  if (!threadsRunning) {
-@@ -986,7 +1056,10 @@ namespace RT64 {
+@@ -986,7 +1063,10 @@ namespace RT64 {
                      matchingProfiler.log();
  
                      const bool displayRateAboveOriginal = (workload.viOriginalRate > 0) && (workloadConfig.targetRate > workload.viOriginalRate);
@@ -673,7 +689,7 @@ index 5a331aa..752bba6 100644
                      const bool resetTicks = !generateInterpolatedFrames || (originalRateForTicks != workload.viOriginalRate) || (displayRateForTicks != workloadConfig.targetRate) || !displayRateAboveOriginal;
                      if (resetTicks) {
 diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
-index 9fae0d4..f1f0ab1 100644
+index 9fae0d4..f89b948 100644
 --- a/src/render/rt64_framebuffer_renderer.cpp
 +++ b/src/render/rt64_framebuffer_renderer.cpp
 @@ -484,6 +484,10 @@ namespace RT64 {
@@ -716,7 +732,21 @@ index 9fae0d4..f1f0ab1 100644
                  drawCallTriangles(drawCall);
  
                  // Simulate dither noise.
-@@ -1607,6 +1626,8 @@ namespace RT64 {
+@@ -1433,7 +1452,12 @@ namespace RT64 {
+ 
+         const float SimilarityPercentage = 0.1f; // TODO: Make more strict once VI ratios are in.
+         const float scissorRatio = static_cast<float>(fbPair.scissorRect.width(false, true)) / static_cast<float>(fbPair.scissorRect.height(false, true));
+-        const bool adjustRatio = (abs((scissorRatio / p.aspectRatioSource) - 1.0f) < SimilarityPercentage);
++        // [wcw fix] Compare the scissor against the framebuffer's own pixel ratio, not
++        // p.aspectRatioSource (now the 4:3 display ratio). The scissor is in fb pixels,
++        // so "covers the whole screen" means it matches the fb's dimensions — identical
++        // for square-pixel games (320x240), required for WCW's anamorphic 480x240 fb.
++        const float fbPixelRatio = (p.fbHeight > 0) ? (static_cast<float>(p.fbWidth) / static_cast<float>(p.fbHeight)) : p.aspectRatioSource;
++        const bool adjustRatio = (abs((scissorRatio / fbPixelRatio) - 1.0f) < SimilarityPercentage);
+         const float aspectRatioScale = adjustRatio ? (p.aspectRatioTarget / p.aspectRatioSource) : 1.0f;
+         InstanceDrawCall instanceDrawCall;
+         interop::RenderIndices renderIndices;
+@@ -1607,6 +1631,8 @@ namespace RT64 {
                      {
                          triangles.shaderDesc = call.shaderDesc;
  
@@ -725,7 +755,7 @@ index 9fae0d4..f1f0ab1 100644
                          RasterShader *gpuShader = p.ubershadersOnly ? nullptr : p.rasterShaderCache->getGPUShader(call.shaderDesc);
                          if (gpuShader != nullptr) {
                              triangles.pipeline = gpuShader->pipeline.get();
-@@ -1618,6 +1639,11 @@ namespace RT64 {
+@@ -1618,6 +1644,11 @@ namespace RT64 {
                                  !copyMode && call.shaderDesc.otherMode.zUpd(),
                                  (call.shaderDesc.otherMode.cvgDst() == CVG_DST_WRAP) || (call.shaderDesc.otherMode.cvgDst() == CVG_DST_SAVE));
                          }
@@ -780,7 +810,7 @@ index 494d99e..d3d406a 100644
          }
  
 diff --git a/src/render/rt64_vi_renderer.cpp b/src/render/rt64_vi_renderer.cpp
-index b4ff4e9..4f608d7 100644
+index b4ff4e9..bb49493 100644
 --- a/src/render/rt64_vi_renderer.cpp
 +++ b/src/render/rt64_vi_renderer.cpp
 @@ -77,6 +77,15 @@ namespace RT64 {
@@ -799,3 +829,17 @@ index b4ff4e9..4f608d7 100644
  
          p.commandList->setPipeline(shader->pipeline.get());
          p.commandList->setGraphicsPipelineLayout(shader->pipelineLayout.get());
+@@ -100,7 +109,12 @@ namespace RT64 {
+         // on the screen. To work around that, the viewport the buffer will be drawn in will be expanded so only
+         // the region of interest is rendered. A scissor will cut it off correctly according to the coordinates
+         // specified by the VI.
+-        const hlslpp::float2 sdSize = removeBlackBorders ? hlslpp::float2(vi.fbSize()) : hlslpp::float2(320.0f, 240.0f);
++        // [wcw fix] The virtual SD TV is always a 4:3 frame. Deriving its size from the
++        // framebuffer's pixel dimensions gave a 2:1 "TV" for WCW's anamorphic 480x240
++        // hi-res fb, stretching the present and defeating pillarboxing in Original mode.
++        // Keep the fb's row count for scaling but force the 4:3 width.
++        const hlslpp::float2 fbSizeF = hlslpp::float2(vi.fbSize());
++        const hlslpp::float2 sdSize = removeBlackBorders ? hlslpp::float2(fbSizeF.y * (4.0f / 3.0f), fbSizeF.y) : hlslpp::float2(320.0f, 240.0f);
+         const hlslpp::float2 hdSize = computeHDSize(sdSize, resolutionScale, downsamplingScale);
+         const hlslpp::float2 windowSize = { float(swapChain->getWidth()), float(swapChain->getHeight()) };
+ 
