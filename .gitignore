@@ -73,6 +73,10 @@ disasm/undefined_syms_auto.txt
 Thumbs.db
 .DS_Store
 
+# Agent instructions + planning docs — local-only, never publish
+CLAUDE.md
+docs/*-plan.md
+
 # Claude Code local (per-machine) settings
 .claude/settings.local.json
 
