@@ -30,10 +30,73 @@ index 1194a96..432e1ab 100644
          rect.fixRectLR = true;
          f3dex.forceBranch = false;
 diff --git a/src/gbi/rt64_gbi.cpp b/src/gbi/rt64_gbi.cpp
-index 7006549..e98169d 100644
+index 7006549..8c0e275 100644
 --- a/src/gbi/rt64_gbi.cpp
 +++ b/src/gbi/rt64_gbi.cpp
-@@ -459,6 +459,10 @@ namespace RT64 {
+@@ -160,7 +160,13 @@ namespace RT64 {
+     // 
+     //                  Length      Hash                    Known instances               
+     //     
+-    static std::array<GBISegment, 94> textSegments = {
++    static std::array<GBISegment, 96> textSegments = {
++            // [wcw2k] WM2000's "F3DLX.Rej xbus 2.08" (AKI 1999): bytes past 0x1000 of the
++            // text are VOLATILE at runtime (hashed differently seconds apart mid-run —
++            // self-modified or yield-state spill), so match on the stable 0x1000-byte
++            // prefix. (The tables are std::sort'ed by length at init, so cumulative
++            // hashing hits the 0x1000 checkpoint first regardless of position here.)
++            GBISegment{ 0x1000,     0x748B4244A299527EULL,  { &F3DLX2_XBUS_2_08_REJ } },
+             GBISegment{ 0x1408,     0x9C0926F5E466BE70ULL,  { &F3D_SDK_E } }, // Needs confirmation.
+             GBISegment{ 0x1400,     0x34EAA6E921BCF1B2ULL,  { &F3D_SDK_F, &F3D_SDK_UNKNOWN_G, &F3D_SDK_UNKNOWN_H } }, // Needs confirmation.
+             GBISegment{ 0x1408,     0x3E05E9BBE814C700ULL,  { &F3D_FIFO_SDK_E } }, // Needs confirmation.
+@@ -219,6 +225,11 @@ namespace RT64 {
+             GBISegment{ 0x13A0,     0x0A4F40D3A58CB674ULL,  { &F3DEX2_XBUS_2_07 } }, // Needs confirmation.
+             GBISegment{ 0x1198,     0x3B23DFF75831391CULL,  { &F3DLX2_XBUS_2_07_REJ } }, // Needs confirmation.
+             GBISegment{ 0x13A0,     0xA7B96A2FC8C94E60ULL,  { &F3DEX2_XBUS_2_08 } }, // Needs confirmation.
++            // [wcw2k] WWF WrestleMania 2000's AKI builds (Yasumoto 1999): "F3DEX xbus 2.08"
++            // (3D) and "F3DLX.Rej xbus 2.08" (menus). Text differs from the stock builds,
++            // but the 3D ucode's DATA hashes identically to F3DEX2_XBUS_2_08's 0x420-byte
++            // entry below — same GBI command set for both, per family.
++            GBISegment{ 0x13A0,     0x60BF253FA40991C0ULL,  { &F3DEX2_XBUS_2_08 } },
+             GBISegment{ 0x1198,     0xD5E0AABE069BA75CULL,  { &F3DLX2_XBUS_2_08_REJ } }, // Needs confirmation.
+             GBISegment{ 0x1370,     0xCFCF197526613F82ULL,  { &F3DEX2_NON_FIFO_2_03 } }, // Needs confirmation.
+             GBISegment{ 0x1390,     0xDF624201BC21895EULL,  { &F3DEX2_NON_FIFO_2_04 } }, // Needs confirmation.
+@@ -257,7 +268,7 @@ namespace RT64 {
+             GBISegment{ 0x10B0,     0xE8028E4BC6529E6EULL,  { &ZSORTP_0_33 } }, // Needs confirmation.
+     };
+ 
+-    static std::array<GBISegment, 105> dataSegments = {
++    static std::array<GBISegment, 106> dataSegments = {
+             GBISegment{ 0x800,      0xEEB10D73400213B3ULL,  { &F3D_SDK_E } }, // Needs confirmation.
+             GBISegment{ 0x800,      0x49651E384B48F694ULL,  { &F3D_SDK_F } }, // Needs confirmation.
+             GBISegment{ 0x800,      0x1A736198F90E81C5ULL,  { &F3D_SDK_UNKNOWN_G } }, // Needs confirmation.
+@@ -326,6 +337,8 @@ namespace RT64 {
+             GBISegment{ 0x420,      0x1D0B2B02F7C09D84ULL,  { &F3DEX2_XBUS_2_07 } }, // Needs confirmation.
+             GBISegment{ 0x410,      0xCE0DAA8259433956ULL,  { &F3DLX2_XBUS_2_07_REJ } }, // Needs confirmation.
+             GBISegment{ 0x420,      0x5FB335C8CDF86F48ULL,  { &F3DEX2_XBUS_2_08 } }, // Needs confirmation.
++            // [wcw2k] WM2000's "F3DLX.Rej xbus 2.08" ucode data (see text-segment note).
++            GBISegment{ 0x420,      0xE49057B911FDCAFAULL,  { &F3DLX2_XBUS_2_08_REJ } },
+             GBISegment{ 0x410,      0x2869DC3116DEA560ULL,  { &F3DLX2_XBUS_2_08_REJ } }, // Needs confirmation.
+             GBISegment{ 0x420,      0x38FF0FE9D7CFBD34ULL,  { &F3DEX2_NON_FIFO_2_03 } }, // Needs confirmation.
+             GBISegment{ 0x420,      0x2E3B70A49807BF89ULL,  { &F3DEX2_NON_FIFO_2_04 } }, // Needs confirmation.
+@@ -438,6 +451,17 @@ namespace RT64 {
+         if (textSegmentIndex < 0 || dataSegmentIndex < 0) {
+             fprintf(stderr, "Unable to find a matching GBI in the current database. This game is not supported in HLE.\n");
+             deduceGBIInformation(RDRAM, textAddress, dataAddress);
++            // [wcw2k] DIAGNOSTIC: print hashes at common segment sizes so an unknown ucode
++            // can be added to the database (WM2000 ships "F3DEX xbus 2.08", an AKI-era
++            // build absent from the tables).
++            for (uint32_t tlen : { 0x1000u, 0x13A0u, 0x1408u }) {
++                fprintf(stderr, "[wcw][gbi] texthash(len=0x%X)=0x%016" PRIX64 "ULL text=0x%X\n",
++                    tlen, XXH3_64bits(&RDRAM[textAddress], tlen), textAddress);
++            }
++            for (uint32_t dlen : { 0x420u, 0x800u }) {
++                fprintf(stderr, "[wcw][gbi] datahash(len=0x%X)=0x%016" PRIX64 "ULL data=0x%X\n",
++                    dlen, XXH3_64bits(&RDRAM[dataAddress], dlen), dataAddress);
++            }
+             return nullptr;
+         }
+ 
+@@ -459,6 +483,10 @@ namespace RT64 {
              return nullptr;
          }
  

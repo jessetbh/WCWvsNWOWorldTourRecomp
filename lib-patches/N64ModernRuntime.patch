@@ -24,11 +24,52 @@ index 716d48b..bbc5b5f 100644
      "${CMAKE_CURRENT_SOURCE_DIR}/src/sp.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/ultra_stubs.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/ultra_translation.cpp"
+diff --git a/librecomp/include/librecomp/overlays.hpp b/librecomp/include/librecomp/overlays.hpp
+index 35703bd..a39baeb 100644
+--- a/librecomp/include/librecomp/overlays.hpp
++++ b/librecomp/include/librecomp/overlays.hpp
+@@ -63,5 +63,9 @@ namespace recomp {
+ 
+ extern "C" void load_overlays(uint32_t rom, int32_t ram_addr, uint32_t size);
+ extern "C" void unload_overlays(int32_t ram_addr, uint32_t size);
++// [wcw2k] see overlays.cpp — boot-image-resident overlay registration + generalized
++// multi-slot overlay swap (WM2000).
++extern "C" void load_boot_resident_overlays(uint32_t boot_rom, int32_t boot_ram, uint32_t boot_size);
++extern "C" bool wcw_try_swap_overlay(uint32_t rom_off, int32_t ram_addr);
+ 
+ #endif
 diff --git a/librecomp/src/ai.cpp b/librecomp/src/ai.cpp
-index 0195f2b..e1fface 100644
+index 0195f2b..4e758b3 100644
 --- a/librecomp/src/ai.cpp
 +++ b/librecomp/src/ai.cpp
-@@ -16,12 +16,15 @@ extern "C" void osAiSetFrequency_recomp(uint8_t* rdram, recomp_context* ctx) {
+@@ -6,24 +6,48 @@
+ 
+ #define VI_NTSC_CLOCK 48681812
+ 
++// [wcw2k] Hardware-accurate osAiSetFrequency return, opt-in per project (default off =
++// WT/Revenge unchanged). On console the AI quantizes the rate through the DAC divisor
++// and osAiSetFrequency RETURNS the actual rate (28800 -> dacRate 1690 -> 28805); AKI
++// audio init sizes its heap allocations from that return value. Returning the requested
++// rate unquantized shrinks WM2000's audio DMA buffers by a few samples each, shifting
++// every subsequent audio-heap allocation ~0xA0-0x140 LOW — low enough that the audio
++// manager's scheduler-client node lands INSIDE thread 6's linker-fixed boot stack
++// (top 0x800839A0). The scheduler then writes message values over the stack slot
++// where the transition chain saved s0 -> thread 6 restores s0=1 -> deterministic crash
++// in func_800222D8 entering gameplay (boots 48-54, session-5 part 5).
++bool wcw_ai_accurate_freq = false;
++
+ extern "C" void osAiSetFrequency_recomp(uint8_t* rdram, recomp_context* ctx) {
+     uint32_t freq = ctx->r4;
+-    // This makes actual audio frequency more accurate to console, but may not be desirable
+-    //uint32_t dacRate = (uint32_t)(((float)VI_NTSC_CLOCK / freq) + 0.5f);
+-    //freq = VI_NTSC_CLOCK / dacRate;
++    if (wcw_ai_accurate_freq) {
++        uint32_t dacRate = (uint32_t)(((float)VI_NTSC_CLOCK / freq) + 0.5f);
++        freq = VI_NTSC_CLOCK / dacRate;
++        fprintf(stderr, "[wcw][ai] osAiSetFrequency(%u) -> %u (dacRate %u)\n", (unsigned)ctx->r4, freq, dacRate);
++    }
+     ctx->r2 = freq;
+     ultramodern::set_audio_frequency(freq);
  }
  
  extern "C" void osAiSetNextBuffer_recomp(uint8_t* rdram, recomp_context* ctx) {
@@ -44,6 +85,16 @@ index 0195f2b..e1fface 100644
  }
  
  extern "C" void osAiGetStatus_recomp(uint8_t* rdram, recomp_context* ctx) {
+-    ctx->r2 = 0x00000000; // Pretend the audio DMAs finish instantly
++    // [wcw2k] Report AI_STATUS_FULL|AI_STATUS_DMA_BUSY while the host queue is backlogged
++    // so the game's own FULL-wait loop paces generation (it blocks on its frame message, so
++    // this never spins). Previously hardcoded 0 ("DMAs finish instantly"), which disabled
++    // WM2000's only audio throttle.
++    bool full = ultramodern::is_audio_backlogged();
++    ctx->r2 = full ? 0xC0000000 : 0x00000000;
++    { static int n = 0, fulls = 0; if (full) fulls++;
++      if ((n++ % 4096) == 0) fprintf(stderr, "[wcw][ai] osAiGetStatus #%d fulls=%d\n", n - 1, fulls); }
+ }
 diff --git a/librecomp/src/math_routines.cpp b/librecomp/src/math_routines.cpp
 index 4d6a01d..9e2dc24 100644
 --- a/librecomp/src/math_routines.cpp
@@ -85,7 +136,7 @@ index 4d6a01d..9e2dc24 100644
 +    ctx->f0.d = ret;
 +}
 diff --git a/librecomp/src/overlays.cpp b/librecomp/src/overlays.cpp
-index 8c8e5d1..e95ff7d 100644
+index 8c8e5d1..ecc7c0e 100644
 --- a/librecomp/src/overlays.cpp
 +++ b/librecomp/src/overlays.cpp
 @@ -200,7 +200,19 @@ extern "C" void load_overlays(uint32_t rom, int32_t ram_addr, uint32_t size) {
@@ -109,8 +160,86 @@ index 8c8e5d1..e95ff7d 100644
      }
  }
  
+@@ -238,6 +250,77 @@ extern "C" void load_overlay_by_id(uint32_t id, uint32_t ram_addr) {
+     }
+ }
+ 
++// [wcw2k] WM2000 support (see Wm2kRecomp CLAUDE.md; upstream to the jessetbh fork's wcw
++// branch alongside the [wcw fix] set).
++//
++// Boot-resident overlays: WM2000 stores its first two swap-overlays (rom 0x4C160/0x73390)
++// INSIDE the IPL3 1MB boot image and block-copies them to their link addresses with the
++// CPU instead of PI DMA, so the pi.cpp swap hook never sees a load. After the boot-window
++// load, register every section that (a) lies fully inside the boot window, (b) does NOT
++// land at its own address contiguously (those are fixed-segment splits the normal
++// load_overlays call already handled), and (c) doesn't overlap another such candidate
++// (Revenge's two overlays both live in-window at the SAME address — that game DMA-swaps
++// them properly, so they must stay unregistered until the swap hook fires; this filter
++// keeps WT/Revenge behavior byte-identical).
++extern "C" void load_boot_resident_overlays(uint32_t boot_rom, int32_t boot_ram, uint32_t boot_size) {
++    std::vector<size_t> cands;
++    for (size_t i = 0; i < sections_info.num_code_sections; i++) {
++        const SectionTableEntry& s = sections_info.code_sections[i];
++        if (s.rom_addr < boot_rom || s.rom_addr + s.size > boot_rom + boot_size) continue;
++        if ((int32_t)(s.rom_addr - boot_rom) + boot_ram == s.ram_addr) continue;
++        cands.push_back(i);
++    }
++    for (size_t i : cands) {
++        const SectionTableEntry& s = sections_info.code_sections[i];
++        bool conflict = false;
++        for (size_t j : cands) {
++            if (j == i) continue;
++            const SectionTableEntry& o = sections_info.code_sections[j];
++            if (s.ram_addr < o.ram_addr + (int32_t)o.size && o.ram_addr < s.ram_addr + (int32_t)s.size) {
++                conflict = true; break;
++            }
++        }
++        if (conflict) continue;
++        fprintf(stderr, "[wcw][ovl] boot-resident overlay rom=0x%06X registered at 0x%08X\n",
++            s.rom_addr, (uint32_t)s.ram_addr);
++        load_overlay(i, s.ram_addr);
++    }
++}
++
++// [wcw2k] Generalized overlay swap for multi-slot AKI games (WM2000: slots 0x800E1B90 and
++// 0x8011C900, four overlays, one of which spans both slots). If rom_off names a registered
++// code section whose link address equals the DMA destination, swap it in: fully unload
++// every loaded section overlapping the incoming range (unload_overlays' partial-overlap
++// guard is correct for its other callers, but a swap legitimately clobbers a larger
++// resident section), then load. Replaces pi.cpp's hardcoded dest==0x80090000 check;
++// WT/Revenge behavior is unchanged (their swap sections' ram_addr IS 0x80090000).
++extern "C" bool wcw_try_swap_overlay(uint32_t rom_off, int32_t ram_addr) {
++    auto find_it = code_sections_by_rom.find(rom_off);
++    if (find_it == code_sections_by_rom.end()) {
++        return false;
++    }
++    size_t idx = find_it->second;
++    const SectionTableEntry& s = sections_info.code_sections[idx];
++    if (s.ram_addr != ram_addr) {
++        return false;
++    }
++    for (auto it = loaded_sections.begin(); it != loaded_sections.end();) {
++        const SectionTableEntry& ls = sections_info.code_sections[it->section_table_index];
++        if (ram_addr < it->loaded_ram_addr + (int32_t)ls.size && it->loaded_ram_addr < ram_addr + (int32_t)s.size) {
++            for (size_t fi = 0; fi < ls.num_funcs; fi++) {
++                func_map.erase(it->loaded_ram_addr + ls.funcs[fi].offset);
++            }
++            section_addresses[ls.index] = ls.ram_addr;
++            it = loaded_sections.erase(it);
++        }
++        else {
++            ++it;
++        }
++    }
++    load_overlay(idx, ram_addr);
++    return true;
++}
++
+ extern "C" void unload_overlays(int32_t ram_addr, uint32_t size) {
+     for (auto it = loaded_sections.begin(); it != loaded_sections.end();) {
+         const auto& section = sections_info.code_sections[it->section_table_index];
 diff --git a/librecomp/src/pi.cpp b/librecomp/src/pi.cpp
-index 62656ad..3be27e2 100644
+index 62656ad..8282706 100644
 --- a/librecomp/src/pi.cpp
 +++ b/librecomp/src/pi.cpp
 @@ -8,6 +8,7 @@
@@ -121,7 +250,7 @@ index 62656ad..3be27e2 100644
  #include <ultramodern/ultra64.h>
  #include <ultramodern/ultramodern.hpp>
  
-@@ -63,6 +64,18 @@ extern "C" void osCreatePiManager_recomp(uint8_t* rdram, recomp_context* ctx) {
+@@ -63,6 +64,27 @@ extern "C" void osCreatePiManager_recomp(uint8_t* rdram, recomp_context* ctx) {
  
  void recomp::do_rom_read(uint8_t* rdram, gpr ram_address, uint32_t physical_addr, size_t num_bytes) {
      // TODO use word copies when possible
@@ -136,11 +265,20 @@ index 62656ad..3be27e2 100644
 +        }
 +        n++;
 +        if (bad) { fprintf(stderr, "[wcw][rom_read] refusing out-of-range read\n"); fflush(stderr); return; }
++        // [wcw2k] DIAGNOSTIC: catch ovl_d loads regardless of DMA path (raw PI transfers
++        // bypass do_dma and thus the overlay swap hook + its logging).
++        // Range covers ovl_d text AND data (rom 0xD2720..0x144AA0): boot88's in-match rope
++        // corruption made the data-section stream (tables at vram 0x8014C640+) a suspect,
++        // and the old 0x13D1D0 (text-end) cutoff made those chunks invisible in the log.
++        if ((off >= 0xD2720 && off < 0x144AA0) || (uint32_t)ram_address == 0xFFFFFFFF800E1B90ull || (uint32_t)ram_address == 0x800E1B90u) {
++            fprintf(stderr, "[wcw2k][ovl?] rom_read rom=0x%zX -> ram=0x%08X len=0x%zX\n",
++                off, (uint32_t)ram_address, num_bytes);
++        }
 +    }
  
      // TODO handle misaligned DMA
      assert((physical_addr & 0x1) == 0 && "Only PI DMA from aligned ROM addresses is currently supported");
-@@ -195,6 +208,15 @@ void save_read(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t coun
+@@ -195,6 +217,15 @@ void save_read(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t coun
      }
  }
  
@@ -156,7 +294,7 @@ index 62656ad..3be27e2 100644
  void save_clear(uint32_t start, uint32_t size, char value) {
      assert(start + size < save_context.save_buffer.size());
  
-@@ -266,6 +288,31 @@ void ultramodern::join_saving_thread() {
+@@ -266,6 +297,39 @@ void ultramodern::join_saving_thread() {
      }
  }
  
@@ -170,25 +308,33 @@ index 62656ad..3be27e2 100644
 +// unloading the previously-mapped one first. The 0x60000 window bounds section selection
 +// (load_overlays only loads sections fully inside it, and load_overlay uses the section's own
 +// size); it covers either game's largest overlay without reaching the next section.
++// [wcw2k] Generalized: instead of hardcoding the 0x80090000 slot, any DMA whose source rom
++// offset names a registered code section AND whose destination equals that section's link
++// address is treated as an overlay swap (wcw_try_swap_overlay in overlays.cpp fully unloads
++// whatever the incoming section clobbers, then loads it). Handles WM2000's two swap slots
++// (0x800E1B90 / 0x8011C900, four overlays, one spanning both) with identical behavior for
++// WT/Revenge (their swap sections' ram_addr IS 0x80090000).
 +static void wcw_maybe_load_overlay(gpr rdram_address, uint32_t physical_addr) {
-+    if ((uint32_t)rdram_address != 0x80090000) {
-+        return;
-+    }
 +    uint32_t rom_off = physical_addr - (uint32_t)recomp::rom_base;
-+    const auto& vrom_map = recomp::overlays::get_vrom_to_section_map();
-+    if (vrom_map.find(rom_off) != vrom_map.end()) {
-+        fprintf(stderr, "[wcw][ovl] map overlay rom=0x%06X -> 0x80090000\n", rom_off);
-+        unload_overlays(0x80090000, 0x00060000); // cover the largest overlay of either game
-+        load_overlays(rom_off, 0x80090000, 0x00060000);
-+        return;
++    if (wcw_try_swap_overlay(rom_off, (int32_t)(uint32_t)rdram_address)) {
++        fprintf(stderr, "[wcw][ovl] map overlay rom=0x%06X -> 0x%08X\n", rom_off, (uint32_t)rdram_address);
 +    }
-+    fprintf(stderr, "[wcw][ovl] DMA to 0x80090000 from unrecognized rom 0x%X\n", rom_off);
++    // [wcw2k] DIAGNOSTIC: WM2000 boot77 crashed executing ovl_d-only code with ovl_d never
++    // mapped — either its load uses a rom offset/destination the swap hook doesn't match, or
++    // the load never happens. Log every DMA that touches the swap slots or the ovl_d image.
++    else {
++        uint32_t dst = (uint32_t)rdram_address;
++        if (dst == 0x800E1B90u || dst == 0x8011C900u ||
++            (rom_off >= 0xD2720u && rom_off < 0x13D1D0u)) {
++            fprintf(stderr, "[wcw2k][ovl?] unmatched DMA rom=0x%06X -> 0x%08X\n", rom_off, dst);
++        }
++    }
 +}
 +
  void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_addr, uint32_t size, uint32_t direction) {
      // TODO asynchronous transfer
      // TODO implement unaligned DMA correctly
-@@ -273,6 +320,7 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
+@@ -273,6 +337,7 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
          if (physical_addr >= recomp::rom_base) {
              // read cart rom
              recomp::do_rom_read(rdram, rdram_address, physical_addr, size);
@@ -196,12 +342,28 @@ index 62656ad..3be27e2 100644
  
              // Send a message to the mq to indicate that the transfer completed
              ultramodern::enqueue_external_message(mq, 0, false, true);
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index 1200f77..34c8acb 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -498,6 +498,11 @@ void init(uint8_t* rdram, recomp_context* ctx, gpr entrypoint) {
+     // Load overlays in the first 1MB
+     load_overlays(0x1000, (int32_t)entrypoint, 1024 * 1024);
+ 
++    // [wcw2k] Register boot-resident swap overlays at their own link addresses (WM2000
++    // block-copies them out of the boot image with the CPU — no DMA to hook). No-op for
++    // WT/Revenge; see overlays.cpp.
++    load_boot_resident_overlays(0x1000, (int32_t)entrypoint, 1024 * 1024);
++
+     // Initial 1MB DMA (rom address 0x1000 = physical address 0x10001000)
+     recomp::do_rom_read(rdram, entrypoint, 0x10001000, 0x100000);
+ 
 diff --git a/librecomp/src/si.cpp b/librecomp/src/si.cpp
 new file mode 100644
-index 0000000..0503b73
+index 0000000..1adf436
 --- /dev/null
 +++ b/librecomp/src/si.cpp
-@@ -0,0 +1,294 @@
+@@ -0,0 +1,375 @@
 +// [wcw] SI / PIF (joybus) emulation for games that use the RAW libultra SI primitives
 +// (__osSiRawStartDma / __osSiDeviceBusy) instead of the high-level osCont* API.
 +//
@@ -225,6 +387,7 @@ index 0000000..0503b73
 +#include <cstring>
 +
 +#include "helpers.hpp"
++#include "librecomp/files.hpp"
 +
 +#define MAXCONTROLLERS 4
 +
@@ -238,6 +401,83 @@ index 0000000..0503b73
 +// save buffer / save file (saves/<game id>.bin) with async persistence + backup for free.
 +void save_write_ptr(const void* in, uint32_t offset, uint32_t count);
 +void save_read_ptr(void* out, uint32_t offset, uint32_t count);
++
++// [wcw2k] Separate Controller Pak backing. Sharing the save buffer is only safe when the
++// game never writes cart SRAM (WCW/Revenge: pak-only saves). WM2000 saves to cart SRAM
++// AND uses the pak (created wrestlers) — sharing would let the first pak write corrupt the
++// cart save. Projects where both coexist set this true (before boot); the pak then lives
++// in its own 32 KB image persisted next to the save file as <save name>.pak.bin with the
++// same atomic backup scheme. Default false keeps WT/Revenge byte-identical.
++bool wcw_pak_separate_backing = false;
++static uint8_t wcw2k_pak_buffer[0x8000];
++static bool wcw2k_pak_loaded = false;
++static bool wcw2k_pak_dirty = false;
++
++static std::filesystem::path wcw2k_pak_file_path() {
++    std::filesystem::path p = ultramodern::get_save_file_path();
++    p.replace_extension(".pak.bin");
++    return p;
++}
++
++static void wcw2k_pak_ensure_loaded() {
++    if (wcw2k_pak_loaded) { return; }
++    wcw2k_pak_loaded = true;
++    std::ifstream f = recomp::open_input_file_with_backup(wcw2k_pak_file_path(), std::ios_base::binary);
++    if (f.good()) {
++        f.read(reinterpret_cast<char*>(wcw2k_pak_buffer), sizeof(wcw2k_pak_buffer));
++        fprintf(stderr, "[wcw2k][pak] loaded pak image (%lld bytes)\n", (long long)f.gcount());
++    }
++    else {
++        fprintf(stderr, "[wcw2k][pak] no pak image yet - starting blank\n");
++    }
++}
++
++// Pak data-region accessors: route to the dedicated image when separated, else to the
++// shared save buffer (legacy WT/Revenge behavior).
++static void wcw_pak_read(void* out, uint32_t offset, uint32_t count) {
++    if (wcw_pak_separate_backing) {
++        wcw2k_pak_ensure_loaded();
++        memcpy(out, wcw2k_pak_buffer + offset, count);
++    }
++    else {
++        save_read_ptr(out, offset, count);
++    }
++}
++
++static void wcw_pak_write(const void* in, uint32_t offset, uint32_t count) {
++    if (wcw_pak_separate_backing) {
++        wcw2k_pak_ensure_loaded();
++        memcpy(wcw2k_pak_buffer + offset, in, count);
++        wcw2k_pak_dirty = true;
++    }
++    else {
++        save_write_ptr(in, offset, count);
++    }
++}
++
++// Flush once per joybus block (not per 32-byte write): a game save is a burst of block
++// writes across a few frames, so this coalesces to a handful of 32 KB file writes.
++static void wcw2k_pak_flush() {
++    if (!wcw2k_pak_dirty) { return; }
++    wcw2k_pak_dirty = false;
++    std::filesystem::path path = wcw2k_pak_file_path();
++    bool failed = false;
++    {
++        std::ofstream f = recomp::open_output_file_with_backup(path, std::ios_base::binary);
++        if (f.good()) {
++            f.write(reinterpret_cast<const char*>(wcw2k_pak_buffer), sizeof(wcw2k_pak_buffer));
++        }
++        else {
++            failed = true;
++        }
++    }
++    if (!failed) {
++        failed = !recomp::finalize_output_file_with_backup(path);
++    }
++    if (failed) {
++        fprintf(stderr, "[wcw2k][pak] FAILED to write pak image %s\n", path.string().c_str());
++    }
++}
 +
 +// [wcw] Hybrid pak identity for rumble support. A real N64 has ONE pak slot per controller:
 +// WCW saves to the Controller Pak but also supports the Rumble Pak ("Insert a Rumble Pak
@@ -281,7 +521,7 @@ index 0000000..0503b73
 +
 +    uint8_t page[256];
 +    for (uint32_t off = 0; off < 0x8000; off += (uint32_t)sizeof(page)) {
-+        save_read_ptr(page, off, (uint32_t)sizeof(page));
++        wcw_pak_read(page, off, (uint32_t)sizeof(page));
 +        for (size_t b = 0; b < sizeof(page); b++) {
 +            if (page[b] != 0) { return; }        // save has data — leave it alone
 +        }
@@ -321,7 +561,7 @@ index 0000000..0503b73
 +    inode[1] = csum;
 +    memcpy(&pages[0x200], inode, 256);
 +
-+    save_write_ptr(pages, 0, (uint32_t)sizeof(pages));
++    wcw_pak_write(pages, 0, (uint32_t)sizeof(pages));
 +    fprintf(stderr, "[wcw][pak] fresh save image - formatted empty Controller Pak filesystem\n");
 +}
 +
@@ -414,7 +654,7 @@ index 0000000..0503b73
 +            uint32_t offset = addr & 0xFFE0u;
 +            if (offset < 0x8000) {
 +                wcw_pak_ensure_formatted();
-+                save_read_ptr(res, offset, 32);          // pak RAM <- save buffer
++                wcw_pak_read(res, offset, 32);           // pak RAM <- pak backing
 +            }
 +            else {
 +                // Bank/ID region: answer with the current pak identity — 0x80s is the Rumble
@@ -434,7 +674,7 @@ index 0000000..0503b73
 +            const uint8_t* data = &pif_ram[i + 5];
 +            if (offset < 0x8000) {
 +                wcw_pak_ensure_formatted();              // format first so the game's write wins
-+                save_write_ptr(data, offset, 32);        // persists asynchronously (librecomp)
++                wcw_pak_write(data, offset, 32);         // persists on block completion (below)
 +            }
 +            else if (offset >= 0xC000) {
 +                // Rumble Pak motor command: a block of 0x01s starts the motor, 0x00s stops it.
@@ -471,6 +711,9 @@ index 0000000..0503b73
 +        i += 2 + t + rx;
 +        channel++;
 +    }
++
++    // [wcw2k] Persist any pak writes this block produced (no-op unless separated + dirty).
++    wcw2k_pak_flush();
 +}
 +
 +extern "C" void __osSiRawStartDma_recomp(uint8_t* rdram, recomp_context* ctx) {
@@ -548,11 +791,44 @@ index 1dab1b8..8fb216d 100644
      }
  }
  
+diff --git a/ultramodern/include/ultramodern/ultramodern.hpp b/ultramodern/include/ultramodern/ultramodern.hpp
+index 3b28af3..4663452 100644
+--- a/ultramodern/include/ultramodern/ultramodern.hpp
++++ b/ultramodern/include/ultramodern/ultramodern.hpp
+@@ -57,6 +57,15 @@ void wait_for_external_message(RDRAM_ARG1);
+ void wait_for_external_message_timed(RDRAM_ARG1, u32 millis);
+ 
+ // Thread scheduling.
++// [wcw2k] repair a game-wiped TCB (context/pri/id) from the authoritative host-side
++// record before any raw rdram read of its fields; see threads.cpp.
++UltraThreadContext* wcw2k_repair_thread(RDRAM_ARG PTR(OSThread) t);
++// [wcw2k] running-queue entry timestamp for the anti-starvation valve (threads.cpp);
++// called by thread_queue_insert on running-queue inserts.
++void wcw2k_note_thread_queued(PTR(OSThread) t);
++// [wcw2k] true while t is inside its post-valve boost window (check_running_queue
++// skips priority preemption for it); see threads.cpp.
++bool wcw2k_thread_boosted(PTR(OSThread) t);
+ void check_running_queue(RDRAM_ARG1);
+ void run_next_thread_and_wait(RDRAM_ARG1);
+ void resume_thread_and_wait(RDRAM_ARG OSThread* t);
+@@ -99,6 +108,12 @@ void init_audio();
+ void set_audio_frequency(uint32_t freq);
+ void queue_audio_buffer(RDRAM_ARG PTR(s16) audio_data, uint32_t byte_count);
+ uint32_t get_remaining_audio_bytes();
++// [wcw2k] True when the host audio queue holds more than ~8 VIs of samples. Used by
++// osAiGetStatus to model the AI FIFO-full backpressure that paces AKI audio drivers
++// (WM2000's audio manager loops on `osAiGetStatus() & AI_STATUS_FULL` before generating;
++// without this it over-produces one fixed burst per frame message — unbounded queue
++// growth in healthy runs, 500 tasks/s free-run in message-clumped unattended sessions).
++bool is_audio_backlogged();
+ 
+ struct audio_callbacks_t {
+     using queue_samples_t = void(int16_t*, size_t);
 diff --git a/ultramodern/src/audio.cpp b/ultramodern/src/audio.cpp
-index 3198be0..31ee871 100644
+index 3198be0..966711a 100644
 --- a/ultramodern/src/audio.cpp
 +++ b/ultramodern/src/audio.cpp
-@@ -38,7 +38,14 @@ void ultramodern::queue_audio_buffer(RDRAM_ARG PTR(int16_t) audio_data_, uint32_
+@@ -38,7 +38,28 @@ void ultramodern::queue_audio_buffer(RDRAM_ARG PTR(int16_t) audio_data_, uint32_
  // For SDL2
  //uint32_t buffer_offset_frames = 1;
  // For Godot
@@ -565,11 +841,25 @@ index 3198be0..31ee871 100644
 +// (~22/s measured) against SDL's chunked consumption. Under-report by ~6 VIs worth
 +// (~50ms @ 22050 Hz) so the game builds real queue depth. Costs ~50ms audio latency.
 +float buffer_offset_frames = 6.0f;
++
++// [wcw2k] AI backpressure model (see ultramodern.hpp). Threshold must sit ABOVE the
++// buffer_offset_frames under-report below (6 VIs), so drivers that pace themselves by
++// osAiGetLength (WCW/Revenge) still build their ~6-VI depth before FULL ever asserts —
++// their behavior is unchanged. Drivers that pace by AI_STATUS_FULL (WM2000) bound the
++// host queue at ~8 VIs (~130ms) instead of growing it forever.
++bool ultramodern::is_audio_backlogged() {
++    if (audio_callbacks.get_frames_remaining == nullptr) {
++        return false;
++    }
++    uint32_t buffered_frames = (uint32_t)audio_callbacks.get_frames_remaining();
++    uint32_t frames_per_vi = sample_rate / 60;
++    return buffered_frames > 8 * frames_per_vi;
++}
  
  // If there's ever any audio popping, check here first. Some games are very sensitive to
  // the remaining sample count and reporting a number that's too high here can lead to issues.
 diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
-index 090cc42..56ab0fe 100644
+index 090cc42..bfe867b 100644
 --- a/ultramodern/src/events.cpp
 +++ b/ultramodern/src/events.cpp
 @@ -29,6 +29,7 @@ struct SpTaskAction {
@@ -767,7 +1057,50 @@ index 090cc42..56ab0fe 100644
      ultramodern::enqueue_external_message(events_context.dp.mq, events_context.dp.msg, false, true);
  }
  
-@@ -355,8 +463,35 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+@@ -283,11 +391,42 @@ void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_r
+             return;
+         }
+ 
++        // [wcw2k] DIAGNOSTIC (WCW2K_TASKWATCH=1): WM2000's corruption family (TCB wipes,
++        // music-slot garbage, thread-6 stack slots — float debris) lives in the audio
++        // heap around 0x80080000-0x80084000. The RSP task thread runs CONCURRENTLY with
++        // the cooperative game threads, so scheduler-touch watchers mis-attribute its
++        // writes. Snapshot the hot windows around each task run to convict or acquit
++        // the recompiled audio ucode directly.
++        static const bool taskwatch = getenv("WCW2K_TASKWATCH") != nullptr;
++        static uint32_t snap[0x60 / 4];
++        static uint32_t tasknum = 0;
++        constexpr uint32_t tcb_off = 0x807C0, frame_off = 0x83900;
++        if (taskwatch) {
++            memcpy(snap, rdram + tcb_off, 0x30);
++            memcpy(snap + 0x30 / 4, rdram + frame_off, 0x30);
++        }
++        tasknum++;
++
+         if (!ultramodern::rsp::run_task(PASS_RDRAM task)) {
+             fprintf(stderr, "Failed to execute task type: %" PRIu32 "\n", task->t.type);
+             ULTRAMODERN_QUICK_EXIT();
+         }
+ 
++        if (taskwatch) {
++            const uint32_t* now_tcb = (const uint32_t*)(rdram + tcb_off);
++            const uint32_t* now_frm = (const uint32_t*)(rdram + frame_off);
++            for (uint32_t i = 0; i < 0x30 / 4; i++) {
++                if (now_tcb[i] != snap[i]) {
++                    fprintf(stderr, "[wcw2k][taskwatch] task#%u type=%u CHANGED 0x%08X: %08X -> %08X\n",
++                        tasknum, (unsigned)task->t.type, 0x80000000u + tcb_off + i * 4, snap[i], now_tcb[i]);
++                }
++                if (now_frm[i] != snap[0x30 / 4 + i]) {
++                    fprintf(stderr, "[wcw2k][taskwatch] task#%u type=%u CHANGED 0x%08X: %08X -> %08X\n",
++                        tasknum, (unsigned)task->t.type, 0x80000000u + frame_off + i * 4, snap[0x30 / 4 + i], now_frm[i]);
++                }
++            }
++        }
++
+         // Tell the game that the RSP has completed
+         sp_complete();
+     }
+@@ -355,8 +494,35 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
  
      while (!exited) {
          // Try to pull an action from the queue
@@ -805,7 +1138,7 @@ index 090cc42..56ab0fe 100644
              // Determine the action type and act on it
              if (const auto* task_action = std::get_if<SpTaskAction>(&action)) {
                  // Tell the game that the RSP completed instantly. This will allow it to queue other task types, but it won't
-@@ -372,6 +507,18 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+@@ -372,6 +538,18 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                  [[maybe_unused]] auto renderer_start = std::chrono::high_resolution_clock::now();
                  renderer_context->send_dl(&task_action->task);
                  [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
@@ -824,7 +1157,7 @@ index 090cc42..56ab0fe 100644
  
                  dp_complete();
                  // TODO hook the parsed event up to the actual parsing point when a callback is added to RT64.
-@@ -380,6 +527,18 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+@@ -380,6 +558,18 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                  // printf("Renderer ProcessDList time: %d us\n", static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(renderer_end - renderer_start).count()));
              }
              else if (const auto* screen_update_action = std::get_if<ScreenUpdateAction>(&action)) {
@@ -843,7 +1176,7 @@ index 090cc42..56ab0fe 100644
                  events_context.vi.update_screen_regs = screen_update_action->regs;
                  renderer_context->update_screen();
                  display_refresh_rate = renderer_context->get_display_framerate();
-@@ -395,6 +554,7 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+@@ -395,6 +585,7 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
              else if (const auto* dummy_workload_action = std::get_if<DummyWorkloadAction>(&action)) {
                  renderer_context->send_dummy_workload(dummy_workload_action->fb_address);
              }
@@ -851,7 +1184,7 @@ index 090cc42..56ab0fe 100644
          }
      }
  
-@@ -454,8 +614,29 @@ void set_dummy_vi(bool odd) {
+@@ -454,8 +645,29 @@ void set_dummy_vi(bool odd) {
      }
  }
  
@@ -913,7 +1246,7 @@ index a170407..07b6997 100644
      ultramodern::send_si_message();
  
 diff --git a/ultramodern/src/mesgqueue.cpp b/ultramodern/src/mesgqueue.cpp
-index 961de3d..9e129e9 100644
+index 961de3d..abeab95 100644
 --- a/ultramodern/src/mesgqueue.cpp
 +++ b/ultramodern/src/mesgqueue.cpp
 @@ -1,4 +1,12 @@
@@ -929,7 +1262,7 @@ index 961de3d..9e129e9 100644
  
  #include "blockingconcurrentqueue.h"
  
-@@ -10,34 +18,148 @@ struct QueuedMessage {
+@@ -10,34 +18,173 @@ struct QueuedMessage {
      OSMesg mesg;
      bool jam;
      bool requeue_if_blocked;
@@ -982,6 +1315,19 @@ index 961de3d..9e129e9 100644
 +    }
 +}
 +
++// [wcw2k] DIAGNOSTIC: per-(mq,msg) histogram of successful EXTERNAL deliveries, printed on the
++// 1/s health line. Attributes an elevated del/s (e.g. WM2000's ~700/s vs ~190/s healthy — the
++// high-priority audio-chain saturation that starves the pri-8 game loop) to its source queue.
++static WcwRequeueSlot wcw2k_deliver_hist[8];
++static void wcw2k_note_delivery(PTR(OSMesgQueue) mq, OSMesg msg) {
++    uint64_t key = ((uint64_t)(uint32_t)mq << 32) | (uint32_t)msg;
++    for (auto& slot : wcw2k_deliver_hist) {
++        uint64_t cur = slot.key.load(std::memory_order_relaxed);
++        if (cur == key) { slot.count.fetch_add(1, std::memory_order_relaxed); return; }
++        if (cur == 0) { slot.key.store(key, std::memory_order_relaxed); slot.count.fetch_add(1, std::memory_order_relaxed); return; }
++    }
++}
++
  void dequeue_external_messages(RDRAM_ARG1) {
      QueuedMessage to_send;
      std::vector<QueuedMessage> requeued_messages{};
@@ -1001,6 +1347,7 @@ index 961de3d..9e129e9 100644
 +        }
 +        else {
 +            wcw_extmsg_delivered.fetch_add(1);
++            wcw2k_note_delivery(to_send.mq, to_send.mesg);
          }
      }
 +    wcw_requeues.fetch_add((int)requeued_messages.size());
@@ -1027,13 +1374,23 @@ index 961de3d..9e129e9 100644
 +    if (last_ms == 0) { last_ms = now; return; }
 +    if (now - last_ms < 1000) { return; }
 +    last_ms = now;
-+    char hist[128] = "";
++    char hist[256] = "";
 +    for (auto& slot : wcw_requeue_hist) {
 +        uint64_t key = slot.key.load(std::memory_order_relaxed);
 +        uint32_t cnt = slot.count.exchange(0, std::memory_order_relaxed);
 +        if (key != 0 && cnt != 0) {
 +            size_t len = strlen(hist);
 +            snprintf(hist + len, sizeof(hist) - len, " mq=0x%X/msg=0x%X:%u",
++                (uint32_t)(key >> 32), (uint32_t)key, cnt);
++        }
++    }
++    // [wcw2k] per-mq delivery attribution (see wcw2k_deliver_hist above).
++    for (auto& slot : wcw2k_deliver_hist) {
++        uint64_t key = slot.key.load(std::memory_order_relaxed);
++        uint32_t cnt = slot.count.exchange(0, std::memory_order_relaxed);
++        if (key != 0 && cnt != 0) {
++            size_t len = strlen(hist);
++            snprintf(hist + len, sizeof(hist) - len, " del[0x%X/0x%X]:%u",
 +                (uint32_t)(key >> 32), (uint32_t)key, cnt);
 +        }
 +    }
@@ -1060,6 +1417,7 @@ index 961de3d..9e129e9 100644
 +    do {
 +        if (do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false)) {
 +            delivered_any = true;
++            wcw2k_note_delivery(to_send.mq, to_send.mesg);
 +        }
 +        else if (to_send.requeue_if_blocked) {
 +            // [wcw fix] Same grace-window drop as dequeue_external_messages above.
@@ -1082,7 +1440,7 @@ index 961de3d..9e129e9 100644
      }
  }
  
-@@ -45,7 +167,13 @@ void ultramodern::wait_for_external_message_timed(RDRAM_ARG u32 millis) {
+@@ -45,13 +192,27 @@ void ultramodern::wait_for_external_message_timed(RDRAM_ARG u32 millis) {
      QueuedMessage to_send;
      if (external_messages.wait_dequeue_timed(to_send, std::chrono::milliseconds{millis})) {
          if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
@@ -1097,7 +1455,21 @@ index 961de3d..9e129e9 100644
          }
      }
  }
-@@ -72,22 +200,54 @@ s32 MQ_IS_FULL(OSMesgQueue* mq) {
+ 
+ extern "C" void osCreateMesgQueue(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg, s32 count) {
+     OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
++    // [wcw2k] DIAGNOSTIC: WM2000's post-attract crash traced to message values landing
++    // in thread 6's stack (func_800E2704's saved-s0 slot 0x80083900 receives retrace/
++    // task-done message values). Log any queue whose ring buffer lands in that region
++    // to identify the creator.
++    if ((uint32_t)msg >= 0x80080000u && (uint32_t)msg < 0x80084000u) {
++        fprintf(stderr, "[wcw2k][mq] osCreateMesgQueue mq=0x%08X BUFFER=0x%08X count=%d (in thread-6 TCB/stack region!)\n",
++            (uint32_t)mq_, (uint32_t)msg, count);
++    }
+     mq->blocked_on_recv = NULLPTR;
+     mq->blocked_on_send = NULLPTR;
+     mq->msgCount = count;
+@@ -72,22 +233,58 @@ s32 MQ_IS_FULL(OSMesgQueue* mq) {
      return MQ_GET_COUNT(mq) >= mq->msgCount;
  }
  
@@ -1133,6 +1505,10 @@ index 961de3d..9e129e9 100644
 +        // msg==0x29C check, letting blocking 0x29C sends post into a full queue. Restored.)
          while (MQ_IS_FULL(mq)) {
              debug_printf("[Message Queue] Thread %d is blocked on send\n", TO_PTR(OSThread, ultramodern::this_thread())->id);
++            // [wcw2k] WCW_BLOCK_LOG=1: trace where threads park (wedge diagnosis)
++            static const bool wcw_block_log = getenv("WCW_BLOCK_LOG") != nullptr;
++            if (wcw_block_log) fprintf(stderr, "[wcw2k][block] id=%d self=0x%08X SEND mq=0x%08X\n",
++                TO_PTR(OSThread, ultramodern::this_thread())->id, (uint32_t)ultramodern::this_thread(), (uint32_t)mq_);
              ultramodern::thread_queue_insert(PASS_RDRAM GET_MEMBER(OSMesgQueue, mq_, blocked_on_send), ultramodern::this_thread());
              ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
          }
@@ -1152,7 +1528,38 @@ index 961de3d..9e129e9 100644
      
      if (jam) {
          // Jams insert at the head of the message queue's buffer.
-@@ -156,9 +316,21 @@ extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags)
+@@ -122,6 +319,10 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
+         // Otherwise, yield this thread in a loop until the queue is no longer full
+         while (MQ_IS_EMPTY(mq)) {
+             debug_printf("[Message Queue] Thread %d is blocked on receive\n", TO_PTR(OSThread, ultramodern::this_thread())->id);
++            // [wcw2k] WCW_BLOCK_LOG=1: trace where threads park (wedge diagnosis)
++            static const bool wcw_block_log = getenv("WCW_BLOCK_LOG") != nullptr;
++            if (wcw_block_log) fprintf(stderr, "[wcw2k][block] id=%d self=0x%08X RECV mq=0x%08X\n",
++                TO_PTR(OSThread, ultramodern::this_thread())->id, (uint32_t)ultramodern::this_thread(), (uint32_t)mq_);
+             ultramodern::thread_queue_insert(PASS_RDRAM GET_MEMBER(OSMesgQueue, mq_, blocked_on_recv), ultramodern::this_thread());
+             ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
+         }
+@@ -146,7 +347,18 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
+ extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags) {
+     OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
+     bool jam = false;
+-    
++
++    // [wcw2k] DIAGNOSTIC: sends into thread 6's upper stack frames (the func_800E2704
++    // saved-s0 slot 0x80083900 corruption — bringup session 5 part 5). Log the target
++    // mq, its ring buffer, and the sender.
++    if (((uint32_t)mq_ >= 0x80083800u && (uint32_t)mq_ < 0x80083A00u) ||
++        ((uint32_t)mq->msg >= 0x80083800u && (uint32_t)mq->msg < 0x80083A00u)) {
++        fprintf(stderr, "[wcw2k][send] mq=0x%08X buf=0x%08X valid=%d msg=0x%08X sender=0x%08X game=%d\n",
++            (uint32_t)mq_, (uint32_t)mq->msg, mq->validCount, (uint32_t)msg,
++            ultramodern::is_game_thread() ? (uint32_t)ultramodern::this_thread() : 0,
++            (int)ultramodern::is_game_thread());
++    }
++
+     // Don't directly send to the message queue if this isn't a game thread to avoid contention.
+     if (!ultramodern::is_game_thread()) {
+         ultramodern::enqueue_external_message(mq_, msg, jam, false);
+@@ -156,9 +368,21 @@ extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags)
      // Handle any messages that have been received from an external thread.
      dequeue_external_messages(PASS_RDRAM1);
  
@@ -1175,7 +1582,7 @@ index 961de3d..9e129e9 100644
      // Check the queue to see if this thread should swap execution to another.
      ultramodern::check_running_queue(PASS_RDRAM1);
  
-@@ -195,11 +367,26 @@ extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32
+@@ -195,11 +419,26 @@ extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32
      // Handle any messages that have been received from an external thread.
      dequeue_external_messages(PASS_RDRAM1);
  
@@ -1203,19 +1610,547 @@ index 961de3d..9e129e9 100644
 +    if (rn <= 80) fprintf(stderr, "[wcw][recv#%d] -> %s\n", rn - 1, received ? "got msg" : "empty");
      return received ? 0 : -1;
  }
+diff --git a/ultramodern/src/scheduling.cpp b/ultramodern/src/scheduling.cpp
+index a22f747..4acc64d 100644
+--- a/ultramodern/src/scheduling.cpp
++++ b/ultramodern/src/scheduling.cpp
+@@ -2,6 +2,10 @@
+ 
+ void ultramodern::schedule_running_thread(RDRAM_ARG PTR(OSThread) t_) {
+     debug_printf("[Scheduling] Adding thread %d to the running queue\n", TO_PTR(OSThread, t_)->id);
++    // [wcw2k] thread_queue_insert orders by a raw rdram read of t->priority; repair a
++    // game-wiped TCB first or garbage priority mis-sorts the thread permanently
++    // (the post-transition wedge — see wcw2k_repair_thread in threads.cpp).
++    ultramodern::wcw2k_repair_thread(PASS_RDRAM t_);
+     thread_queue_insert(PASS_RDRAM running_queue, t_);
+     TO_PTR(OSThread, t_)->state = OSThreadState::QUEUED;
+ }
+@@ -9,6 +13,8 @@ void ultramodern::schedule_running_thread(RDRAM_ARG PTR(OSThread) t_) {
+ void swap_to_thread(RDRAM_ARG OSThread *to) {
+     debug_printf("[Scheduling] Thread %d giving execution to thread %d\n", TO_PTR(OSThread, ultramodern::this_thread())->id, to->id);
+     // Insert this thread in the running queue.
++    // [wcw2k] repair self before the priority-ordered insert (see schedule_running_thread).
++    ultramodern::wcw2k_repair_thread(PASS_RDRAM ultramodern::this_thread());
+     ultramodern::thread_queue_insert(PASS_RDRAM ultramodern::running_queue, ultramodern::this_thread());
+     TO_PTR(OSThread, ultramodern::this_thread())->state = OSThreadState::QUEUED;
+     // Unpause the target thread and wait for this one to be unpaused.
+@@ -16,10 +22,21 @@ void swap_to_thread(RDRAM_ARG OSThread *to) {
+ }
+ 
+ void ultramodern::check_running_queue(RDRAM_ARG1) {
++    // [wcw2k] a starvation-valve-boosted thread keeps the CPU for its boost window
++    // (see wcw2k_pop_starved in threads.cpp) — skipping the priority preemption here
++    // is what lets it do a frame of work instead of one OS call per valve fire.
++    if (ultramodern::wcw2k_thread_boosted(ultramodern::this_thread())) {
++        return;
++    }
+     // Check if there are any threads in the running queue.
+     if (!thread_queue_empty(PASS_RDRAM running_queue)) {
+         // Check if the highest priority thread in the queue is higher priority than the current thread.
+-        OSThread* next_thread = TO_PTR(OSThread, ultramodern::thread_queue_peek(PASS_RDRAM running_queue));
++        // [wcw2k] repair both TCBs before the raw priority compare — a wiped garbage
++        // priority on either side yields a wrong (and sticky) scheduling decision.
++        PTR(OSThread) next_thread_ = ultramodern::thread_queue_peek(PASS_RDRAM running_queue);
++        ultramodern::wcw2k_repair_thread(PASS_RDRAM next_thread_);
++        ultramodern::wcw2k_repair_thread(PASS_RDRAM ultramodern::this_thread());
++        OSThread* next_thread = TO_PTR(OSThread, next_thread_);
+         OSThread* self = TO_PTR(OSThread, ultramodern::this_thread());
+         if (next_thread->priority > self->priority) {
+             ultramodern::thread_queue_pop(PASS_RDRAM running_queue);
+diff --git a/ultramodern/src/threadqueue.cpp b/ultramodern/src/threadqueue.cpp
+index f9c0fa1..c221bcf 100644
+--- a/ultramodern/src/threadqueue.cpp
++++ b/ultramodern/src/threadqueue.cpp
+@@ -22,6 +22,12 @@ void ultramodern::thread_queue_insert(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(O
+     toadd->queue = queue_;
+     *cur = toadd_;
+ 
++    // [wcw2k] stamp running-queue entry time for the anti-starvation valve
++    // (see wcw2k_pop_starved in threads.cpp).
++    if (queue_ == ultramodern::running_queue) {
++        ultramodern::wcw2k_note_thread_queued(toadd_);
++    }
++
+     debug_printf("  Contains:");
+     cur = queue_to_ptr(PASS_RDRAM queue_);
+     while (*cur) {
 diff --git a/ultramodern/src/threads.cpp b/ultramodern/src/threads.cpp
-index 812c556..3be797f 100644
+index 812c556..ae63bc2 100644
 --- a/ultramodern/src/threads.cpp
 +++ b/ultramodern/src/threads.cpp
-@@ -185,6 +185,8 @@ void ultramodern::resume_thread_and_wait(RDRAM_ARG OSThread *t) {
+@@ -1,5 +1,8 @@
+ #include <cstdio>
+ #include <thread>
++#include <chrono>
++#include <mutex>
++#include <unordered_map>
+ #include <cassert>
+ #include <string>
+ 
+@@ -146,45 +149,377 @@ void ultramodern::set_native_thread_name(const std::string& name) {
+ void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
+ #endif
+ 
++// [wcw2k] forward declarations (defined below with the context map).
++static UltraThreadContext* wcw2k_get_context(RDRAM_ARG PTR(OSThread) t_);
++static UltraThreadContext* wcw2k_get_context_host(RDRAM_ARG OSThread* t);
++
+ void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
+     thread_context->running.wait();
+     // If this thread's context was replaced by another thread or deleted, destroy it again from its own context.
+     // This will trigger thread cleanup instead.
+-    if (TO_PTR(OSThread, ultramodern::this_thread())->context != thread_context) {
++    // [wcw2k] compare through the repairing accessor so a game-wiped (but live)
++    // context doesn't read as "replaced".
++    if (wcw2k_get_context(PASS_RDRAM ultramodern::this_thread()) != thread_context) {
+         osDestroyThread(PASS_RDRAM NULLPTR);
+     }
+ }
+ 
+-void resume_thread(OSThread* t) {
++void resume_thread(RDRAM_ARG OSThread* t) {
+     debug_printf("[Thread] Resuming execution of thread %d\n", t->id);
+-    t->context->running.signal();
++    // [wcw2k] repair a game-wiped context; a thread absent from the host map was
++    // genuinely destroyed — nothing to resume.
++    UltraThreadContext* ctx = wcw2k_get_context_host(PASS_RDRAM t);
++    if (ctx == nullptr) {
++        fprintf(stderr, "[wcw2k][thread] resume of destroyed thread id=%d — skipped\n", t->id);
++        return;
++    }
++    ctx->running.signal();
+ }
+ 
+-void run_next_thread(RDRAM_ARG1) {
+-    if (ultramodern::thread_queue_empty(PASS_RDRAM ultramodern::running_queue)) {
+-        throw std::runtime_error("No threads left to run!\n");
++// [wcw2k] WM2000's main-loop thread wipes its OWN OSThread struct while running (the
++// mode-transition code clears the arena its boot TCB was allocated from, then keeps
++// executing). On hardware that's survivable: the TCB is just memory the OS writes
++// register state into at the next switch. In ultramodern it nulls the host-written
++// `context` pointer, which the runtime needs at every yield. The context pointer is
++// RUNTIME property that merely lives in game memory — so keep an authoritative
++// host-side copy keyed by struct address and transparently restore it when the
++// in-rdram copy reads null. Entries are erased on genuine destruction (osDestroyThread
++// / thread replacement), so a restore can never resurrect a dead thread.
++// The map also keeps priority and id: a wiped TCB leaves garbage priority
++// (observed 0xC4430000 = huge negative), which starves the thread in every
++// priority comparison — it would never finish the mode transition. Restoring the
++// runtime's last-known values mirrors what the scheduler itself knew about the
++// thread; osSetThreadPri keeps the copy in sync.
++struct Wcw2kThreadRecord {
++    UltraThreadContext* context;
++    OSPri priority;
++    OSId id;
++};
++static std::mutex wcw2k_context_map_mutex;
++static std::unordered_map<int32_t, Wcw2kThreadRecord> wcw2k_context_map;
++
++static void wcw2k_register_context(PTR(OSThread) t_, UltraThreadContext* context, OSPri pri, OSId id) {
++    std::lock_guard lock{wcw2k_context_map_mutex};
++    wcw2k_context_map[(int32_t)t_] = Wcw2kThreadRecord{context, pri, id};
++}
++
++static void wcw2k_update_priority(PTR(OSThread) t_, OSPri pri) {
++    std::lock_guard lock{wcw2k_context_map_mutex};
++    auto it = wcw2k_context_map.find((int32_t)t_);
++    if (it != wcw2k_context_map.end()) {
++        it->second.priority = pri;
++    }
++}
++
++static void wcw2k_unregister_context(PTR(OSThread) t_, UltraThreadContext* context) {
++    std::lock_guard lock{wcw2k_context_map_mutex};
++    auto it = wcw2k_context_map.find((int32_t)t_);
++    if (it != wcw2k_context_map.end() && it->second.context == context) {
++        wcw2k_context_map.erase(it);
++    }
++}
++
++// Returns the thread's context, repairing a game-wiped in-rdram pointer from the
++// host-side map. Null only if the thread was genuinely destroyed.
++static UltraThreadContext* wcw2k_get_context_host(RDRAM_ARG OSThread* t) {
++    // reverse of TO_PTR: recover the rdram-relative pointer for the map key.
++    PTR(OSThread) t_ = (PTR(OSThread))(int32_t)((uint32_t)((uint8_t*)t - rdram) + 0x80000000u);
++    return wcw2k_get_context(PASS_RDRAM t_);
++}
++
++static UltraThreadContext* wcw2k_get_context(RDRAM_ARG PTR(OSThread) t_) {
++    OSThread* t = TO_PTR(OSThread, t_);
++    std::lock_guard lock{wcw2k_context_map_mutex};
++    auto it = wcw2k_context_map.find((int32_t)t_);
++    if (it == wcw2k_context_map.end()) {
++        // No host record (thread not made by osCreateThread, or genuinely destroyed):
++        // the rdram copy is all there is.
++        return t->context;
++    }
++    // The host record is AUTHORITATIVE: the in-rdram copy is just a cache the game
++    // may overwrite with anything (WM2000's transitions wrote zeros one time and
++    // 0x200000012 another). Repair on any mismatch — on hardware libultra likewise
++    // rewrites TCB fields on every context switch, so games cannot keep load-bearing
++    // data in them.
++    // Compare ALL mirrored fields, not context alone: boot47's wedge was a wipe flavor
++    // that trashed only the first 0x10 TCB bytes (priority=-1, queue=-1, next=0) while
++    // leaving the +0x20 context intact — a context-only trigger no-ops, and the pri -1
++    // thread then loses every check_running_queue compare from the HEAD of the running
++    // queue (which the starvation valve exempted) and parks forever. Priority is safe
++    // to compare: osSetThreadPri keeps the record in sync, so any divergence is a
++    // clobber.
++    if (t->context != it->second.context || t->priority != it->second.priority || t->id != it->second.id) {
++        fprintf(stderr, "[wcw2k][thread] repaired clobbered TCB for struct 0x%08X (read id=%d pri=%d ctx=%p; restoring id=%d pri=%d)\n",
++            (uint32_t)t_, t->id, t->priority, (void*)t->context, it->second.id, it->second.priority);
++        t->context = it->second.context;
++        t->priority = it->second.priority;
++        t->id = it->second.id;
+     }
++    return it->second.context;
++}
++
++// [wcw2k] public wrapper so the scheduler (scheduling.cpp) can repair a wiped TCB
++// before its raw priority reads: check_running_queue's compare and
++// thread_queue_insert's ordering both read t->priority straight from rdram, and a
++// game-wiped garbage priority there mis-sorts the thread PERMANENTLY (a hugely
++// negative value inserts it behind the pri-8 idle thread, whose pause_self loop only
++// ever swaps to strictly-higher-priority queued threads — the thread is then never
++// popped, so the pop-time repair never fires; observed as the post-transition wedge:
++// thread 6 starved forever, gfx frozen, audio alive).
++static void wcw2k_spraywatch(RDRAM_ARG const char* where);
++
++UltraThreadContext* ultramodern::wcw2k_repair_thread(RDRAM_ARG PTR(OSThread) t_) {
++    wcw2k_spraywatch(PASS_RDRAM "sched");
++    return wcw2k_get_context(PASS_RDRAM t_);
++}
++
++// [wcw2k] Anti-starvation valve. WM2000's audio pipeline is a closed message loop
++// among four high-priority threads (pri 80/100/110/120): each one's send wakes the
++// next before it blocks, and because ultramodern completes RSP audio tasks and DMAs
++// instantly (no hardware latency), the loop never has an "everything blocked" gap.
++// Result: at every run_next_thread pop instant some >=pri-80 thread is runnable, and
++// the pri-8 game-loop thread sits in the running queue forever (observed live in
++// boot36/37: thread 6 runnable-at-correct-priority for minutes while gfx froze at
++// task 1 — NOT a lost wakeup; mq 0x800559A0 state was consistent). On hardware the
++// RSP/AI latencies create gaps where the game thread runs. The valve restores that:
++// any queued thread (above idle priority 0) that has waited longer than
++// WCW2K_STARVATION_MS is popped ahead of the priority order, with a loud log line —
++// healthy scheduling never trips it (normal waits are <1 frame).
++static constexpr int64_t WCW2K_STARVATION_MS = 50;
++static std::unordered_map<int32_t, int64_t> wcw2k_queued_since;
++static std::mutex wcw2k_queued_since_mutex;
++
++static int64_t wcw2k_now_ms() {
++    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
++// [wcw2k] Post-valve boost window: a starvation-popped thread runs un-preempted for a
++// short window (check_running_queue skips the swap-away), because otherwise its very
++// first osSendMesg/osRecvMesg swaps it right back behind the saturated high-priority
++// loop and it advances one OS call per valve fire (observed: gfx +1 per ~10 fires).
++// 20ms is ~1 frame of work and far below the game's ~100ms audio buffering.
++static constexpr int64_t WCW2K_BOOST_MS = 20;
++static std::atomic<int32_t> wcw2k_boosted_thread{0};
++static std::atomic<int64_t> wcw2k_boost_until{0};
++
++bool ultramodern::wcw2k_thread_boosted(PTR(OSThread) t_) {
++    return (int32_t)t_ == wcw2k_boosted_thread.load(std::memory_order_relaxed) &&
++           wcw2k_now_ms() < wcw2k_boost_until.load(std::memory_order_relaxed);
++}
+ 
+-    OSThread* to_run = TO_PTR(OSThread, ultramodern::thread_queue_pop(PASS_RDRAM ultramodern::running_queue));
+-    debug_printf("[Scheduling] Resuming execution of thread %d\n", to_run->id);
+-    to_run->context->running.signal();
++void ultramodern::wcw2k_note_thread_queued(PTR(OSThread) t_) {
++    std::lock_guard lock{wcw2k_queued_since_mutex};
++    wcw2k_queued_since[(int32_t)t_] = wcw2k_now_ms();
++}
++
++// Walk the running queue; unlink and return the first above-idle-priority entry that
++// has been queued longer than the starvation threshold (NULLPTR if none).
++static PTR(OSThread) wcw2k_pop_starved(RDRAM_ARG1) {
++    int64_t now = wcw2k_now_ms();
++    PTR(OSThread) head = ultramodern::thread_queue_peek(PASS_RDRAM ultramodern::running_queue);
++    if (head == NULLPTR) {
++        return NULLPTR;
++    }
++    std::lock_guard lock{wcw2k_queued_since_mutex};
++    // Leave priority-0 idle threads alone (starving idle is by design). The head used
++    // to be exempt ("the normal pop handles it") — but boot47 proved a clobbered head
++    // can sit unpoppable forever: TCB wiped to priority=-1 with context intact, so the
++    // context-only repair no-op'd and check_running_queue never saw it outrank idle.
++    // The field-mismatch repair now fixes that flavor at peek time; popping an overdue
++    // head here as well covers any future flavor the repair can't recognize (e.g. no
++    // host record). Healthy scheduling never leaves the head queued 50ms, so this
++    // changes nothing on the happy path.
++    {
++        OSThread* h = TO_PTR(OSThread, head);
++        auto hit = wcw2k_queued_since.find((int32_t)head);
++        if (h->priority != 0 && hit != wcw2k_queued_since.end() && now - hit->second > WCW2K_STARVATION_MS) {
++            ultramodern::thread_queue_pop(PASS_RDRAM ultramodern::running_queue);
++            wcw2k_boosted_thread.store((int32_t)head, std::memory_order_relaxed);
++            wcw2k_boost_until.store(now + WCW2K_BOOST_MS, std::memory_order_relaxed);
++            fprintf(stderr, "[wcw2k][sched] STARVATION valve (HEAD): thread id=%d pri=%d @0x%08X queued %lld ms unpopped; boosting %lld ms\n",
++                h->id, h->priority, (uint32_t)head, (long long)(now - hit->second), (long long)WCW2K_BOOST_MS);
++            return head;
++        }
++    }
++    PTR(OSThread) prev = head;
++    PTR(OSThread) cur = TO_PTR(OSThread, head)->next;
++    while (cur != NULLPTR) {
++        OSThread* t = TO_PTR(OSThread, cur);
++        auto it = wcw2k_queued_since.find((int32_t)cur);
++        if (t->priority > 0 && it != wcw2k_queued_since.end() && now - it->second > WCW2K_STARVATION_MS) {
++            TO_PTR(OSThread, prev)->next = t->next;   // unlink
++            t->queue = NULLPTR;
++            wcw2k_boosted_thread.store((int32_t)cur, std::memory_order_relaxed);
++            wcw2k_boost_until.store(now + WCW2K_BOOST_MS, std::memory_order_relaxed);
++            static uint32_t fire_count = 0;
++            if ((fire_count++ % 32) == 0) {
++                fprintf(stderr, "[wcw2k][sched] STARVATION valve (fire %u): running thread id=%d pri=%d @0x%08X (queued %lld ms behind higher-priority loop; boosting %lld ms)\n",
++                    fire_count, t->id, t->priority, (uint32_t)cur, (long long)(now - it->second), (long long)WCW2K_BOOST_MS);
++            }
++            return cur;
++        }
++        prev = cur;
++        cur = t->next;
++    }
++    return NULLPTR;
++}
++
++// [wcw2k] DIAGNOSTIC: dump an OSThread struct's raw words (game-byte-order view) —
++// distinguishes "game clobbered it with unrelated data" from "game manually
++// re-initialized a TCB" (menu-transition crash investigation).
++static void wcw2k_dump_thread_struct(RDRAM_ARG PTR(OSThread) t_) {
++    // rdram stores 32-bit words host-endian at aligned offsets, so a direct u32 view
++    // yields the game's word values.
++    const uint32_t* words = reinterpret_cast<const uint32_t*>(TO_PTR(void, t_));
++    fprintf(stderr, "[wcw2k][thread] struct @0x%08X:", (uint32_t)t_);
++    for (uint32_t i = 0; i < 0x10; i++) {
++        fprintf(stderr, " %08X", words[i]);
++    }
++    fprintf(stderr, "\n");
++}
++
++// [wcw2k] WCW_SCHED_LOG=1: periodic one-line dump of the running queue (id/pri/struct
++// chain) so a starved thread is visible — a wedge shows up as a thread sitting in the
++// queue with wrong priority (or missing entirely) while others cycle.
++static void wcw2k_sched_log(RDRAM_ARG1) {
++    static const bool enabled = getenv("WCW_SCHED_LOG") != nullptr;
++    if (!enabled) {
++        return;
++    }
++    static uint32_t pop_count = 0;
++    if ((pop_count++ % 512) != 0) {
++        return;
++    }
++    fprintf(stderr, "[wcw2k][sched] self=0x%08X queue:", (uint32_t)ultramodern::this_thread());
++    PTR(OSThread) cur = ultramodern::thread_queue_peek(PASS_RDRAM ultramodern::running_queue);
++    for (int i = 0; cur != NULLPTR && i < 16; i++) {
++        OSThread* t = TO_PTR(OSThread, cur);
++        fprintf(stderr, " id=%d pri=%d @0x%08X", t->id, t->priority, (uint32_t)cur);
++        cur = t->next;
++    }
++    fprintf(stderr, "\n");
++}
++
++// [wcw2k] DIAGNOSTIC (WCW2K_SPRAYWATCH=1): watch the region holding WM2000's thread-6
++// TCB + stack (0x80080000..0x80084000) for writes, attributed to the game thread that
++// just ran (checked at every scheduler touch). WM2000's transitions spray this region
++// (evolving garbage across 7 TCB repairs in boot48) and thread 6 resumes with a saved
++// register restored from a clobbered stack slot (s0=1 -> crash in func_800222D8).
++// Changes while thread 6 itself runs are its own stack traffic and are not logged.
++static void wcw2k_spraywatch(RDRAM_ARG const char* where) {
++    static const bool enabled = getenv("WCW2K_SPRAYWATCH") != nullptr;
++    if (!enabled) return;
++    // Watch thread 6's TCB (0x800807F0, 0x30 host bytes + margin) word-by-word: boot50
++    // showed the render thread making STRUCTURED writes into it (state/flags
++    // transitions, a pointer at +0x18, evolving values), not a bulk fill — the game
++    // appears to run its own thread bookkeeping against stock-libultra TCB offsets.
++    constexpr uint32_t base = 0x800807C0, size = 0xA0;
++    static uint32_t prev[size / 4];
++    static bool primed = false;
++    const uint32_t* cur = (const uint32_t*)TO_PTR(void, (int32_t)base);
++    if (!primed) { memcpy(prev, cur, size); primed = true; return; }
++    PTR(OSThread) self_ = ultramodern::this_thread();
++    // Thread 6 itself and the scheduler legitimately write its TCB.
++    if ((uint32_t)self_ == 0x800807F0u) { memcpy(prev, cur, size); return; }
++    int shown = 0;
++    for (uint32_t i = 0; i < size / 4; i++) {
++        if (cur[i] != prev[i] && shown < 8) {
++            fprintf(stderr, "[wcw2k][spray] 0x%08X: %08X -> %08X (by struct=0x%08X id=%d at %s)\n",
++                base + i * 4, prev[i], cur[i], (uint32_t)self_,
++                self_ != NULLPTR ? TO_PTR(OSThread, self_)->id : -1, where);
++            shown++;
++        }
++    }
++    if (shown) { memcpy(prev, cur, size); }
++
++    // Second window: thread 6's shallow stack frames (func_800222D8's 0x40-byte frame
++    // below entry sp 0x80083990). The deterministic crash restores saved-s0 == 1 from
++    // here; trap any word BECOMING 1 to identify the slot and the writer.
++    constexpr uint32_t fbase = 0x80083900, fsize = 0xA0;
++    static uint32_t fprev[fsize / 4];
++    static bool fprimed = false;
++    const uint32_t* fcur = (const uint32_t*)TO_PTR(void, (int32_t)fbase);
++    if (!fprimed) { memcpy(fprev, fcur, fsize); fprimed = true; return; }
++    for (uint32_t i = 0; i < fsize / 4; i++) {
++        if (fcur[i] != fprev[i] && (fcur[i] == 1 || fprev[i] == 1)) {
++            fprintf(stderr, "[wcw2k][frame] 0x%08X: %08X -> %08X (by struct=0x%08X id=%d at %s)\n",
++                fbase + i * 4, fprev[i], fcur[i], (uint32_t)self_,
++                self_ != NULLPTR ? TO_PTR(OSThread, self_)->id : -1, where);
++        }
++    }
++    memcpy(fprev, fcur, fsize);
++}
++
++void run_next_thread(RDRAM_ARG1) {
++    wcw2k_spraywatch(PASS_RDRAM "pop");
++    // [wcw2k] Repair game-wiped contexts (see wcw2k_get_context); a queued thread whose
++    // context is null even in the host map was genuinely destroyed — drop it.
++    wcw2k_sched_log(PASS_RDRAM1);
++    for (;;) {
++        if (ultramodern::thread_queue_empty(PASS_RDRAM ultramodern::running_queue)) {
++            throw std::runtime_error("No threads left to run!\n");
++        }
++
++        // [wcw2k] anti-starvation valve (see wcw2k_pop_starved above).
++        PTR(OSThread) to_run_ = wcw2k_pop_starved(PASS_RDRAM1);
++        if (to_run_ == NULLPTR) {
++            to_run_ = ultramodern::thread_queue_pop(PASS_RDRAM ultramodern::running_queue);
++        }
++        OSThread* to_run = TO_PTR(OSThread, to_run_);
++        UltraThreadContext* ctx = wcw2k_get_context(PASS_RDRAM to_run_);
++        if (ctx == nullptr) {
++            fprintf(stderr, "[wcw2k][thread] queued thread id=%d (0x%08X) has NULL context and no host record — dropping\n",
++                to_run->id, (uint32_t)to_run_);
++            continue;
++        }
++        debug_printf("[Scheduling] Resuming execution of thread %d\n", to_run->id);
++        ctx->running.signal();
++        return;
++    }
+ }
+ 
+ void ultramodern::run_next_thread_and_wait(RDRAM_ARG1) {
+-    UltraThreadContext* cur_context = TO_PTR(OSThread, thread_self)->context;
++    // [wcw2k] wcw2k_get_context repairs the in-rdram pointer if the game wiped its own
++    // TCB (WM2000's mode transitions); dump + park only if genuinely destroyed.
++    UltraThreadContext* cur_context = wcw2k_get_context(PASS_RDRAM thread_self);
++    if (cur_context == nullptr) {
++        OSThread* self = TO_PTR(OSThread, thread_self);
++        fprintf(stderr, "[wcw2k][thread] yielding thread id=%d self=0x%08X has NULL context and no host record — parking forever\n",
++            self->id, (uint32_t)thread_self);
++        wcw2k_dump_thread_struct(PASS_RDRAM thread_self);
++        run_next_thread(PASS_RDRAM1);
++        for (;;) {
++            std::this_thread::sleep_for(std::chrono::hours(1));
++        }
++    }
+     run_next_thread(PASS_RDRAM1);
+     wait_for_resumed(PASS_RDRAM cur_context);
+ }
+ 
+ void ultramodern::resume_thread_and_wait(RDRAM_ARG OSThread *t) {
+-    UltraThreadContext* cur_context = TO_PTR(OSThread, thread_self)->context;
+-    resume_thread(t);
++    UltraThreadContext* cur_context = wcw2k_get_context(PASS_RDRAM thread_self);
++    resume_thread(PASS_RDRAM t);
++    // [wcw2k] see run_next_thread_and_wait — execution was already handed to t.
++    if (cur_context == nullptr) {
++        OSThread* self = TO_PTR(OSThread, thread_self);
++        fprintf(stderr, "[wcw2k][thread] resuming-and-waiting thread id=%d self=0x%08X has NULL context and no host record — parking forever\n",
++            self->id, (uint32_t)thread_self);
++        wcw2k_dump_thread_struct(PASS_RDRAM thread_self);
++        for (;;) {
++            std::this_thread::sleep_for(std::chrono::hours(1));
++        }
++    }
+     wait_for_resumed(PASS_RDRAM cur_context);
+ }
+ 
  static void _thread_func(RDRAM_ARG PTR(OSThread) self_, PTR(thread_func_t) entrypoint, PTR(void) arg, UltraThreadContext* thread_context) {
      OSThread *self = TO_PTR(OSThread, self_);
      debug_printf("[Thread] Thread created: %d\n", self->id);
 +    // [wcw] map game thread ids to their entry PCs (to identify threads in traces)
-+    fprintf(stderr, "[wcw][thread] id=%d entry=0x%08X pri=%d\n", self->id, (unsigned)(uint32_t)entrypoint, self->priority);
++    // [wcw2k] + stack pointer: to check whether a thread's stack lies inside the region
++    // WM2000's transitions spray (boot48 crash: thread 6 resumed with a saved reg
++    // restored as garbage from a stack slot).
++    fprintf(stderr, "[wcw][thread] id=%d entry=0x%08X pri=%d struct=0x%08X sp=0x%08X\n", self->id, (unsigned)(uint32_t)entrypoint, self->priority, (uint32_t)self_, (uint32_t)self->sp);
      thread_self = self_;
      is_game_thread = true;
  
+@@ -218,7 +553,11 @@ static void _thread_func(RDRAM_ARG PTR(OSThread) self_, PTR(thread_func_t) entry
+ 
+     // Check if the thread hasn't been destroyed or replaced. If so, then the thread terminated or destroyed itself,
+     // so mark this thread as destroyed and run the next queued thread.
+-    if (self->context == thread_context) {
++    // [wcw2k] compare through the repairing accessor (a game-wiped context is still
++    // "ours"), and drop the host-map record — this thread is gone for real.
++    UltraThreadContext* effective_context = wcw2k_get_context(PASS_RDRAM self_);
++    wcw2k_unregister_context(self_, thread_context);
++    if (effective_context == thread_context) {
+         self->context = nullptr;
+         run_next_thread(PASS_RDRAM1);
+     }
+@@ -239,7 +578,7 @@ extern "C" void osStartThread(RDRAM_ARG PTR(OSThread) t_) {
+     // Otherwise, immediately start the thread and terminate this one.
+     else {
+         t->state = OSThreadState::QUEUED;
+-        resume_thread(t);
++        resume_thread(PASS_RDRAM t);
+         //throw ultramodern::thread_terminated{};
+     }
+ }
+@@ -248,6 +587,13 @@ extern "C" void osCreateThread(RDRAM_ARG PTR(OSThread) t_, OSId id, PTR(thread_f
+     debug_printf("[os] Create Thread %d\n", id);
+     OSThread *t = TO_PTR(OSThread, t_);
+     
++    // [wcw2k] DIAGNOSTIC: struct reuse while a live host thread still references it
++    // (WM2000 recreates threads on the same OSThread structs at menu transitions).
++    if (t->context != nullptr) {
++        fprintf(stderr, "[wcw2k][thread] osCreateThread REUSING struct 0x%08X (old id=%d, ctx alive) for new id=%d entry=0x%08X\n",
++            (uint32_t)t_, t->id, id, (uint32_t)entrypoint);
++    }
++
+     t->next = NULLPTR;
+     t->queue = NULLPTR;
+     t->priority = pri;
+@@ -259,6 +605,7 @@ extern "C" void osCreateThread(RDRAM_ARG PTR(OSThread) t_, OSId id, PTR(thread_f
+     // Pass the context as an argument to the thread function to ensure that it can't get cleared before the thread captures its value.
+     UltraThreadContext* context = new UltraThreadContext{};
+     t->context = context;
++    wcw2k_register_context(t_, context, pri, id); // [wcw2k] authoritative host-side copy
+     context->host_thread = std::thread{_thread_func, PASS_RDRAM t_, entrypoint, arg, t->context};
+ 
+     // Wait until the thread is initialized to indicate that it's ready to be started.
+@@ -284,6 +631,9 @@ extern "C" void osDestroyThread(RDRAM_ARG PTR(OSThread) t_) {
+         t_ = thread_self;
+     }
+     OSThread* t = TO_PTR(OSThread, t_);
++    // [wcw2k] DIAGNOSTIC: trace thread churn (menu-transition crash investigation).
++    fprintf(stderr, "[wcw2k][thread] osDestroyThread target=0x%08X id=%d state=%d ctx=%s (self=0x%08X)\n",
++        (uint32_t)t_, t->id, (int)t->state, t->context ? "live" : "null", (uint32_t)thread_self);
+     // Check if the thread is destroying itself (arg is null or thread_self)
+     if (t_ == thread_self) {
+         throw ultramodern::thread_terminated{};
+@@ -293,7 +643,10 @@ extern "C" void osDestroyThread(RDRAM_ARG PTR(OSThread) t_) {
+         ultramodern::thread_queue_remove(PASS_RDRAM t->queue, t_);
+     }
+     // Check if the thread has already been destroyed to prevent destroying it again.
+-    UltraThreadContext* cur_context = t->context;
++    // [wcw2k] repair a game-wiped pointer first so wiped-then-destroyed threads get
++    // full cleanup, and drop the host-map record — this is genuine destruction.
++    UltraThreadContext* cur_context = wcw2k_get_context(PASS_RDRAM t_);
++    wcw2k_unregister_context(t_, cur_context);
+     if (cur_context != nullptr) {
+         // Mark the target thread as destroyed and resume it. When it starts it'll check this and terminate itself instead of resuming.
+         t->context = nullptr;
+@@ -309,6 +662,7 @@ extern "C" void osSetThreadPri(RDRAM_ARG PTR(OSThread) t_, OSPri pri) {
+ 
+     if (t->priority != pri) {
+         t->priority = pri;
++        wcw2k_update_priority(t_, pri); // [wcw2k] keep the host-side record in sync
+ 
+         if (t_ != ultramodern::this_thread() && t->state != OSThreadState::STOPPED) {
+             ultramodern::thread_queue_remove(PASS_RDRAM t->queue, t_);
 diff --git a/ultramodern/src/timer.cpp b/ultramodern/src/timer.cpp
 index 276301b..1dcdb8e 100644
 --- a/ultramodern/src/timer.cpp
