@@ -30,7 +30,7 @@ index 1194a96..432e1ab 100644
          rect.fixRectLR = true;
          f3dex.forceBranch = false;
 diff --git a/src/gbi/rt64_gbi.cpp b/src/gbi/rt64_gbi.cpp
-index 7006549..8c0e275 100644
+index 7006549..5debe75 100644
 --- a/src/gbi/rt64_gbi.cpp
 +++ b/src/gbi/rt64_gbi.cpp
 @@ -160,7 +160,13 @@ namespace RT64 {
@@ -96,17 +96,17 @@ index 7006549..8c0e275 100644
              return nullptr;
          }
  
-@@ -459,6 +483,10 @@ namespace RT64 {
-             return nullptr;
-         }
+@@ -461,6 +485,10 @@ namespace RT64 {
  
-+        // [wcw] DIAGNOSTIC: report which GBI the ucode hash matched.
-+        fprintf(stderr, "[wcw][gbi] matched ucode: name='%s' enum=%d (text=0x%X data=0x%X)\n",
-+            matchingInstance->name, (int)matchingInstance->ucode, textAddress, dataAddress);
-+
          GBI &gbi = gbiCache[uint32_t(matchingInstance->ucode)];
          if (gbi.ucode == GBIUCode::Unknown) {
++            // [wcw] DIAGNOSTIC: report which GBI the ucode hash matched — once per ucode
++            // (this function runs per RSP task; the unconditional print spammed user logs).
++            fprintf(stderr, "[wcw][gbi] matched ucode: name='%s' enum=%d (text=0x%X data=0x%X)\n",
++                matchingInstance->name, (int)matchingInstance->ucode, textAddress, dataAddress);
              gbi.ucode = matchingInstance->ucode;
+ 
+             // Common RDP functions.
 diff --git a/src/gbi/rt64_gbi_f3dex2.cpp b/src/gbi/rt64_gbi_f3dex2.cpp
 index 16b4b9c..f9156e0 100644
 --- a/src/gbi/rt64_gbi_f3dex2.cpp
@@ -197,7 +197,7 @@ index 785de27..cb5f3b9 100644
          state->updateScreen(core.decodeVI(), false);
      }
 diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
-index 3227ab1..7d6cd99 100644
+index 3227ab1..b3bb8d3 100644
 --- a/src/hle/rt64_present_queue.cpp
 +++ b/src/hle/rt64_present_queue.cpp
 @@ -116,6 +116,8 @@ namespace RT64 {
@@ -209,7 +209,7 @@ index 3227ab1..7d6cd99 100644
          bool lockedWorkloadMutex = false;
          InterpolatedFrameCounters &frameCounters = ext.sharedResources->interpolatedFrames[ext.sharedResources->interpolatedFramesIndex];
  
-@@ -127,6 +129,15 @@ namespace RT64 {
+@@ -127,6 +129,16 @@ namespace RT64 {
          
          // Perform any external write operations indicated by the event.
          if (!present.fbOperations.empty()) {
@@ -217,15 +217,16 @@ index 3227ab1..7d6cd99 100644
 +            // presenting. WCW's fb RDRAM is never written back by RT64, so a WriteChanges op
 +            // aimed at a presented fb would splat stale/black RAM over the rendered frame.
 +            { static int fo = 0;
++              static const bool wcwTrace = getenv("WCW_TRACE") != nullptr;
 +              for (const auto &op : present.fbOperations) {
-+                  if (fo < 40 || (fo % 60) == 0) fprintf(stderr, "[wcw][fbop#%d] type=%d addr=0x%X\n",
++                  if (wcwTrace && (fo < 40 || (fo % 60) == 0)) fprintf(stderr, "[wcw][fbop#%d] type=%d addr=0x%X\n",
 +                      fo, (int)op.type, (op.type == FramebufferOperation::Type::WriteChanges) ? op.writeChanges.address : 0);
 +                  fo++;
 +              } }
              const std::scoped_lock lock(screenFbChangePoolMutex);
              {
                  RenderWorkerExecution workerExecution(ext.presentGraphicsWorker);
-@@ -194,9 +205,27 @@ namespace RT64 {
+@@ -194,9 +206,27 @@ namespace RT64 {
                      ext.sharedResources->workloadMutex.lock();
                  }
  
@@ -245,7 +246,7 @@ index 3227ab1..7d6cd99 100644
                  RenderTargetKey colorTargetKey(presentFb->addressStart, presentFb->width, presentFb->siz, Framebuffer::Type::Color);
                  colorTarget = &targetManager.get(colorTargetKey, true);
 +                // [wcw] DIAGNOSTIC: report whether the present found a non-empty rendered target.
-+                { static int pn = 0; if ((pn++ % 61) == 0) fprintf(stderr, "[wcw][blit#%d] addr=0x%X w=%d siz=%d empty=%d interp=%d\n",
++                { static int pn = 0; static const bool wcwTrace = getenv("WCW_TRACE") != nullptr; if (wcwTrace && (pn++ % 61) == 0) fprintf(stderr, "[wcw][blit#%d] addr=0x%X w=%d siz=%d empty=%d interp=%d\n",
 +                    pn, presentFb->addressStart, (int)presentFb->width, (int)presentFb->siz, (int)colorTarget->isEmpty(), (int)presentFb->interpolationEnabled); }
                  if (!colorTarget->isEmpty()) {
 +                    wcw_reason = 1;
@@ -253,7 +254,7 @@ index 3227ab1..7d6cd99 100644
                      // If a depth framebuffer is about to be shown, convert it to color.
                      if (presentFb->isLastWriteDifferent(Framebuffer::Type::Color)) {
                          RenderTargetKey otherColorTargetKey(presentFb->addressStart, presentFb->width, presentFb->siz, presentFb->lastWriteType);
-@@ -210,6 +239,7 @@ namespace RT64 {
+@@ -210,6 +240,7 @@ namespace RT64 {
                  }
                  else {
                      colorTarget = nullptr;
@@ -261,7 +262,7 @@ index 3227ab1..7d6cd99 100644
                  }
  
                  if (!present.paused && (viHistory.top().vi != present.screenVI)) {
-@@ -219,6 +249,13 @@ namespace RT64 {
+@@ -219,6 +250,13 @@ namespace RT64 {
              else {
                  uint32_t fbAddress = present.screenVI.fbAddress();
  
@@ -269,13 +270,13 @@ index 3227ab1..7d6cd99 100644
 +                // render target down to native size (destroying the rendered hi-res texture),
 +                // clears it, and uploads the RDRAM copy (black — RT64 never writes back), which
 +                // would wipe the rendered frame and explain the black screen.
-+                { static int sp = 0; if ((sp++ % 30) == 0) fprintf(stderr, "[wcw][scratch-present#%d] fbAddr=0x%X (fb lookup MISSED)\n", sp, fbAddress); }
++                { static int sp = 0; static const bool wcwTrace = getenv("WCW_TRACE") != nullptr; if (wcwTrace && (sp++ % 30) == 0) fprintf(stderr, "[wcw][scratch-present#%d] fbAddr=0x%X (fb lookup MISSED)\n", sp, fbAddress); }
 +                wcw_reason = 3;
 +
                  // Use a scratch framebuffer to upload the RAM to the render target.
                  hlslpp::uint2 fbSize = present.screenVI.fbSize();
                  scratchFb.addressStart = fbAddress;
-@@ -266,6 +303,12 @@ namespace RT64 {
+@@ -266,6 +304,12 @@ namespace RT64 {
              }
          }
          
@@ -288,7 +289,7 @@ index 3227ab1..7d6cd99 100644
          for (int32_t i = 0; i < framesToPresent; i++) {
              uint32_t frameCountersNextPresented = 0;
              if ((framesToPresent > 1) && (usingMSAA || (i > 0))) {
-@@ -299,8 +342,11 @@ namespace RT64 {
+@@ -299,8 +343,11 @@ namespace RT64 {
  
              uint32_t swapChainIndex = 0;
              const bool presentFrame = (i < framesToPresent) && swapChainValid;
@@ -300,7 +301,7 @@ index 3227ab1..7d6cd99 100644
              }
  
              if (presentFrame && swapChainValid) {
-@@ -340,6 +386,24 @@ namespace RT64 {
+@@ -340,6 +387,24 @@ namespace RT64 {
                      }
                  }
                  
@@ -325,7 +326,7 @@ index 3227ab1..7d6cd99 100644
                  commandList->setFramebuffer(swapChainFramebuffer);
                  commandList->clearColor();
  
-@@ -358,7 +422,38 @@ namespace RT64 {
+@@ -358,7 +423,38 @@ namespace RT64 {
                      if (inspector != nullptr) {
                          inspector->draw(commandList);
                      }
@@ -365,7 +366,7 @@ index 3227ab1..7d6cd99 100644
                      commandList->barriers(RenderBarrierStage::NONE, RenderTextureBarrier(swapChainTexture, RenderTextureLayout::PRESENT));
                      commandList->end();
                      const RenderCommandList *commandList = ext.presentGraphicsWorker->commandList.get();
-@@ -366,6 +461,44 @@ namespace RT64 {
+@@ -366,6 +462,44 @@ namespace RT64 {
                      RenderCommandSemaphore *signalSemaphore = drawSemaphores[swapChainIndex].get();
                      ext.presentGraphicsWorker->commandQueue->executeCommandLists(&commandList, 1, &waitSemaphore, 1, &signalSemaphore, 1, ext.presentGraphicsWorker->commandFence.get());
                      ext.presentGraphicsWorker->wait();
@@ -410,7 +411,7 @@ index 3227ab1..7d6cd99 100644
                  }
              }
  
-@@ -460,6 +593,18 @@ namespace RT64 {
+@@ -460,6 +594,18 @@ namespace RT64 {
                      processCursor = threadCursor;
                      threadCursor = (threadCursor + 1) % presents.size();
                      skipPresent = (writeCursor != threadCursor);
@@ -430,7 +431,7 @@ index 3227ab1..7d6cd99 100644
              }
  
 diff --git a/src/hle/rt64_rdp.cpp b/src/hle/rt64_rdp.cpp
-index a10c11a..c113f3e 100644
+index a10c11a..5f2345a 100644
 --- a/src/hle/rt64_rdp.cpp
 +++ b/src/hle/rt64_rdp.cpp
 @@ -401,6 +401,12 @@ namespace RT64 {
@@ -440,7 +441,7 @@ index a10c11a..c113f3e 100644
 +        // [wcw] DIAGNOSTIC: checksum the source RDRAM bytes of texture loads. If sums are zero,
 +        // the game's texture data in RDRAM is zeros (game-side data bug, e.g. decompression);
 +        // if nonzero, texture data is real and the problem is downstream in the texture path.
-+        { static int tl = 0; if ((tl++ % 500) == 0) {
++        { static int tl = 0; static const bool wcwTrace = getenv("WCW_TRACE") != nullptr; if (wcwTrace && (tl++ % 500) == 0) {
 +            uint32_t sum = 0; for (uint32_t i = 0; i < 256; i++) { sum += RDRAM[(textureStart + i) ^ 3]; }
 +            fprintf(stderr, "[wcw][tmemload#%d] src=0x%X words=%u rows=%u first256sum=0x%X\n", tl, textureStart, wordsPerRow, rowCount, sum); } }
          
@@ -451,7 +452,7 @@ index a10c11a..c113f3e 100644
  
      void RDP::loadTLUT(uint8_t tile, uint16_t uls, uint16_t ult, uint16_t lrs, uint16_t lrt) {
 +        // [wcw] DIAGNOSTIC: does the game ever load a palette via the proper TLUT command?
-+        { static int lt = 0; if ((lt++ % 200) == 0) fprintf(stderr, "[wcw][loadtlut#%d] tile=%d uls=%d lrs=%d (tmem=0x%X)\n", lt, (int)tile, uls>>2, lrs>>2, (unsigned)tiles[tile].tmem << 3); }
++        { static int lt = 0; static const bool wcwTrace = getenv("WCW_TRACE") != nullptr; if (wcwTrace && (lt++ % 200) == 0) fprintf(stderr, "[wcw][loadtlut#%d] tile=%d uls=%d lrs=%d (tmem=0x%X)\n", lt, (int)tile, uls>>2, lrs>>2, (unsigned)tiles[tile].tmem << 3); }
  #ifdef LOG_LOAD_METHODS
          RT64_LOG_PRINTF("RDP::loadTLUT(tile %u, uls %u, ult %u, lrs %u, lrt %u)", tile, uls, ult, lrs, lrt);
  #endif
@@ -460,7 +461,7 @@ index a10c11a..c113f3e 100644
      
      void RDP::setScissor(uint8_t mode, int32_t ulx, int32_t uly, int32_t lrx, int32_t lry, const ExtendedAlignment &extAlignment) {
 +        // [wcw] DIAGNOSTIC: log scissor settings (empty scissor clips ALL draws -> black target).
-+        { static int sc = 0; if ((sc++ % 200) == 0) fprintf(stderr, "[wcw][scissor#%d] mode=%d (%d,%d)-(%d,%d)\n", sc, (int)mode, ulx>>2, uly>>2, lrx>>2, lry>>2); }
++        { static int sc = 0; static const bool wcwTrace = getenv("WCW_TRACE") != nullptr; if (wcwTrace && (sc++ % 200) == 0) fprintf(stderr, "[wcw][scissor#%d] mode=%d (%d,%d)-(%d,%d)\n", sc, (int)mode, ulx>>2, uly>>2, lrx>>2, lry>>2); }
          FixedRect &scissorRect = scissorRectStack[scissorStackSize - 1];
          scissorRect.ulx = std::clamp(movedFromOrigin(ulx + extAlignment.leftOffset, extAlignment.leftOrigin), extAlignment.leftBound, extAlignment.rightBound);
          scissorRect.uly = std::clamp(uly + extAlignment.topOffset, extAlignment.topBound, extAlignment.bottomBound);
@@ -469,7 +470,7 @@ index a10c11a..c113f3e 100644
          RT64_LOG_PRINTF("RDP::fillRect(ulx %d, uly %d, lrx %d, lry %d)", ulx, uly, lrx, lry);
  #   endif
 +        // [wcw] DIAGNOSTIC: count fill rects (clears) + log fill color occasionally.
-+        { static int fr = 0; if ((fr++ % 120) == 0) fprintf(stderr, "[wcw][fillrect#%d] (%d,%d)-(%d,%d) fillColor=0x%08X\n", fr, ulx>>2, uly>>2, lrx>>2, lry>>2, fillColorStack[fillColorStackSize - 1]); }
++        { static int fr = 0; static const bool wcwTrace = getenv("WCW_TRACE") != nullptr; if (wcwTrace && (fr++ % 120) == 0) fprintf(stderr, "[wcw][fillrect#%d] (%d,%d)-(%d,%d) fillColor=0x%08X\n", fr, ulx>>2, uly>>2, lrx>>2, lry>>2, fillColorStack[fillColorStackSize - 1]); }
  
          // Filter out incorrect rectangles.
          if ((lrx < ulx) || (lry < uly)) {
@@ -480,7 +481,7 @@ index a10c11a..c113f3e 100644
 +        // [wcw] DIAGNOSTIC: count texture rects (2D blits — logos/menus draw with these), and log
 +        // the color state — if prim/env are black and the combiner multiplies by them, everything
 +        // draws black (stuck intro fade).
-+        { static int tr = 0; if ((tr++ % 200) == 0) {
++        { static int tr = 0; static const bool wcwTrace = getenv("WCW_TRACE") != nullptr; if (wcwTrace && (tr++ % 200) == 0) {
 +            const hlslpp::float4& pc = primColorStack[primColorStackSize - 1];
 +            const hlslpp::float4& ec = envColorStack[envColorStackSize - 1];
 +            fprintf(stderr, "[wcw][texrect#%d] (%d,%d)-(%d,%d) tilefmt=%d tilesiz=%d tlut=0x%X prim=(%.2f,%.2f,%.2f,%.2f) cc=0x%08X%08X\n",
@@ -492,7 +493,7 @@ index a10c11a..c113f3e 100644
          RT64_LOG_PRINTF("RDP::drawTexRect(ulx %d, uly %d, lrx %d, lry %d, tile %u, uls %d, ult %d, dsdx %d, dtdy %d, flip %u)", ulx, uly, lrx, lry, tile, uls, ult, dsdx, dtdy, flip);
  #   endif
 diff --git a/src/hle/rt64_rsp.cpp b/src/hle/rt64_rsp.cpp
-index ee2030b..2354169 100644
+index ee2030b..558d3e7 100644
 --- a/src/hle/rt64_rsp.cpp
 +++ b/src/hle/rt64_rsp.cpp
 @@ -4,7 +4,9 @@
@@ -647,7 +648,7 @@ index ee2030b..2354169 100644
      void RSP::drawIndexedTri(uint32_t a, uint32_t b, uint32_t c, bool rawGlobalIndices) {
 +        // [wcw] DIAGNOSTIC: count triangle submissions (prints once per ~2000 tris; if this never
 +        // prints, the game's display lists contain no geometry at all).
-+        { static int tris = 0; if ((tris++ % 2000) == 0) fprintf(stderr, "[wcw][tri] total tris so far: %d\n", tris); }
++        { static int tris = 0; static const bool wcwTrace = getenv("WCW_TRACE") != nullptr; if (wcwTrace && (tris++ % 2000) == 0) fprintf(stderr, "[wcw][tri] total tris so far: %d\n", tris); }
          // Copy mode is not supported when drawing regular tris and crashes the hardware.
          const uint32_t cycleType = state->rdp->otherMode.cycleType();
          assert(cycleType != G_CYC_COPY);
@@ -746,7 +747,7 @@ index a870166..bc0aec8 100644
              const bool interlacedStep = status.serrate && (vCurrentLine & 0x1);
              const uint32_t rowBytes = width * (1U << (siz - 1));
 diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
-index 5a331aa..24be9f9 100644
+index 5a331aa..293953d 100644
 --- a/src/hle/rt64_workload_queue.cpp
 +++ b/src/hle/rt64_workload_queue.cpp
 @@ -131,7 +131,14 @@ namespace RT64 {
@@ -830,7 +831,7 @@ index 5a331aa..24be9f9 100644
 +                // [wcw] DIAGNOSTIC: count workloads + checksum CPU-side draw data. If posFloats /
 +                // rdpParams are zeros, the interpreter->drawData conversion is broken; if real,
 +                // the GPU upload/consumption is the break.
-+                { static int wl = 0; if ((wl++ % 61) == 0) {
++                { static int wl = 0; static const bool wcwTrace = getenv("WCW_TRACE") != nullptr; if (wcwTrace && (wl++ % 61) == 0) {
 +                    const auto& dd = workload.drawData;
 +                    float posSum = 0.0f; for (size_t i = 0; i < dd.posFloats.size() && i < 256; i++) posSum += fabsf(dd.posFloats[i]);
 +                    // [wcw] also checksum the RAW TRI (rect) vertices — the title screen is texrects,
@@ -869,7 +870,7 @@ index 5a331aa..24be9f9 100644
                      const bool resetTicks = !generateInterpolatedFrames || (originalRateForTicks != workload.viOriginalRate) || (displayRateForTicks != workloadConfig.targetRate) || !displayRateAboveOriginal;
                      if (resetTicks) {
 diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
-index 9fae0d4..f89b948 100644
+index 9fae0d4..632fc9c 100644
 --- a/src/render/rt64_framebuffer_renderer.cpp
 +++ b/src/render/rt64_framebuffer_renderer.cpp
 @@ -484,6 +484,10 @@ namespace RT64 {
@@ -877,34 +878,35 @@ index 9fae0d4..f89b948 100644
              worker->commandList->setGraphicsDescriptorSet(descTextureSet->get(), 2);
              worker->commandList->setGraphicsDescriptorSet(depthState ? descRealFbSet : descDummyFbSet, 3);
 +            // [wcw] DIAGNOSTIC: log the actual GPU viewport used for the workload draws.
-+            { static int vp = 0; if ((vp++ % 100) == 0) fprintf(stderr, "[wcw][gpuviewport#%d] x=%.1f y=%.1f w=%.1f h=%.1f minD=%.2f maxD=%.2f\n",
++            { static int vp = 0; static const bool wcwTrace = getenv("WCW_TRACE") != nullptr; if (wcwTrace && (vp++ % 100) == 0) fprintf(stderr, "[wcw][gpuviewport#%d] x=%.1f y=%.1f w=%.1f h=%.1f minD=%.2f maxD=%.2f\n",
 +                vp, framebuffer.viewport.x, framebuffer.viewport.y, framebuffer.viewport.width, framebuffer.viewport.height,
 +                framebuffer.viewport.minDepth, framebuffer.viewport.maxDepth); }
              worker->commandList->setViewports(framebuffer.viewport);
          };
  
-@@ -546,6 +550,15 @@ namespace RT64 {
+@@ -546,6 +550,16 @@ namespace RT64 {
                  assert(triangles.pipeline != nullptr);
  
                  // Draw calls can sometimes end up with empty scissors and cause validation errors. We just skip them.
 +                // [wcw] DIAGNOSTIC: count draws skipped due to empty scissor vs executed, log sample rects.
 +                { static int skipped = 0, executed = 0, logged = 0;
++                  static const bool wcwTrace = getenv("WCW_TRACE") != nullptr;
 +                  if (triangles.scissor.isEmpty()) {
 +                    skipped++;
-+                    if (logged < 8) { logged++; fprintf(stderr, "[wcw][SKIP-emptyscissor] #%d scissor=(%d,%d)-(%d,%d) viewport=(%.1f,%.1f %.1fx%.1f)\n",
++                    if (wcwTrace && logged < 8) { logged++; fprintf(stderr, "[wcw][SKIP-emptyscissor] #%d scissor=(%d,%d)-(%d,%d) viewport=(%.1f,%.1f %.1fx%.1f)\n",
 +                        skipped, triangles.scissor.left, triangles.scissor.top, triangles.scissor.right, triangles.scissor.bottom,
 +                        framebuffer.viewport.x, framebuffer.viewport.y, framebuffer.viewport.width, framebuffer.viewport.height); }
 +                  } else { executed++; }
-+                  if (((skipped + executed) % 2000) == 1) fprintf(stderr, "[wcw][drawexec] executed=%d skippedEmptyScissor=%d\n", executed, skipped); }
++                  if (wcwTrace && ((skipped + executed) % 2000) == 1) fprintf(stderr, "[wcw][drawexec] executed=%d skippedEmptyScissor=%d\n", executed, skipped); }
                  if (triangles.scissor.isEmpty()) {
                      continue;
                  }
-@@ -576,6 +589,12 @@ namespace RT64 {
+@@ -576,6 +590,12 @@ namespace RT64 {
                  rasterParams.screenOffset = triangles.screenOffset;
                  worker->commandList->setGraphicsPushConstants(0, &rasterParams);
  
 +                // [wcw] DIAGNOSTIC: log per-draw transform + count (degenerate scale = invisible).
-+                { static int pd = 0; if ((pd++ % 500) == 0) fprintf(stderr, "[wcw][draw#%d] type=%d faces=%d scale=(%.3f,%.3f) offset=(%.3f,%.3f)\n",
++                { static int pd = 0; static const bool wcwTrace = getenv("WCW_TRACE") != nullptr; if (wcwTrace && (pd++ % 500) == 0) fprintf(stderr, "[wcw][draw#%d] type=%d faces=%d scale=(%.3f,%.3f) offset=(%.3f,%.3f)\n",
 +                    pd, (int)drawCall.type, (int)triangles.faceCount,
 +                    (float)triangles.screenScale.x, (float)triangles.screenScale.y,
 +                    (float)triangles.screenOffset.x, (float)triangles.screenOffset.y); }
@@ -912,7 +914,7 @@ index 9fae0d4..f89b948 100644
                  drawCallTriangles(drawCall);
  
                  // Simulate dither noise.
-@@ -1433,7 +1452,12 @@ namespace RT64 {
+@@ -1433,7 +1453,12 @@ namespace RT64 {
  
          const float SimilarityPercentage = 0.1f; // TODO: Make more strict once VI ratios are in.
          const float scissorRatio = static_cast<float>(fbPair.scissorRect.width(false, true)) / static_cast<float>(fbPair.scissorRect.height(false, true));
@@ -926,7 +928,7 @@ index 9fae0d4..f89b948 100644
          const float aspectRatioScale = adjustRatio ? (p.aspectRatioTarget / p.aspectRatioSource) : 1.0f;
          InstanceDrawCall instanceDrawCall;
          interop::RenderIndices renderIndices;
-@@ -1607,6 +1631,8 @@ namespace RT64 {
+@@ -1607,6 +1632,8 @@ namespace RT64 {
                      {
                          triangles.shaderDesc = call.shaderDesc;
  
@@ -935,15 +937,16 @@ index 9fae0d4..f89b948 100644
                          RasterShader *gpuShader = p.ubershadersOnly ? nullptr : p.rasterShaderCache->getGPUShader(call.shaderDesc);
                          if (gpuShader != nullptr) {
                              triangles.pipeline = gpuShader->pipeline.get();
-@@ -1618,6 +1644,11 @@ namespace RT64 {
+@@ -1618,6 +1645,12 @@ namespace RT64 {
                                  !copyMode && call.shaderDesc.otherMode.zUpd(),
                                  (call.shaderDesc.otherMode.cvgDst() == CVG_DST_WRAP) || (call.shaderDesc.otherMode.cvgDst() == CVG_DST_SAVE));
                          }
 +                        // [wcw] DIAGNOSTIC: count draws and whether they got a real pipeline.
 +                        { static int dc = 0, nullpipe = 0, uber = 0;
++                          static const bool wcwTrace = getenv("WCW_TRACE") != nullptr;
 +                          if (triangles.pipeline == nullptr) nullpipe++;
 +                          if (gpuShader == nullptr) uber++;
-+                          if ((dc++ % 500) == 0) fprintf(stderr, "[wcw][drawcall#%d] nullPipelines=%d uberFallbacks=%d\n", dc, nullpipe, uber); }
++                          if (wcwTrace && (dc++ % 500) == 0) fprintf(stderr, "[wcw][drawcall#%d] nullPipelines=%d uberFallbacks=%d\n", dc, nullpipe, uber); }
                          
                          triangles.faceCount = call.callDesc.triangleCount;
                          triangles.vertexTestZ = (vertexTestZCallIndex >= 0);
@@ -990,7 +993,7 @@ index 494d99e..d3d406a 100644
          }
  
 diff --git a/src/render/rt64_vi_renderer.cpp b/src/render/rt64_vi_renderer.cpp
-index b4ff4e9..bb49493 100644
+index b4ff4e9..5e7ebe5 100644
 --- a/src/render/rt64_vi_renderer.cpp
 +++ b/src/render/rt64_vi_renderer.cpp
 @@ -77,6 +77,15 @@ namespace RT64 {
@@ -999,7 +1002,7 @@ index b4ff4e9..bb49493 100644
          pushConstants.gamma = p.vi->gamma();
 +        // [wcw] DIAGNOSTIC: the shader samples with a BORDER sampler (out of range = black).
 +        // Log the size math to catch a VI-vs-texture mismatch producing an all-border quad.
-+        { static int vr = 0; if ((vr++ % 120) == 0) {
++        { static int vr = 0; static const bool wcwTrace = getenv("WCW_TRACE") != nullptr; if (wcwTrace && (vr++ % 120) == 0) {
 +            hlslpp::uint2 fbsz = p.vi->fbSize();
 +            fprintf(stderr, "[wcw][viblit#%d] vi.fbSize=%ux%u videoRes=(%.0f,%.0f) texRes=(%.0f,%.0f) gamma=%d\n",
 +                vr, (unsigned)fbsz.x, (unsigned)fbsz.y,

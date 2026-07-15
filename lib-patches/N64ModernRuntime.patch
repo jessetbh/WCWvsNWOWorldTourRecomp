@@ -39,10 +39,10 @@ index 35703bd..a39baeb 100644
  
  #endif
 diff --git a/librecomp/src/ai.cpp b/librecomp/src/ai.cpp
-index 0195f2b..4e758b3 100644
+index 0195f2b..f5c4a50 100644
 --- a/librecomp/src/ai.cpp
 +++ b/librecomp/src/ai.cpp
-@@ -6,24 +6,48 @@
+@@ -6,24 +6,49 @@
  
  #define VI_NTSC_CLOCK 48681812
  
@@ -74,14 +74,14 @@ index 0195f2b..4e758b3 100644
  
  extern "C" void osAiSetNextBuffer_recomp(uint8_t* rdram, recomp_context* ctx) {
 +    // [wcw] totals every 64 calls to see whether the audio driver still feeds buffers late in a run
-+    { static int n = 0; if ((n++ % 64) == 0) fprintf(stderr, "[wcw][ai] osAiSetNextBuffer #%d len=0x%X\n", n - 1, (unsigned)ctx->r5); }
++    { static int n = 0; static const bool wcwTrace = getenv("WCW_TRACE") != nullptr; if (wcwTrace && (n++ % 64) == 0) fprintf(stderr, "[wcw][ai] osAiSetNextBuffer #%d len=0x%X\n", n - 1, (unsigned)ctx->r5); }
      ultramodern::queue_audio_buffer(rdram, ctx->r4, ctx->r5);
      ctx->r2 = 0;
  }
  
  extern "C" void osAiGetLength_recomp(uint8_t* rdram, recomp_context* ctx) {
      ctx->r2 = ultramodern::get_remaining_audio_bytes();
-+    { static int n = 0; if ((n++ % 256) == 0) fprintf(stderr, "[wcw][ai] osAiGetLength #%d -> 0x%X\n", n - 1, (unsigned)ctx->r2); }
++    { static int n = 0; static const bool wcwTrace = getenv("WCW_TRACE") != nullptr; if (wcwTrace && (n++ % 256) == 0) fprintf(stderr, "[wcw][ai] osAiGetLength #%d -> 0x%X\n", n - 1, (unsigned)ctx->r2); }
  }
  
  extern "C" void osAiGetStatus_recomp(uint8_t* rdram, recomp_context* ctx) {
@@ -93,7 +93,8 @@ index 0195f2b..4e758b3 100644
 +    bool full = ultramodern::is_audio_backlogged();
 +    ctx->r2 = full ? 0xC0000000 : 0x00000000;
 +    { static int n = 0, fulls = 0; if (full) fulls++;
-+      if ((n++ % 4096) == 0) fprintf(stderr, "[wcw][ai] osAiGetStatus #%d fulls=%d\n", n - 1, fulls); }
++      static const bool wcwTrace = getenv("WCW_TRACE") != nullptr;
++      if (wcwTrace && (n++ % 4096) == 0) fprintf(stderr, "[wcw][ai] osAiGetStatus #%d fulls=%d\n", n - 1, fulls); }
  }
 diff --git a/librecomp/src/math_routines.cpp b/librecomp/src/math_routines.cpp
 index 4d6a01d..9e2dc24 100644
@@ -774,7 +775,7 @@ index 0000000..1adf436
 +    _return<s32>(ctx, 0);
 +}
 diff --git a/librecomp/src/sp.cpp b/librecomp/src/sp.cpp
-index ae0f44f..9a6e7dc 100644
+index ae0f44f..aa13222 100644
 --- a/librecomp/src/sp.cpp
 +++ b/librecomp/src/sp.cpp
 @@ -2,6 +2,9 @@
@@ -787,7 +788,7 @@ index ae0f44f..9a6e7dc 100644
  
  extern "C" void osSpTaskLoad_recomp(uint8_t* rdram, recomp_context* ctx) {
      // Nothing to do here
-@@ -10,8 +13,13 @@ extern "C" void osSpTaskLoad_recomp(uint8_t* rdram, recomp_context* ctx) {
+@@ -10,8 +13,14 @@ extern "C" void osSpTaskLoad_recomp(uint8_t* rdram, recomp_context* ctx) {
  bool dump_frame = false;
  
  extern "C" void osSpTaskStartGo_recomp(uint8_t* rdram, recomp_context* ctx) {
@@ -796,8 +797,9 @@ index ae0f44f..9a6e7dc 100644
 +    // [wcw] running totals every 64 tasks so a stall's task mix is visible late in a run
 +    {
 +        static int nGfx = 0, nAud = 0, nAll = 0;
++        static const bool wcwTrace = getenv("WCW_TRACE") != nullptr;
 +        if (task->t.type == M_GFXTASK) nGfx++; else if (task->t.type == M_AUDTASK) nAud++;
-+        if ((nAll++ % 64) == 0) fprintf(stderr, "[wcw][sp] task totals: gfx=%d aud=%d\n", nGfx, nAud);
++        if (wcwTrace && (nAll++ % 64) == 0) fprintf(stderr, "[wcw][sp] task totals: gfx=%d aud=%d\n", nGfx, nAud);
 +    }
      if (task->t.type == M_GFXTASK) {
          //printf("[sp] Gfx task: %08X\n", (uint32_t)ctx->r4);
@@ -1280,7 +1282,7 @@ index a170407..07b6997 100644
      ultramodern::send_si_message();
  
 diff --git a/ultramodern/src/mesgqueue.cpp b/ultramodern/src/mesgqueue.cpp
-index 961de3d..abeab95 100644
+index 961de3d..4ba2e69 100644
 --- a/ultramodern/src/mesgqueue.cpp
 +++ b/ultramodern/src/mesgqueue.cpp
 @@ -1,4 +1,12 @@
@@ -1296,7 +1298,7 @@ index 961de3d..abeab95 100644
  
  #include "blockingconcurrentqueue.h"
  
-@@ -10,34 +18,173 @@ struct QueuedMessage {
+@@ -10,34 +18,180 @@ struct QueuedMessage {
      OSMesg mesg;
      bool jam;
      bool requeue_if_blocked;
@@ -1397,6 +1399,13 @@ index 961de3d..abeab95 100644
 +// del/s = deliveries; drop/s = orphaned messages expired by the requeue grace window. This is
 +// the instrumentation that root-caused the 4-minute in-match slowdown/SFX-loss (see the
 +// requeue_grace_ms comment above).
++// [wcw fix] The per-event bring-up diagnostics below (mq/send/frame/recv traces) are
++// opt-in via WCW_TRACE=1 — ungated they land in every user's log file.
++static bool wcw_trace_enabled() {
++    static const bool on = getenv("WCW_TRACE") != nullptr;
++    return on;
++}
++
 +void wcw_health_tick() {
 +    static const bool enabled = getenv("WCW_HEALTH_LOG") != nullptr;
 +    if (!enabled) {
@@ -1474,7 +1483,7 @@ index 961de3d..abeab95 100644
      }
  }
  
-@@ -45,13 +192,27 @@ void ultramodern::wait_for_external_message_timed(RDRAM_ARG u32 millis) {
+@@ -45,13 +199,27 @@ void ultramodern::wait_for_external_message_timed(RDRAM_ARG u32 millis) {
      QueuedMessage to_send;
      if (external_messages.wait_dequeue_timed(to_send, std::chrono::milliseconds{millis})) {
          if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
@@ -1496,14 +1505,14 @@ index 961de3d..abeab95 100644
 +    // in thread 6's stack (func_800E2704's saved-s0 slot 0x80083900 receives retrace/
 +    // task-done message values). Log any queue whose ring buffer lands in that region
 +    // to identify the creator.
-+    if ((uint32_t)msg >= 0x80080000u && (uint32_t)msg < 0x80084000u) {
++    if (wcw_trace_enabled() && (uint32_t)msg >= 0x80080000u && (uint32_t)msg < 0x80084000u) {
 +        fprintf(stderr, "[wcw2k][mq] osCreateMesgQueue mq=0x%08X BUFFER=0x%08X count=%d (in thread-6 TCB/stack region!)\n",
 +            (uint32_t)mq_, (uint32_t)msg, count);
 +    }
      mq->blocked_on_recv = NULLPTR;
      mq->blocked_on_send = NULLPTR;
      mq->msgCount = count;
-@@ -72,22 +233,58 @@ s32 MQ_IS_FULL(OSMesgQueue* mq) {
+@@ -72,22 +240,58 @@ s32 MQ_IS_FULL(OSMesgQueue* mq) {
      return MQ_GET_COUNT(mq) >= mq->msgCount;
  }
  
@@ -1562,7 +1571,7 @@ index 961de3d..abeab95 100644
      
      if (jam) {
          // Jams insert at the head of the message queue's buffer.
-@@ -122,6 +319,10 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
+@@ -122,6 +326,10 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
          // Otherwise, yield this thread in a loop until the queue is no longer full
          while (MQ_IS_EMPTY(mq)) {
              debug_printf("[Message Queue] Thread %d is blocked on receive\n", TO_PTR(OSThread, ultramodern::this_thread())->id);
@@ -1573,7 +1582,7 @@ index 961de3d..abeab95 100644
              ultramodern::thread_queue_insert(PASS_RDRAM GET_MEMBER(OSMesgQueue, mq_, blocked_on_recv), ultramodern::this_thread());
              ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
          }
-@@ -146,7 +347,18 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
+@@ -146,7 +354,19 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
  extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags) {
      OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
      bool jam = false;
@@ -1582,8 +1591,9 @@ index 961de3d..abeab95 100644
 +    // [wcw2k] DIAGNOSTIC: sends into thread 6's upper stack frames (the func_800E2704
 +    // saved-s0 slot 0x80083900 corruption — bringup session 5 part 5). Log the target
 +    // mq, its ring buffer, and the sender.
-+    if (((uint32_t)mq_ >= 0x80083800u && (uint32_t)mq_ < 0x80083A00u) ||
-+        ((uint32_t)mq->msg >= 0x80083800u && (uint32_t)mq->msg < 0x80083A00u)) {
++    if (wcw_trace_enabled() &&
++        (((uint32_t)mq_ >= 0x80083800u && (uint32_t)mq_ < 0x80083A00u) ||
++         ((uint32_t)mq->msg >= 0x80083800u && (uint32_t)mq->msg < 0x80083A00u))) {
 +        fprintf(stderr, "[wcw2k][send] mq=0x%08X buf=0x%08X valid=%d msg=0x%08X sender=0x%08X game=%d\n",
 +            (uint32_t)mq_, (uint32_t)mq->msg, mq->validCount, (uint32_t)msg,
 +            ultramodern::is_game_thread() ? (uint32_t)ultramodern::this_thread() : 0,
@@ -1593,13 +1603,13 @@ index 961de3d..abeab95 100644
      // Don't directly send to the message queue if this isn't a game thread to avoid contention.
      if (!ultramodern::is_game_thread()) {
          ultramodern::enqueue_external_message(mq_, msg, jam, false);
-@@ -156,9 +368,21 @@ extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags)
+@@ -156,9 +376,21 @@ extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags)
      // Handle any messages that have been received from an external thread.
      dequeue_external_messages(PASS_RDRAM1);
  
 +    // [wcw] DIAGNOSTIC: every frame-ready (send to 0x80040FC0) log the present pointer the game
 +    // left in 0x80040FFC — nonzero = func_800033A0 present-with-DL, zero = func_800033E8 sync-only.
-+    if ((uint32_t)mq_ == 0x80040FC0) {
++    if (wcw_trace_enabled() && (uint32_t)mq_ == 0x80040FC0) {
 +        static int fn = 0;
 +        if (fn++ < 80) {
 +            uint32_t off = 0x40FFC;
@@ -1616,15 +1626,15 @@ index 961de3d..abeab95 100644
      // Check the queue to see if this thread should swap execution to another.
      ultramodern::check_running_queue(PASS_RDRAM1);
  
-@@ -195,11 +419,26 @@ extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32
+@@ -195,11 +427,26 @@ extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32
      // Handle any messages that have been received from an external thread.
      dequeue_external_messages(PASS_RDRAM1);
  
 +    // [wcw] DIAGNOSTIC: trace recv calls to find where the game thread parks.
 +    static int rn = 0;
-+    if (rn < 80) fprintf(stderr, "[wcw][recv#%d] mq=0x%X block=%d validCount=%d\n", rn, (unsigned)mq_, (int)(flags == OS_MESG_BLOCK), mq ? (int)mq->validCount : -1);
++    if (wcw_trace_enabled() && rn < 80) fprintf(stderr, "[wcw][recv#%d] mq=0x%X block=%d validCount=%d\n", rn, (unsigned)mq_, (int)(flags == OS_MESG_BLOCK), mq ? (int)mq->validCount : -1);
 +#ifdef _WIN32
-+    if (rn == 0 && flags == OS_MESG_BLOCK) {
++    if (wcw_trace_enabled() && rn == 0 && flags == OS_MESG_BLOCK) {
 +        void* fr[24]; unsigned short n = RtlCaptureStackBackTrace(0, 24, fr, nullptr);
 +        HMODULE base = GetModuleHandleW(nullptr);
 +        fprintf(stderr, "[wcw][recv#0] base=%p frames:", (void*)base);
@@ -1641,7 +1651,7 @@ index 961de3d..abeab95 100644
      // Check the queue to see if this thread should swap execution to another.
      ultramodern::check_running_queue(PASS_RDRAM1);
  
-+    if (rn <= 80) fprintf(stderr, "[wcw][recv#%d] -> %s\n", rn - 1, received ? "got msg" : "empty");
++    if (wcw_trace_enabled() && rn <= 80) fprintf(stderr, "[wcw][recv#%d] -> %s\n", rn - 1, received ? "got msg" : "empty");
      return received ? 0 : -1;
  }
 diff --git a/ultramodern/src/scheduling.cpp b/ultramodern/src/scheduling.cpp
