@@ -274,7 +274,7 @@ index 8c8e5d1..3051706 100644
      for (auto it = loaded_sections.begin(); it != loaded_sections.end();) {
          const auto& section = sections_info.code_sections[it->section_table_index];
 diff --git a/librecomp/src/pi.cpp b/librecomp/src/pi.cpp
-index 62656ad..8282706 100644
+index 62656ad..fa20ce1 100644
 --- a/librecomp/src/pi.cpp
 +++ b/librecomp/src/pi.cpp
 @@ -8,6 +8,7 @@
@@ -285,7 +285,7 @@ index 62656ad..8282706 100644
  #include <ultramodern/ultra64.h>
  #include <ultramodern/ultramodern.hpp>
  
-@@ -63,6 +64,27 @@ extern "C" void osCreatePiManager_recomp(uint8_t* rdram, recomp_context* ctx) {
+@@ -63,6 +64,28 @@ extern "C" void osCreatePiManager_recomp(uint8_t* rdram, recomp_context* ctx) {
  
  void recomp::do_rom_read(uint8_t* rdram, gpr ram_address, uint32_t physical_addr, size_t num_bytes) {
      // TODO use word copies when possible
@@ -305,7 +305,8 @@ index 62656ad..8282706 100644
 +        // Range covers ovl_d text AND data (rom 0xD2720..0x144AA0): boot88's in-match rope
 +        // corruption made the data-section stream (tables at vram 0x8014C640+) a suspect,
 +        // and the old 0x13D1D0 (text-end) cutoff made those chunks invisible in the log.
-+        if ((off >= 0xD2720 && off < 0x144AA0) || (uint32_t)ram_address == 0xFFFFFFFF800E1B90ull || (uint32_t)ram_address == 0x800E1B90u) {
++        static const bool wcwTrace = getenv("WCW_TRACE") != nullptr;
++        if (wcwTrace && ((off >= 0xD2720 && off < 0x144AA0) || (uint32_t)ram_address == 0xFFFFFFFF800E1B90ull || (uint32_t)ram_address == 0x800E1B90u)) {
 +            fprintf(stderr, "[wcw2k][ovl?] rom_read rom=0x%zX -> ram=0x%08X len=0x%zX\n",
 +                off, (uint32_t)ram_address, num_bytes);
 +        }
@@ -313,7 +314,7 @@ index 62656ad..8282706 100644
  
      // TODO handle misaligned DMA
      assert((physical_addr & 0x1) == 0 && "Only PI DMA from aligned ROM addresses is currently supported");
-@@ -195,6 +217,15 @@ void save_read(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t coun
+@@ -195,6 +218,15 @@ void save_read(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t coun
      }
  }
  
@@ -329,7 +330,7 @@ index 62656ad..8282706 100644
  void save_clear(uint32_t start, uint32_t size, char value) {
      assert(start + size < save_context.save_buffer.size());
  
-@@ -266,6 +297,39 @@ void ultramodern::join_saving_thread() {
+@@ -266,6 +298,40 @@ void ultramodern::join_saving_thread() {
      }
  }
  
@@ -359,8 +360,9 @@ index 62656ad..8282706 100644
 +    // the load never happens. Log every DMA that touches the swap slots or the ovl_d image.
 +    else {
 +        uint32_t dst = (uint32_t)rdram_address;
-+        if (dst == 0x800E1B90u || dst == 0x8011C900u ||
-+            (rom_off >= 0xD2720u && rom_off < 0x13D1D0u)) {
++        static const bool wcwTrace = getenv("WCW_TRACE") != nullptr;
++        if (wcwTrace && (dst == 0x800E1B90u || dst == 0x8011C900u ||
++            (rom_off >= 0xD2720u && rom_off < 0x13D1D0u))) {
 +            fprintf(stderr, "[wcw2k][ovl?] unmatched DMA rom=0x%06X -> 0x%08X\n", rom_off, dst);
 +        }
 +    }
@@ -369,7 +371,7 @@ index 62656ad..8282706 100644
  void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_addr, uint32_t size, uint32_t direction) {
      // TODO asynchronous transfer
      // TODO implement unaligned DMA correctly
-@@ -273,6 +337,7 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
+@@ -273,6 +339,7 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
          if (physical_addr >= recomp::rom_base) {
              // read cart rom
              recomp::do_rom_read(rdram, rdram_address, physical_addr, size);
