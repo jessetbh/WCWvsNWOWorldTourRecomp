@@ -653,10 +653,41 @@ index ee2030b..558d3e7 100644
          const uint32_t cycleType = state->rdp->otherMode.cycleType();
          assert(cycleType != G_CYC_COPY);
 diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
-index d249a97..9bfeec9 100644
+index d249a97..62597ad 100644
 --- a/src/hle/rt64_state.cpp
 +++ b/src/hle/rt64_state.cpp
-@@ -1747,6 +1747,21 @@ namespace RT64 {
+@@ -6,6 +6,7 @@
+ 
+ #include <cassert>
+ #include <cinttypes>
++#include <set>
+ 
+ #include "im3d/im3d.h"
+ #include "im3d/im3d_math.h"
+@@ -1164,6 +1165,22 @@ namespace RT64 {
+                         depthFb->everUsedAsDepth = true;
+                     }
+ 
++                    // [wcw diag] WCW_FBLOG=1: log each distinct framebuffer pair (color/depth
++                    // image address, size) — for the No Mercy match-heap-vs-stale-framebuffer
++                    // writeback hunt. Dedup by address pair, print first sightings only.
++                    {
++                        static const bool wcwFbLog = getenv("WCW_FBLOG") != nullptr;
++                        if (wcwFbLog) {
++                            static std::set<uint64_t> seenPairs;
++                            const uint64_t key = (uint64_t(colorImg.address) << 32) | depthImg.address;
++                            if (seenPairs.insert(key).second) {
++                                fprintf(stderr, "[wcw][fbpair] color=0x%08X siz=%u w=%u h=%u depth=0x%08X dW=%u\n",
++                                    colorImg.address, colorImg.siz, colorImg.width, colorHeight,
++                                    depthImg.address, depthWriteWidth);
++                            }
++                        }
++                    }
++
+                     colorRowStart = fbPair.drawColorRect.top(false);
+                     colorRowEnd = fbPair.drawColorRect.bottom(true);
+                     depthRowStart = 0;
+@@ -1747,6 +1764,21 @@ namespace RT64 {
              }
          }
          
@@ -678,7 +709,7 @@ index d249a97..9bfeec9 100644
          // Advance the workload queue at the end of a full synchronization.
          advanceWorkload(workload, false);
          ext.workloadQueue->advanceToNextWorkload();
-@@ -1870,6 +1885,21 @@ namespace RT64 {
+@@ -1870,6 +1902,21 @@ namespace RT64 {
          screenCpuProfiler.start();
          bool fbChangesMade = false;
          bool screenChangesMade = false;

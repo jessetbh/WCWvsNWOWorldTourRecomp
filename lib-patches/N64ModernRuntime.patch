@@ -897,7 +897,7 @@ index 3198be0..966711a 100644
  // If there's ever any audio popping, check here first. Some games are very sensitive to
  // the remaining sample count and reporting a number that's too high here can lead to issues.
 diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
-index 090cc42..bfe867b 100644
+index 090cc42..677a00d 100644
 --- a/ultramodern/src/events.cpp
 +++ b/ultramodern/src/events.cpp
 @@ -29,6 +29,7 @@ struct SpTaskAction {
@@ -1138,7 +1138,7 @@ index 090cc42..bfe867b 100644
          // Tell the game that the RSP has completed
          sp_complete();
      }
-@@ -355,8 +494,35 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+@@ -355,15 +494,51 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
  
      while (!exited) {
          // Try to pull an action from the queue
@@ -1175,10 +1175,33 @@ index 090cc42..bfe867b 100644
 +                }
              // Determine the action type and act on it
              if (const auto* task_action = std::get_if<SpTaskAction>(&action)) {
-                 // Tell the game that the RSP completed instantly. This will allow it to queue other task types, but it won't
-@@ -372,6 +538,18 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+-                // Tell the game that the RSP completed instantly. This will allow it to queue other task types, but it won't
+-                // start another graphics task until the RDP is also complete. Games usually preserve the RSP inputs until the RDP
+-                // is finished as well, so sending this early shouldn't be an issue in most cases.
+-                // If this causes issues then the logic can be replaced with responding to yield requests.
+-                sp_complete();
++                // [wcw fix] sp_complete() used to be signaled HERE, before send_dl — telling the
++                // game the RSP consumed its inputs before RT64 actually read them. On hardware,
++                // SP-done is the license to rewrite RSP inputs, and the AKI engine takes it: its
++                // pose pass rewrites the double-buffered bone matrices as soon as SP-done arrives,
++                // which can race this thread's DL interpretation and feed torn/stale
++                // gSPForceMatrix loads (WWF No Mercy's per-wrestler matrices are the exposed
++                // surface; static-matrix menus are immune). Signal sp_complete() AFTER send_dl
++                // instead — the hardware contract — so inputs are fully ingested before the game
++                // may rewrite them. (The old comment predicted exactly this: "If this causes
++                // issues then the logic can be replaced with responding to yield requests.")
++                // NOTE: this is a correctness hardening of the SP-input contract, NOT the cause
++                // of the No Mercy exploded-wrestler bug — that was a recompiler miscompile
++                // (misplaced self-entry label, fixed by tools/fix_selfentry.py). This reorder is
++                // the defensive other half; kept because the old ordering is simply wrong on HW.
+                 ultramodern::measure_input_latency();
+ 
+                 PTR(u64) displaylist = task_action->task.t.data_ptr;
+@@ -371,7 +546,20 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+ 
                  [[maybe_unused]] auto renderer_start = std::chrono::high_resolution_clock::now();
                  renderer_context->send_dl(&task_action->task);
++                sp_complete(); // [wcw fix] see above: RSP inputs are consumed only now.
                  [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
 +                { // [wcw] DIAGNOSTIC (WCW_PRESENT_LUM=1): per-task display-list processing cost on this thread.
 +                    static const bool wcwDlog = getenv("WCW_PRESENT_LUM") != nullptr;
@@ -1195,7 +1218,7 @@ index 090cc42..bfe867b 100644
  
                  dp_complete();
                  // TODO hook the parsed event up to the actual parsing point when a callback is added to RT64.
-@@ -380,6 +558,18 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+@@ -380,6 +568,18 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                  // printf("Renderer ProcessDList time: %d us\n", static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(renderer_end - renderer_start).count()));
              }
              else if (const auto* screen_update_action = std::get_if<ScreenUpdateAction>(&action)) {
@@ -1214,7 +1237,7 @@ index 090cc42..bfe867b 100644
                  events_context.vi.update_screen_regs = screen_update_action->regs;
                  renderer_context->update_screen();
                  display_refresh_rate = renderer_context->get_display_framerate();
-@@ -395,6 +585,7 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+@@ -395,6 +595,7 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
              else if (const auto* dummy_workload_action = std::get_if<DummyWorkloadAction>(&action)) {
                  renderer_context->send_dummy_workload(dummy_workload_action->fb_address);
              }
@@ -1222,7 +1245,7 @@ index 090cc42..bfe867b 100644
          }
      }
  
-@@ -454,8 +645,29 @@ void set_dummy_vi(bool odd) {
+@@ -454,8 +655,29 @@ void set_dummy_vi(bool odd) {
      }
  }
  
