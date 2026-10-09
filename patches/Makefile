@@ -21,8 +21,10 @@ endif
 # (`-target mips-freestanding-none -mcpu=mips2` is the zig-compatible spelling of
 # plain clang's `-target mips -mips2`; verified to emit the same non-PIC
 # R_MIPS_HI16/LO16/26 relocs N64Recomp expects.)
+# -fno-sanitize=undefined: zig cc enables UBSan by default, and array indexing then
+# references __ubsan_handle_* runtime symbols that don't exist for the recompiler.
 CFLAGS   := -target mips-freestanding-none -mcpu=mips2 -mabi=32 -g -G0 -mno-abicalls -mno-odd-spreg -mno-check-zero-division \
-			-fomit-frame-pointer -ffast-math -fno-unsafe-math-optimizations -fno-builtin-memset \
+			-fno-sanitize=undefined -fomit-frame-pointer -ffast-math -fno-unsafe-math-optimizations -fno-builtin-memset \
 			-Wall -Wextra -Wno-incompatible-library-redeclaration -Wno-unused-parameter -Wno-unknown-pragmas \
 			-Wno-unused-variable -Wno-unused-but-set-variable -Wno-missing-braces \
 			-Wno-unsupported-floating-point-opt -Wno-switch -D_MIPS_SZLONG=32

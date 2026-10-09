@@ -709,6 +709,20 @@ int main(int argc, char** argv) {
     }
 #endif
 
+    // DIAGNOSTIC (opt-in): WCW_QUIT_AFTER=<seconds> requests a graceful quit (the same
+    // ultramodern::quit() the quit prompt's "Quit" button calls), so scripted test runs can
+    // end without the confirm dialog or a hard kill.
+    if (const char *wcwQuitEnv = getenv("WCW_QUIT_AFTER")) {
+        const int wcwQuitDelay = atoi(wcwQuitEnv);
+        if (wcwQuitDelay > 0) {
+            std::thread([wcwQuitDelay]() {
+                std::this_thread::sleep_for(std::chrono::seconds(wcwQuitDelay));
+                fprintf(stderr, "[wcw] WCW_QUIT_AFTER=%d: quitting\n", wcwQuitDelay);
+                ultramodern::quit();
+            }).detach();
+        }
+    }
+
     // NOTE: graphics-API init (both D3D12 and Vulkan) aborts in a headless/virtual-display
     // session even with a GPU present; it should initialize on a normal local desktop.
     // Leave api_option at its default (Auto -> D3D12 on Windows). To override for testing:
