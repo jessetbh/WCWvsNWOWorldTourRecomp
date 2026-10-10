@@ -161,16 +161,21 @@ index c89956e..73c8376 100644
          return profile_index;
      }
 diff --git a/recompui/include/recompui/config.h b/recompui/include/recompui/config.h
-index 38b84f5..b8af38d 100644
+index 38b84f5..dfe8d58 100644
 --- a/recompui/include/recompui/config.h
 +++ b/recompui/include/recompui/config.h
-@@ -61,6 +61,9 @@ namespace recompui {
+@@ -61,6 +61,14 @@ namespace recompui {
                  inline const std::string hpfb_option = "hpfb_option";
                  inline const std::string rr_manual_value = "rr_manual_value";
                  inline const std::string ds_option = "ds_option";
 +                // [wcw rt] Experimental hybrid ray tracing (RT64 WcwRaytracer).
 +                inline const std::string rt_option = "rt_option";
 +                inline const std::string rt_quality_option = "rt_quality_option";
++                // [wcw crt] CRT presentation filter (RT64 CrtFilter).
++                inline const std::string crt_filter_option = "crt_filter_option";
++                inline const std::string crt_signal_option = "crt_signal_option";
++                inline const std::string crt_colors_option = "crt_colors_option";
++                inline const std::string crt_beam_option = "crt_beam_option";
              }
      
              void update_msaa_supported(bool supported);
@@ -209,18 +214,19 @@ index 277a421..f5d6ad6 100644
              }
          }
 diff --git a/recompui/src/config/ui_config_tab_graphics.cpp b/recompui/src/config/ui_config_tab_graphics.cpp
-index 4fdf81f..9ecc462 100644
+index 4fdf81f..541b986 100644
 --- a/recompui/src/config/ui_config_tab_graphics.cpp
 +++ b/recompui/src/config/ui_config_tab_graphics.cpp
-@@ -2,6 +2,7 @@
+@@ -2,6 +2,8 @@
  #include "recompui/config.h"
  #include "recompui/renderer.h"
  #include "util/steam_deck.h"
++#include "render/rt64_crt_filter.h"
 +#include "render/rt64_wcw_raytracer.h"
  
  static bool created_graphics_config = false;
  
-@@ -64,6 +65,29 @@ namespace recompui {
+@@ -64,6 +66,85 @@ namespace recompui {
          #endif
          };
  
@@ -247,10 +253,66 @@ index 4fdf81f..9ecc462 100644
 +            {RayTracingQuality::Quality, "Quality", "Quality"},
 +        };
 +
++        // [wcw crt] CRT filter: on/off, the video signal (a preset in crt/presets/ next to the
++        // executable) and the TV's color standard.
++        enum class CrtFilterOption {
++            Off = 0,
++            On = 1
++        };
++
++        enum class CrtSignalOption {
++            Composite = 0,
++            SVideo = 1,
++            RF = 2,
++            RGB = 3
++        };
++
++        enum class CrtColorsOption {
++            USA = 0,
++            Japan = 1
++        };
++
++        static EnumOptionVector crt_filter_options = {
++            {CrtFilterOption::Off, "Off", "Off"},
++            {CrtFilterOption::On, "On", "On"},
++        };
++
++        static EnumOptionVector crt_signal_options = {
++            {CrtSignalOption::Composite, "Composite", "Composite"},
++            {CrtSignalOption::SVideo, "SVideo", "S-Video"},
++            {CrtSignalOption::RF, "RF", "RF"},
++            {CrtSignalOption::RGB, "RGB", "RGB"},
++        };
++
++        static EnumOptionVector crt_colors_options = {
++            {CrtColorsOption::USA, "USA", "USA"},
++            {CrtColorsOption::Japan, "Japan", "Japan"},
++        };
++
++        enum class CrtBeamOption {
++            Off = 0,
++            On = 1
++        };
++
++        static EnumOptionVector crt_beam_options = {
++            {CrtBeamOption::Off, "Off", "Off"},
++            {CrtBeamOption::On, "On", "On"},
++        };
++
++        static const char *crt_signal_preset(CrtSignalOption option) {
++            switch (option) {
++            case CrtSignalOption::SVideo: return "aki-svideo";
++            case CrtSignalOption::RF: return "aki-rf";
++            case CrtSignalOption::RGB: return "aki-rgb";
++            case CrtSignalOption::Composite:
++            default: return "aki-composite";
++            }
++        }
++
          static EnumOptionVector aspect_ratio_options = {
              {ultramodern::renderer::AspectRatio::Original, "Original"},
              {ultramodern::renderer::AspectRatio::Expand, "Expand"},
-@@ -152,11 +176,12 @@ namespace recompui {
+@@ -152,11 +233,12 @@ namespace recompui {
          }
  
          static std::string get_framerate_text(uint32_t refresh_rate) {
@@ -264,7 +326,7 @@ index 4fdf81f..9ecc462 100644
                  "<br />"
                  "<br />"
                  "<recomp-color primary>Detected display refresh rate: " + std::to_string(refresh_rate) + "hz</recomp-color>";
-@@ -178,6 +203,11 @@ namespace recompui {
+@@ -178,6 +260,21 @@ namespace recompui {
              new_config.ds_option = get_graphics_enum_value<int>(graphics::options::ds_option);
  
              ultramodern::renderer::set_graphics_config(new_config);
@@ -273,10 +335,20 @@ index 4fdf81f..9ecc462 100644
 +            RT64::WcwRaytracer::setUserSettings(
 +                get_graphics_enum_value<RayTracingOption>(graphics::options::rt_option) == RayTracingOption::On,
 +                uint32_t(get_graphics_enum_value<RayTracingQuality>(graphics::options::rt_quality_option)));
++
++            // [wcw crt] Takes effect on the next frame; the first use of a preset compiles its shaders.
++            RT64::CrtFilter::Settings crt_settings;
++            crt_settings.enabled = get_graphics_enum_value<CrtFilterOption>(graphics::options::crt_filter_option) == CrtFilterOption::On;
++            crt_settings.preset = crt_signal_preset(get_graphics_enum_value<CrtSignalOption>(graphics::options::crt_signal_option));
++            // guest-advanced "LUT Colors": 0 = none, 1 = NTSC-J.
++            const bool crt_japan = get_graphics_enum_value<CrtColorsOption>(graphics::options::crt_colors_option) == CrtColorsOption::Japan;
++            crt_settings.parameters.emplace_back("TNTC", crt_japan ? 1.0f : 0.0f);
++            crt_settings.beamSimulator = get_graphics_enum_value<CrtBeamOption>(graphics::options::crt_beam_option) == CrtBeamOption::On;
++            RT64::CrtFilter::setUserSettings(crt_settings);
          }
  
          void graphics::update_msaa_supported(bool supported) {
-@@ -304,8 +334,27 @@ namespace recompui {
+@@ -304,8 +401,27 @@ namespace recompui {
                  "Framerate",
                  get_framerate_text(60),
                  refresh_rate_options,
@@ -305,10 +377,70 @@ index 4fdf81f..9ecc462 100644
  
              config.add_number_option(
                  graphics::options::rr_manual_value,
-@@ -359,6 +408,32 @@ namespace recompui {
+@@ -359,6 +475,92 @@ namespace recompui {
                  true
              );
  
++            config.add_enum_option(
++                graphics::options::crt_filter_option,
++                "CRT Filter",
++                "Simulates a period CRT television: the video signal, scanlines, phosphor mask and glow. "
++                "Looks best at higher window resolutions."
++                "<br />"
++                "<br />"
++                "The first use of each signal takes a few seconds to prepare.",
++                crt_filter_options,
++                CrtFilterOption::Off
++            );
++
++            config.add_enum_option(
++                graphics::options::crt_signal_option,
++                "CRT Signal",
++                "<recomp-color primary>Composite</recomp-color>: how most players saw the N64. "
++                "<recomp-color primary>S-Video</recomp-color>: a cleaner picture on a Trinitron. "
++                "<recomp-color primary>RF</recomp-color>: the RF switch, the softest and noisiest. "
++                "<recomp-color primary>RGB</recomp-color>: a sharp professional monitor (enthusiast look; a stock N64 has no RGB output).",
++                crt_signal_options,
++                CrtSignalOption::Composite
++            );
++
++            config.add_enum_option(
++                graphics::options::crt_colors_option,
++                "TV Colors",
++                "The color standard of the simulated TV. <recomp-color primary>Japan</recomp-color> uses NTSC-J colors (cooler whites), as on a Japanese set.",
++                crt_colors_options,
++                CrtColorsOption::USA
++            );
++            config.add_enum_option(
++                graphics::options::crt_beam_option,
++                "CRT Beam Simulator",
++                "Simulates the CRT's rolling scan for CRT-like motion clarity (Blur Busters CRT Beam Simulator)."
++                "<br />"
++                "<br />"
++                "<recomp-color primary>Requires a 120 Hz or faster display running at a multiple of 60 Hz, with V-Sync on.</recomp-color> "
++                "Works best at 240 Hz and up, and on OLED. Not recommended with variable refresh rate (G-Sync/FreeSync) "
++                "or local dimming. It has no effect otherwise.",
++                crt_beam_options,
++                CrtBeamOption::Off
++            );
++            {
++                config.add_option_hidden_dependency(
++                    graphics::options::crt_beam_option,
++                    graphics::options::crt_filter_option,
++                    CrtFilterOption::Off
++                );
++                config.add_option_hidden_dependency(
++                    graphics::options::crt_signal_option,
++                    graphics::options::crt_filter_option,
++                    CrtFilterOption::Off
++                );
++                config.add_option_hidden_dependency(
++                    graphics::options::crt_colors_option,
++                    graphics::options::crt_filter_option,
++                    CrtFilterOption::Off
++                );
++            }
++
 +            config.add_enum_option(
 +                graphics::options::rt_option,
 +                "Ray Tracing",
