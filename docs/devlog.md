@@ -9,6 +9,51 @@ the relevant section at the time, so it reads as a layered status document, not 
 diary. For current contributor instructions see the root CLAUDE.md and BUILDING.md.
 
 ---
+# 2026-10-10 — CRT filter + beam simulator (experimental, rt64/RecompFrontend `wcw-crt`, games `exp/crt`)
+
+Optional CRT presentation for all six games: Graphics → CRT Filter (Off/On), CRT Signal
+(Composite / S-Video / RF / RGB), TV Colors (USA / Japan = guest's NTSC-J LUT via `TNTC=1`),
+CRT Beam Simulator. Test override: `WCW_CRT=<preset>` (+ `WCW_CRT_BEAM=1`, `WCW_CRT_SRCW=<n>`),
+`WCW_CRT_LOG=1` logs beam present rate + per-phase timing.
+
+**Design.** `rt64_crt_filter.{h,cpp}` replaces the VI blit in `rt64_present_queue.cpp`
+(UI is drawn after it, so menus stay sharp). RetroArch slang presets run through
+**librashader 0.12.0** (prebuilt MPL-2.0 DLL, loaded via `librashader_ld.h`; D3D12 + Vulkan,
+writes straight into a viewport of the swap chain). The supersampled RT64 frame is first
+box-filtered (`VideoInterfacePS` `BOX_DOWNSAMPLE`) to the VI's scanline space (320x240 for 4:3)
+so the shaders see one row per scanline. Presets/shaders ship in `<exe>/crt/` (vendored
+subset of crt-guest-advanced(-ntsc), GPL-2.0+; licenses in `crt/NOTICE.md`).
+
+**Beam simulator.** Blur Busters + Lottes CRT Beam Simulator (MIT), as an AKI variant
+(`crt/shaders/aki-beam-simulator.slang`) taking a *fractional* display:CRT ratio (`HZ_RATIO`,
+2.75 at 165 Hz) — RetroArch's sub-frame API is integer-only. The present thread presents a
+sub-frame every display refresh while waiting for the game's next frame; a new game frame
+swaps in only when the simulated scan restarts (like a VI framebuffer swap). The simulated
+CRT always runs at 60 Hz — a 30 fps game is scanned twice per frame, as on hardware.
+
+**Hard-won facts.**
+- RT64/plume **does not block on vsync**: the D3D12 swap chain presents with sync interval 0
+  when present-wait is enabled, and RT64 relies on the game to pace frames. A free-running
+  present loop hit ~2500 presents/s. Beam presents are paced with DXGI
+  `IDXGIOutput::WaitForVBlank` on the window's monitor (works for Vulkan too); refreshes that
+  went by are counted (`skipBeamRefreshes`) so the scan stays in phase.
+- librashader leaves its own pipeline state bound: after each call invalidate plume's
+  cached D3D12 state (`descriptorHeapsSet`, active pipeline/layouts, topology) and rebind
+  the framebuffer.
+- **Vulkan**: librashader must not be called inside a render pass, and plume leaves one
+  open after `clearColor` until the next barrier → call `endActiveRenderPass()` first
+  (otherwise a driver crash in `vkCmdEndRenderPass`). Swap chain `VulkanTexture`s never set
+  `imageFormat` (plume only sets it for textures it allocates) → fall back to `desc.format`
+  (UNDEFINED made the NVIDIA driver divide by zero).
+- `std::set_terminate` is **per-thread** on MSVC; an uncaught exception on the present/UI
+  thread aborted silently (0xC0000409 subcode 7, no handler output). Added a process-wide
+  `SIGABRT` backtrace handler in `main.cpp`.
+- `WCW_PRESENT_LUM` swap chain readback crashes on Vulkan (`copyTextureRegion` on a swap
+  chain image) — D3D12-only diagnostic.
+- Beam pacing drops to ~50 idle sub-frames/s (vblank wait ~10 ms, ~1 refresh skipped per
+  sub-frame) while **another game is rendering on the same GPU/display**; measured 130-135/s
+  (+30 game presents = 165) when it's alone. Phase stays correct either way.
+
 # 2026-07-08 — v0.1.1 (launcher branding) + v0.1.2 (aspect-ratio fix)
 
 **v0.1.1**: game logo on the launcher screen (embedded `icons/logo.png` Image element
