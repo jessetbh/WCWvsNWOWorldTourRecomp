@@ -235,7 +235,11 @@ if (WIN32)
             "${sdl2_SOURCE_DIR}/lib/x64/SDL2.dll"
             "${RT64DIR}/src/contrib/dxc/bin/x64/dxil.dll"
             "${RT64DIR}/src/contrib/dxc/bin/x64/dxcompiler.dll"
-            $<TARGET_FILE_DIR:WCWRecompiled>)
+            "${RT64DIR}/src/contrib/librashader/bin/x64/librashader.dll"
+            $<TARGET_FILE_DIR:WCWRecompiled>
+        # CRT filter presets + slang shaders (rt64 [wcw crt]).
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${RT64DIR}/src/contrib/crt" "$<TARGET_FILE_DIR:WCWRecompiled>/crt")
 endif()
 
 # Copy the runtime UI assets and SDL controller db next to the exe so a fresh build runs

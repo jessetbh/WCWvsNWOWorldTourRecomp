@@ -2,6 +2,7 @@
 // Minimal launcher: sets up SDL + RT64 (via recompui) + the runtime callbacks, registers
 // the game, auto-loads the ROM (no UI launcher yet), and calls recomp::start.
 // Adapted from Bomberman Hero: Recompiled's src/main/main.cpp.
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <cassert>
@@ -94,6 +95,21 @@ static void wcw_terminate_handler() {
     fprintf(stderr, "==== [wcw] end backtrace ====\n");
     fflush(stderr);
     _exit(2);
+}
+
+// DIAGNOSTIC: std::set_terminate is per-thread on MSVC, so an uncaught exception (or an abort())
+// on any other thread lands here instead. SIGABRT handlers are process-wide.
+static void wcw_abort_handler(int) {
+    fprintf(stderr, "\n==== [wcw] abort() on thread %lu ====\n", GetCurrentThreadId());
+    void* frames[64];
+    USHORT n = RtlCaptureStackBackTrace(0, 64, frames, nullptr);
+    HANDLE proc = GetCurrentProcess();
+    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+    SymInitialize(proc, nullptr, TRUE);
+    for (USHORT i = 0; i < n; i++) wcw_print_frame(proc, i, (DWORD64)frames[i]);
+    fprintf(stderr, "==== [wcw] end backtrace ====\n");
+    fflush(stderr);
+    _exit(3);
 }
 
 // DIAGNOSTIC: walk the faulting thread's stack for hard faults (access violations etc.),
@@ -419,6 +435,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[wcw] main start\n");
 #ifdef _WIN32
     std::set_terminate(wcw_terminate_handler);
+    signal(SIGABRT, wcw_abort_handler);
     SetUnhandledExceptionFilter(wcw_unhandled_filter);
 
     // [wcw] DIAGNOSTIC: when running under RenderDoc (renderdoc.dll injected), trigger a
