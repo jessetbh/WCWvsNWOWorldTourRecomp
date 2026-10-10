@@ -23,15 +23,26 @@ function tables in `RecompiledFuncs/recomp_overlays.inl`:
   from the patched ROM with the live recompiler at load time (`[romhack]` lines in stderr
   list them). A plain runtime keeps running the stock code for them, and the hack usually
   crashes.
-- **Changed bytes outside functions**: code the hack added or moved outside the known
-  function boundaries. Patch mods can't run that; it needs a full recompile of the hacked
-  ROM (the VPW2 Freem `exp/freem` method).
+- **Changed bytes outside functions**, or **ESCAPES** lines (a changed function branches or
+  calls somewhere that is neither inside it nor a known function start): the hack added code
+  or restructured code across function boundaries. Patch mods can't run that, so the tool
+  won't write the mod (`--force` overrides); it needs a full recompile of the hacked ROM (the
+  VPW2 Freem `exp/freem` method). Example: one VPW2 English patch rewrites
+  func_80007070..func_80007238 into new subroutines; the runtime refuses it at load with
+  "Invalid ROM patch".
 
 Only one ROM-patch mod can be enabled at a time. On the `wcw-romhack` runtime a patch mod's
 saves go to `saves/<mod id>/`, apart from the stock game's (a plain runtime shares them, so a
 hack that changes the save layout could damage them).
 
 ## Verified
+
+Survey of 18 hack ROMs (2026-10-10): runs as a patch mod today: VPW2 Freem Edition, VPW2
+English Patched, VPW2 English Beta 3 (rey), VPW2 Unlocked, All-Japan Pro Wrestling 64 (Beta 3,
+a VPW2 hack), WWF No Mercy Unlocked. Needs a full recompile (relinked code or another base):
+No Mercy Plus v2.1/V3, ECW Born to be Wired, ECW House Party Mixtape, Project Outsider
+Extreme, WrestleMania X 64, SUMMIT VPW Gamma, Revenge Starrcade Edition, WCW vs. nWo 9
+Underground, and the VPW2 "(English Patch)" zip release (escaping branches).
 
 VPW2 Freem Edition (2024-06-15): 17 changed functions (75 instructions) plus ~31 MB of data.
 On the stock build with the patch mod, all 17 are recompiled at load, the game boots into

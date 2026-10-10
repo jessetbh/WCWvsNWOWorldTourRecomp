@@ -164,6 +164,40 @@ def changed_functions(sections, base, hack):
     return funcs, loose
 
 
+def escaping_branches(sections, hack, funcs):
+    """Control flow in the hack's changed functions that leaves the function anywhere but a
+    known function start: [(func, pc, target, kind)]. Recompiling a function at load time
+    handles branches within it and calls/tail calls to known functions only; a hack that
+    restructures code across function boundaries (or jumps into code it added) needs a full
+    recompile of the hacked ROM."""
+    starts = {ram + off for _, rom, ram, size, entries in sections for _, off, sz in entries}
+    by_name = {(name, func): (rom, ram, off, sz) for name, rom, ram, size, entries in sections for func, off, sz in entries}
+    out = []
+    for section, func, vram, size, words in funcs:
+        rom, ram, off, sz = by_name[(section, func)]
+        lo, hi = ram + off, ram + off + sz
+        for i in range(0, sz, 4):
+            pc = lo + i
+            w = int.from_bytes(hack[rom + off + i:rom + off + i + 4], 'big')
+            op, rs, rt = w >> 26, (w >> 21) & 0x1F, (w >> 16) & 0x1F
+            simm = (w & 0xFFFF) - 0x10000 if w & 0x8000 else (w & 0xFFFF)
+            target, kind = None, None
+            if op in (0x04, 0x05, 0x06, 0x07, 0x14, 0x15, 0x16, 0x17) or                (op == 0x01 and rt in (0x00, 0x01, 0x02, 0x03, 0x10, 0x11, 0x12, 0x13)) or                (op == 0x11 and rs == 0x08):
+                target, kind = (pc + 4 + (simm << 2)) & 0xFFFFFFFF, 'branch'
+            elif op == 0x02:
+                target, kind = ((pc + 4) & 0xF0000000) | ((w & 0x3FFFFFF) << 2), 'jump'
+            elif op == 0x03:
+                target, kind = ((pc + 4) & 0xF0000000) | ((w & 0x3FFFFFF) << 2), 'call'
+            if target is None:
+                continue
+            if kind == 'call':
+                if target not in starts:
+                    out.append((func, pc, target, kind))
+            elif not (lo <= target < hi) and target not in starts:
+                out.append((func, pc, target, kind))
+    return out
+
+
 # ------------------------------------------------------------------------------------ main
 
 def main():
@@ -181,6 +215,7 @@ def main():
     ap.add_argument('--repaired', default='RecompiledFuncs/repaired_functions.txt',
                     help='functions the post-recompile pipeline changed (tools/romhack/list_repaired_functions.py)')
     ap.add_argument('--out', help='output .nrm (omit to only print the report)')
+    ap.add_argument('--force', action='store_true', help='write the mod even when the report says it needs a full recompile')
     args = ap.parse_args()
 
     base = open(args.base, 'rb').read()
@@ -207,13 +242,23 @@ def main():
     risky = [f for f in funcs if f[1] in repaired]
     if risky:
         print('WARNING: %d changed function(s) carry pipeline repairs or hand-edits; test them closely.' % len(risky))
-    if funcs:
+    escapes = escaping_branches(sections, hack, funcs)
+    for func, pc, target, kind in escapes[:20]:
+        print('  ESCAPES: %s %s at 0x%08X -> 0x%08X (not in the function or a known function start)' % (func, kind, pc, target))
+    if escapes:
+        print('BLOCKED: %d branch(es)/call(s) leave their function: the hack restructures code across'
+              ' function boundaries or calls code it added, so it needs a full recompile.' % len(escapes))
+    if escapes or loose:
+        print('-> needs a full recompile of the hacked ROM; a patch mod would not run it correctly.')
+    elif funcs:
         print('-> changes code: needs a runtime that recompiles changed functions from the patch.')
     else:
         print('-> data-only: works with any runtime that supports ROM-patch mods.')
 
     if not args.out:
         return
+    if (escapes or loose) and not args.force:
+        sys.exit('not writing %s: the hack needs a full recompile (use --force to write it anyway)' % args.out)
 
     patch = bps_encode(base, hack)
     assert bps_apply(base, patch) == hack, 'BPS round trip failed'
