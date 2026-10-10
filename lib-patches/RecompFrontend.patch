@@ -160,6 +160,20 @@ index c89956e..73c8376 100644
          }
          return profile_index;
      }
+diff --git a/recompui/include/recompui/config.h b/recompui/include/recompui/config.h
+index 38b84f5..b8af38d 100644
+--- a/recompui/include/recompui/config.h
++++ b/recompui/include/recompui/config.h
+@@ -61,6 +61,9 @@ namespace recompui {
+                 inline const std::string hpfb_option = "hpfb_option";
+                 inline const std::string rr_manual_value = "rr_manual_value";
+                 inline const std::string ds_option = "ds_option";
++                // [wcw rt] Experimental hybrid ray tracing (RT64 WcwRaytracer).
++                inline const std::string rt_option = "rt_option";
++                inline const std::string rt_quality_option = "rt_quality_option";
+             }
+     
+             void update_msaa_supported(bool supported);
 diff --git a/recompui/src/base/ui_state.cpp b/recompui/src/base/ui_state.cpp
 index 277a421..f5d6ad6 100644
 --- a/recompui/src/base/ui_state.cpp
@@ -195,10 +209,48 @@ index 277a421..f5d6ad6 100644
              }
          }
 diff --git a/recompui/src/config/ui_config_tab_graphics.cpp b/recompui/src/config/ui_config_tab_graphics.cpp
-index 4fdf81f..544d0a8 100644
+index 4fdf81f..9ecc462 100644
 --- a/recompui/src/config/ui_config_tab_graphics.cpp
 +++ b/recompui/src/config/ui_config_tab_graphics.cpp
-@@ -152,11 +152,12 @@ namespace recompui {
+@@ -2,6 +2,7 @@
+ #include "recompui/config.h"
+ #include "recompui/renderer.h"
+ #include "util/steam_deck.h"
++#include "render/rt64_wcw_raytracer.h"
+ 
+ static bool created_graphics_config = false;
+ 
+@@ -64,6 +65,29 @@ namespace recompui {
+         #endif
+         };
+ 
++        // [wcw rt] Experimental hybrid ray tracing.
++        enum class RayTracingOption {
++            Off = 0,
++            On = 1
++        };
++
++        enum class RayTracingQuality {
++            Performance = 0,
++            Balanced = 1,
++            Quality = 2
++        };
++
++        static EnumOptionVector ray_tracing_options = {
++            {RayTracingOption::Off, "Off", "Off"},
++            {RayTracingOption::On, "On", "On"},
++        };
++
++        static EnumOptionVector ray_tracing_quality_options = {
++            {RayTracingQuality::Performance, "Performance", "Performance"},
++            {RayTracingQuality::Balanced, "Balanced", "Balanced"},
++            {RayTracingQuality::Quality, "Quality", "Quality"},
++        };
++
+         static EnumOptionVector aspect_ratio_options = {
+             {ultramodern::renderer::AspectRatio::Original, "Original"},
+             {ultramodern::renderer::AspectRatio::Expand, "Expand"},
+@@ -152,11 +176,12 @@ namespace recompui {
          }
  
          static std::string get_framerate_text(uint32_t refresh_rate) {
@@ -212,7 +264,19 @@ index 4fdf81f..544d0a8 100644
                  "<br />"
                  "<br />"
                  "<recomp-color primary>Detected display refresh rate: " + std::to_string(refresh_rate) + "hz</recomp-color>";
-@@ -304,8 +305,27 @@ namespace recompui {
+@@ -178,6 +203,11 @@ namespace recompui {
+             new_config.ds_option = get_graphics_enum_value<int>(graphics::options::ds_option);
+ 
+             ultramodern::renderer::set_graphics_config(new_config);
++
++            // [wcw rt] Takes effect on the next frame (no renderer restart needed).
++            RT64::WcwRaytracer::setUserSettings(
++                get_graphics_enum_value<RayTracingOption>(graphics::options::rt_option) == RayTracingOption::On,
++                uint32_t(get_graphics_enum_value<RayTracingQuality>(graphics::options::rt_quality_option)));
+         }
+ 
+         void graphics::update_msaa_supported(bool supported) {
+@@ -304,8 +334,27 @@ namespace recompui {
                  "Framerate",
                  get_framerate_text(60),
                  refresh_rate_options,
@@ -241,6 +305,39 @@ index 4fdf81f..544d0a8 100644
  
              config.add_number_option(
                  graphics::options::rr_manual_value,
+@@ -359,6 +408,32 @@ namespace recompui {
+                 true
+             );
+ 
++            config.add_enum_option(
++                graphics::options::rt_option,
++                "Ray Tracing",
++                "<recomp-color warning>Experimental.</recomp-color> Adds ray-traced shadows from the arena lights and contact shadows, replacing the game's blob shadows."
++                "<br />"
++                "<br />"
++                "<recomp-color primary>Requires an RTX-class GPU with DirectX Raytracing 1.1 and the D3D12 graphics API.</recomp-color> It has no effect otherwise.",
++                ray_tracing_options,
++                RayTracingOption::Off
++            );
++
++            config.add_enum_option(
++                graphics::options::rt_quality_option,
++                "Ray Tracing Quality",
++                "<recomp-color primary>Performance</recomp-color> traces at half resolution with fewer rays. <recomp-color primary>Balanced</recomp-color> traces at half resolution. <recomp-color primary>Quality</recomp-color> traces at full resolution and costs the most.",
++                ray_tracing_quality_options,
++                RayTracingQuality::Balanced
++            );
++            {
++                config.add_option_hidden_dependency(
++                    graphics::options::rt_quality_option,
++                    graphics::options::rt_option,
++                    RayTracingOption::Off
++                );
++            }
++
+             return config;
+         }
+     }
 diff --git a/recompui/src/renderer/rt64_render_context.cpp b/recompui/src/renderer/rt64_render_context.cpp
 index a7954c7..71635b7 100644
 --- a/recompui/src/renderer/rt64_render_context.cpp

@@ -9,6 +9,31 @@ index 21df8c2..5635c09 100644
 -	url = https://github.com/renderbag/plume.git
 +	url = https://github.com/jessetbh/plume.git
 +	branch = wcw
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2fb01e5..2154981 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -386,6 +386,7 @@ set (SOURCES
+     "${PROJECT_SOURCE_DIR}/src/render/rt64_transform_processor.cpp"
+     "${PROJECT_SOURCE_DIR}/src/render/rt64_upscaler.cpp"
+     "${PROJECT_SOURCE_DIR}/src/render/rt64_vertex_processor.cpp"
++    "${PROJECT_SOURCE_DIR}/src/render/rt64_wcw_raytracer.cpp"
+     "${PROJECT_SOURCE_DIR}/src/render/rt64_vi_renderer.cpp"
+ 
+     "${PROJECT_SOURCE_DIR}/src/preset/rt64_preset.cpp"
+@@ -527,6 +528,12 @@ build_pixel_shader(  rt64 "src/shaders/PostBlendDitherNoisePS.hlsl" "src/shaders
+ build_compute_shader(rt64 "src/shaders/RSPModifyCS.hlsl")
+ build_compute_shader(rt64 "src/shaders/RSPProcessCS.hlsl")
+ build_compute_shader(rt64 "src/shaders/RSPWorldCS.hlsl")
++# [wcw rt] Hybrid ray tracing: inline ray queries need SM 6.5, D3D12 only.
++if (WIN32)
++    build_shader_dxil(rt64 "src/shaders/WcwRtTraceCS.hlsl" "${DXC_COMMON_OPTS};-E;CSMain;-T;cs_6_5")
++    build_shader_dxil(rt64 "src/shaders/WcwRtResolveCS.hlsl" "${DXC_COMMON_OPTS};-E;CSMain;-T;cs_6_5")
++endif()
++build_pixel_shader(rt64 "src/shaders/WcwRtCompositePS.hlsl")
+ build_compute_shader(rt64 "src/shaders/RSPSmoothNormalCS.hlsl")
+ build_compute_shader(rt64 "src/shaders/RSPVertexTestZCS.hlsl")
+ build_compute_shader(rt64 "src/shaders/RSPVertexTestZCS.hlsl" "src/shaders/RSPVertexTestZCSMS.hlsl" "-D MULTISAMPLING")
 diff --git a/src/common/rt64_enhancement_configuration.cpp b/src/common/rt64_enhancement_configuration.cpp
 index 1194a96..432e1ab 100644
 --- a/src/common/rt64_enhancement_configuration.cpp
@@ -197,7 +222,7 @@ index 785de27..cb5f3b9 100644
          state->updateScreen(core.decodeVI(), false);
      }
 diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
-index 3227ab1..b3bb8d3 100644
+index 3227ab1..db07ca5 100644
 --- a/src/hle/rt64_present_queue.cpp
 +++ b/src/hle/rt64_present_queue.cpp
 @@ -116,6 +116,8 @@ namespace RT64 {
@@ -326,7 +351,7 @@ index 3227ab1..b3bb8d3 100644
                  commandList->setFramebuffer(swapChainFramebuffer);
                  commandList->clearColor();
  
-@@ -358,7 +423,38 @@ namespace RT64 {
+@@ -358,7 +423,39 @@ namespace RT64 {
                      if (inspector != nullptr) {
                          inspector->draw(commandList);
                      }
@@ -348,6 +373,7 @@ index 3227ab1..b3bb8d3 100644
 +                    bool wcwDoRead = false;
 +                    if (wcwLum) {
 +                        wcwPresentN++;
++                        wcwRtPresentCounter = wcwPresentN;
 +                        if (wcwPresentN >= 240 && wcwPresentN <= wcwLumEnd) {
 +                            uint32_t w = ext.swapChain->getWidth(), h = ext.swapChain->getHeight();
 +                            uint32_t row = (w + 63) & ~63u;
@@ -366,7 +392,7 @@ index 3227ab1..b3bb8d3 100644
                      commandList->barriers(RenderBarrierStage::NONE, RenderTextureBarrier(swapChainTexture, RenderTextureLayout::PRESENT));
                      commandList->end();
                      const RenderCommandList *commandList = ext.presentGraphicsWorker->commandList.get();
-@@ -366,6 +462,44 @@ namespace RT64 {
+@@ -366,6 +463,44 @@ namespace RT64 {
                      RenderCommandSemaphore *signalSemaphore = drawSemaphores[swapChainIndex].get();
                      ext.presentGraphicsWorker->commandQueue->executeCommandLists(&commandList, 1, &waitSemaphore, 1, &signalSemaphore, 1, ext.presentGraphicsWorker->commandFence.get());
                      ext.presentGraphicsWorker->wait();
@@ -411,7 +437,7 @@ index 3227ab1..b3bb8d3 100644
                  }
              }
  
-@@ -460,6 +594,18 @@ namespace RT64 {
+@@ -460,6 +595,18 @@ namespace RT64 {
                      processCursor = threadCursor;
                      threadCursor = (threadCursor + 1) % presents.size();
                      skipPresent = (writeCursor != threadCursor);
@@ -493,10 +519,10 @@ index a10c11a..5f2345a 100644
          RT64_LOG_PRINTF("RDP::drawTexRect(ulx %d, uly %d, lrx %d, lry %d, tile %u, uls %d, ult %d, dsdx %d, dtdy %d, flip %u)", ulx, uly, lrx, lry, tile, uls, ult, dsdx, dtdy, flip);
  #   endif
 diff --git a/src/hle/rt64_rsp.cpp b/src/hle/rt64_rsp.cpp
-index ee2030b..558d3e7 100644
+index ee2030b..4f87101 100644
 --- a/src/hle/rt64_rsp.cpp
 +++ b/src/hle/rt64_rsp.cpp
-@@ -4,7 +4,9 @@
+@@ -4,12 +4,15 @@
  
  #include "rt64_rsp.h"
  
@@ -506,7 +532,21 @@ index ee2030b..558d3e7 100644
  
  #include "../include/rt64_extended_gbi.h"
  #include "common/rt64_common.h"
-@@ -131,6 +133,21 @@ namespace RT64 {
+ #include "common/rt64_math.h"
+ #include "gbi/rt64_f3d.h"
++#include "render/rt64_wcw_raytracer.h"
+ #include "shared/rt64_rsp_fog.h"
+ 
+ #include "rt64_interpreter.h"
+@@ -70,6 +73,7 @@ namespace RT64 {
+         projectionIndex = -1;
+         projectionMatrixChanged = false;
+         projectionMatrixInversed = false;
++        wcwCameraLoaded = false;
+         viewportChanged = false;
+         modelViewProjMatrix = hlslpp::float4x4(0.0f);
+         modelViewProjChanged = false;
+@@ -131,6 +135,21 @@ namespace RT64 {
          segments[seg] = address;
      }
  
@@ -528,7 +568,7 @@ index ee2030b..558d3e7 100644
      void RSP::matrixCommon(const hlslpp::float4x4 &floatMatrix, uint32_t address, uint8_t params) {
          // Projection matrix.
          hlslpp::float4x4 &viewMatrix = viewMatrixStack[projectionMatrixStackSize - 1];
-@@ -191,6 +208,22 @@ namespace RT64 {
+@@ -191,6 +210,22 @@ namespace RT64 {
          const uint32_t rdramAddress = fromSegmentedMasked(address);
          const FixedMatrix *fixedMatrix = reinterpret_cast<FixedMatrix *>(state->fromRDRAM(rdramAddress));
          const hlslpp::float4x4 floatMatrix = fixedMatrix->toMatrix4x4();
@@ -551,7 +591,7 @@ index ee2030b..558d3e7 100644
          matrixCommon(floatMatrix, address, params);
      }
  
-@@ -311,6 +344,20 @@ namespace RT64 {
+@@ -311,6 +346,20 @@ namespace RT64 {
          modelViewProjMatrix = fixedMatrix->toMatrix4x4();
          modelViewProjInserted = true;
          modelViewProjChanged = false;
@@ -572,7 +612,73 @@ index ee2030b..558d3e7 100644
      }
  
      static void setExtendedMatrixFloat(RSP &rsp, uint32_t address, hlslpp::float4x4 &matrix, hlslpp::float4x4 &invMatrix) {
-@@ -372,6 +419,32 @@ namespace RT64 {
+@@ -333,11 +382,65 @@ namespace RT64 {
+         rsp.lookAtChanged = true;
+     }
+ 
++    // [wcw rt] AKI-engine games compose every MVP on the CPU and never load a projection, so
++    // RT64 only ever sees clip-space "world" transforms. With WCW_RT=1, a game patch hands
++    // the real camera over through G_EX_SETVIEWMATRIXFLOAT_V1 / G_EX_SETPROJMATRIXFLOAT_V1 at
++    // the start of each frame's display list, and while the projection stack has never been
++    // loaded (the forceMatrix-only signature) those commands load it instead of setting the
++    // extended correction matrices. Forced MVPs then decompose as world = MVP * inv(V * P):
++    // true model matrices, a real camera, and an unchanged raster result (viewProj * world == MVP).
++    bool RSP::setWcwCameraMatrix(uint32_t address, bool view) {
++        const int top = projectionMatrixStackSize - 1;
++        if (!wcwCameraLoaded && !isMatrixZero(viewProjMatrixStack[top])) {
++            // The game loads its own projection: keep upstream semantics.
++            return false;
++        }
++
++        // With ray tracing off the camera is consumed and ignored, so the default path keeps the
++        // identity-VP [wcw fix] behavior and never touches the extended correction matrices.
++        if (!WcwRaytracer::active()) {
++            return true;
++        }
++
++        if (!wcwCameraLoaded) {
++            viewMatrixStack[top] = hlslpp::float4x4::identity();
++            projMatrixStack[top] = hlslpp::float4x4::identity();
++            wcwCameraLoaded = true;
++        }
++
++        const uint32_t rdramAddress = fromSegmentedMasked(address);
++        const float *floatMatrix = reinterpret_cast<const float *>(state->fromRDRAM(rdramAddress));
++        hlslpp::float4x4 &dst = view ? viewMatrixStack[top] : projMatrixStack[top];
++        for (uint32_t j = 0; j < 4; j++) {
++            for (uint32_t i = 0; i < 4; i++) {
++                dst[j][i] = floatMatrix[j * 4 + i];
++            }
++        }
++
++        viewProjMatrixStack[top] = hlslpp::mul(viewMatrixStack[top], projMatrixStack[top]);
++        if (!view) {
++            projectionMatrixSegmentedAddressStack[top] = address;
++            projectionMatrixPhysicalAddressStack[top] = rdramAddress;
++        }
++
++        projectionMatrixChanged = true;
++        projectionMatrixInversed = false;
++        return true;
++    }
++
+     void RSP::setProjectionMatrixFloat(uint32_t address) {
++        if (setWcwCameraMatrix(address, false)) {
++            return;
++        }
++
+         setExtendedMatrixFloat(*this, address, extended.projMatrix, extended.invProjMatrix);
+     }
+ 
+     void RSP::setViewMatrixFloat(uint32_t address) {
++        if (setWcwCameraMatrix(address, true)) {
++            return;
++        }
++
+         setExtendedMatrixFloat(*this, address, extended.viewMatrix, extended.invViewMatrix);
+     }
+ 
+@@ -372,6 +475,32 @@ namespace RT64 {
  
          const uint32_t rdramAddress = fromSegmentedMasked(address);
          const Vertex *dlVerts = reinterpret_cast<const Vertex *>(state->fromRDRAM(rdramAddress));
@@ -605,7 +711,7 @@ index ee2030b..558d3e7 100644
          memcpy(&vertices[dstIndex], dlVerts, sizeof(Vertex) * vtxCount);
          setVertexCommon<true, sizeof(Vertex)>(rdramAddress, dstIndex, dstIndex + vtxCount);
      }
-@@ -465,9 +538,18 @@ namespace RT64 {
+@@ -465,9 +594,18 @@ namespace RT64 {
  
              uint32_t physicalAddress = projectionMatrixPhysicalAddressStack[projectionMatrixStackSize - 1];
              workload.physicalAddressTransformMap.emplace(physicalAddress, uint32_t(drawData.viewProjTransformGroups.size()));
@@ -627,7 +733,7 @@ index ee2030b..558d3e7 100644
              drawData.viewProjTransformGroups.emplace_back(extended.curViewProjMatrixIdGroupIndex);
              drawData.rspViewports.emplace_back(viewportStack[viewportStackSize - 1]);
              drawData.viewportOrigins.emplace_back(extended.viewportOriginStack[viewportStackSize - 1]);
-@@ -533,7 +615,13 @@ namespace RT64 {
+@@ -533,12 +671,41 @@ namespace RT64 {
              modelViewProjInserted = false;
  
              if (!projectionMatrixInversed) {
@@ -642,7 +748,35 @@ index ee2030b..558d3e7 100644
                  projectionMatrixInversed = true;
              }
  
-@@ -1050,6 +1138,9 @@ namespace RT64 {
+             curTransformIndex = static_cast<uint16_t>(worldTransforms.size());
+             worldTransforms.emplace_back(hlslpp::mul(hlslpp::mul(modelViewProjMatrix, invViewProjMatrixStack[projectionMatrixStackSize - 1]), extended.viewProjMatrix));
++
++            // [wcw rt] WCW_RT_LOG=1: sample decomposed world translations (static scenery must
++            // stay put while the camera moves when the camera hand-off is correct).
++            static const bool wcwRtLog = getenv("WCW_RT_LOG") != nullptr;
++            if (wcwRtLog && wcwCameraLoaded) {
++                static uint32_t wcwRtLogCount = 0;
++                if ((wcwRtLogCount++ % 997) == 0) {
++                    const hlslpp::float4x4 &w = worldTransforms.back();
++                    const hlslpp::float4x4 invView = hlslpp::inverse(viewMatrixStack[projectionMatrixStackSize - 1]);
++                    const hlslpp::float4x4 re = hlslpp::mul(w, viewProjMatrixStack[projectionMatrixStackSize - 1]);
++                    float err = 0.0f, mag = 0.0f;
++                    for (uint32_t j = 0; j < 4; j++) {
++                        for (uint32_t i = 0; i < 4; i++) {
++                            err = std::max(err, std::abs(float(re[j][i]) - float(modelViewProjMatrix[j][i])));
++                            mag = std::max(mag, std::abs(float(modelViewProjMatrix[j][i])));
++                        }
++                    }
++
++                    fprintf(stderr, "[wcw rt] world.t=(%.1f,%.1f,%.1f) world.sx=%.3f mvpErr=%g/%g eye=(%.1f,%.1f,%.1f)\n",
++                        (float)w[3][0], (float)w[3][1], (float)w[3][2], (float)hlslpp::length(w[0].xyz), err, mag,
++                        (float)invView[3][0], (float)invView[3][1], (float)invView[3][2]);
++                }
++            }
+         }
+ 
+         if (addWorldTransform) {
+@@ -1050,6 +1217,9 @@ namespace RT64 {
      }
  
      void RSP::drawIndexedTri(uint32_t a, uint32_t b, uint32_t c, bool rawGlobalIndices) {
@@ -652,6 +786,29 @@ index ee2030b..558d3e7 100644
          // Copy mode is not supported when drawing regular tris and crashes the hardware.
          const uint32_t cycleType = state->rdp->otherMode.cycleType();
          assert(cycleType != G_CYC_COPY);
+diff --git a/src/hle/rt64_rsp.h b/src/hle/rt64_rsp.h
+index 61bb3b1..5ca1a6c 100644
+--- a/src/hle/rt64_rsp.h
++++ b/src/hle/rt64_rsp.h
+@@ -149,6 +149,10 @@ namespace RT64 {
+         uint8_t curLightCount;
+         bool projectionMatrixChanged;
+         bool projectionMatrixInversed;
++
++        // [wcw rt] Set once a forceMatrix-only game has supplied its real camera through
++        // the float view/projection commands this display list (see setWcwCameraMatrix).
++        bool wcwCameraLoaded;
+         bool viewportChanged;
+         hlslpp::float4x4 modelViewProjMatrix;
+         bool modelViewProjChanged;
+@@ -247,6 +251,7 @@ namespace RT64 {
+         void insertMatrix(uint32_t address, uint32_t value);
+         void forceMatrix(uint32_t address);
+         void setProjectionMatrixFloat(uint32_t address);
++        bool setWcwCameraMatrix(uint32_t address, bool view);
+         void setViewMatrixFloat(uint32_t address);
+         void computeModelViewProj();
+         void specialComputeModelViewProj();
 diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
 index d249a97..62597ad 100644
 --- a/src/hle/rt64_state.cpp
@@ -778,7 +935,7 @@ index a870166..bc0aec8 100644
              const bool interlacedStep = status.serrate && (vCurrentLine & 0x1);
              const uint32_t rowBytes = width * (1U << (siz - 1));
 diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
-index 5a331aa..293953d 100644
+index 5a331aa..713f36f 100644
 --- a/src/hle/rt64_workload_queue.cpp
 +++ b/src/hle/rt64_workload_queue.cpp
 @@ -131,7 +131,14 @@ namespace RT64 {
@@ -797,7 +954,17 @@ index 5a331aa..293953d 100644
  
          const auto ratioMode = ext.sharedResources->userConfig.aspectRatio;
          switch (ratioMode) {
-@@ -452,6 +459,24 @@ namespace RT64 {
+@@ -387,7 +394,8 @@ namespace RT64 {
+                 rspProcessor->process(rspParams);
+             }
+ 
+-            const bool processWorldVertices = prevFrame.matched;
++            // [wcw rt] The hybrid ray tracer builds its acceleration structures from world positions every frame.
++            const bool processWorldVertices = prevFrame.matched || WcwRaytracer::active();
+             if (processWorldVertices) {
+                 workload.resetWorldOutputBuffers();
+ 
+@@ -452,6 +460,24 @@ namespace RT64 {
                      if (colorFb != nullptr) {
                          fbKey.colorTargetKey = RenderTargetKey(colorFb->addressStart, colorFb->width, colorFb->siz, Framebuffer::Type::Color);
                          colorTarget = &targetManager.get(fbKey.colorTargetKey);
@@ -822,7 +989,18 @@ index 5a331aa..293953d 100644
                      }
                      else {
                          colorTarget = nullptr;
-@@ -842,6 +867,32 @@ namespace RT64 {
+@@ -604,6 +630,10 @@ namespace RT64 {
+             // Add all framebuffer pairs to the framebuffer renderer and setup the operations.
+             scratchFbChangePool.reset();
+             fbManager.resetOperations();
++            if (framebufferRenderer->wcwRaytracer != nullptr) {
++                framebufferRenderer->wcwRaytracer->beginWorkload(workload.presentId);
++            }
++
+             framebufferRenderer->resetFramebuffers(ext.workloadGraphicsWorker, ubershadersVisible, workload.extended.ditherNoiseStrength, targetManager.multisampling);
+ 
+ #       if RT_ENABLED
+@@ -842,12 +872,83 @@ namespace RT64 {
              framebufferRenderer->waitForUploaders();
              ext.workloadGraphicsWorker->execute();
              ext.workloadGraphicsWorker->wait();
@@ -855,7 +1033,58 @@ index 5a331aa..293953d 100644
              workerMutex.unlock();
  
              // Update the GPU profiler with the results from the timestamps of the frame.
-@@ -904,6 +955,32 @@ namespace RT64 {
+             queryPool->queryResults();
+             const uint64_t *frameTimestamps = queryPool->getResults();
+             rendererGPUProfiler.log(double(frameTimestamps[1] - frameTimestamps[0]) / 1000000.0);
++            if (framebufferRenderer->wcwRaytracer != nullptr) {
++                framebufferRenderer->wcwRaytracer->collectTimings();
++            }
++
++            // [wcw rt] WCW_GPU_LOG=1: average/max GPU time per workload every 300 workloads.
++            static const bool wcwGpuLog = getenv("WCW_GPU_LOG") != nullptr;
++            if (wcwGpuLog) {
++                static double wcwGpuSum = 0.0, wcwGpuMax = 0.0;
++                static uint32_t wcwGpuCount = 0;
++                const double gpuMs = double(frameTimestamps[1] - frameTimestamps[0]) / 1000000.0;
++                wcwGpuSum += gpuMs;
++                wcwGpuMax = std::max(wcwGpuMax, gpuMs);
++                if (++wcwGpuCount == 300) {
++                    fprintf(stderr, "[wcw gpu] workload GPU time avg=%.3f ms max=%.3f ms (300 workloads)\n", wcwGpuSum / wcwGpuCount, wcwGpuMax);
++                    wcwGpuSum = 0.0;
++                    wcwGpuMax = 0.0;
++                    wcwGpuCount = 0;
++                }
++
++                // Per displayed frame: workloads sharing a presentId build one frame.
++                static uint64_t wcwFramePresentId = UINT64_MAX;
++                static double wcwFrameMs = 0.0, wcwFramesSum = 0.0, wcwFramesMax = 0.0;
++                static uint32_t wcwFrameWorkloads = 0, wcwFramesCount = 0, wcwFramesOver = 0, wcwFrameWorkloadsMax = 0;
++                if (workload.presentId != wcwFramePresentId) {
++                    if (wcwFramePresentId != UINT64_MAX) {
++                        wcwFramesSum += wcwFrameMs;
++                        wcwFramesMax = std::max(wcwFramesMax, wcwFrameMs);
++                        wcwFrameWorkloadsMax = std::max(wcwFrameWorkloadsMax, wcwFrameWorkloads);
++                        wcwFramesOver += (wcwFrameMs > 33.3) ? 1 : 0;
++                        if (++wcwFramesCount == 150) {
++                            fprintf(stderr, "[wcw gpu] frame GPU time avg=%.3f ms max=%.3f ms, over 33.3 ms: %u, workloads/frame max %u (150 frames)\n",
++                                wcwFramesSum / wcwFramesCount, wcwFramesMax, wcwFramesOver, wcwFrameWorkloadsMax);
++                            wcwFramesSum = wcwFramesMax = 0.0;
++                            wcwFramesCount = wcwFramesOver = wcwFrameWorkloadsMax = 0;
++                        }
++                    }
++
++                    wcwFramePresentId = workload.presentId;
++                    wcwFrameMs = 0.0;
++                    wcwFrameWorkloads = 0;
++                }
++
++                wcwFrameMs += gpuMs;
++                wcwFrameWorkloads++;
++            }
+ 
+             // Indicate to the texture cache it's safe to delete the textures if no locks are active.
+             ext.textureCache->decrementLock();
+@@ -904,6 +1005,32 @@ namespace RT64 {
              if (processCursor >= 0) {
                  std::unique_lock<std::mutex> threadLock(threadMutex);
                  Workload &workload = workloads[processCursor];
@@ -888,7 +1117,7 @@ index 5a331aa..293953d 100644
                  ext.presentQueue->waitForPresentId(workload.presentId);
  
                  if (!threadsRunning) {
-@@ -986,7 +1063,10 @@ namespace RT64 {
+@@ -986,7 +1113,10 @@ namespace RT64 {
                      matchingProfiler.log();
  
                      const bool displayRateAboveOriginal = (workload.viOriginalRate > 0) && (workloadConfig.targetRate > workload.viOriginalRate);
@@ -901,10 +1130,115 @@ index 5a331aa..293953d 100644
                      const bool resetTicks = !generateInterpolatedFrames || (originalRateForTicks != workload.viOriginalRate) || (displayRateForTicks != workloadConfig.targetRate) || !displayRateAboveOriginal;
                      if (resetTicks) {
 diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
-index 9fae0d4..632fc9c 100644
+index 9fae0d4..262eae4 100644
 --- a/src/render/rt64_framebuffer_renderer.cpp
 +++ b/src/render/rt64_framebuffer_renderer.cpp
-@@ -484,6 +484,10 @@ namespace RT64 {
+@@ -4,6 +4,8 @@
+ 
+ #include "rt64_framebuffer_renderer.h"
+ 
++#include <cfloat>
++
+ #include "../include/rt64_extended_gbi.h"
+ 
+ #include "common/rt64_elapsed_timer.h"
+@@ -50,6 +52,71 @@ namespace interop {
+ };
+ 
+ namespace RT64 {
++    static const void *wcwDumpScene = nullptr;
++    struct WcwRayTestVertex { float x, y, z, mesh; };
++    static std::vector<WcwRayTestVertex> wcwRayTestTris;
++    static bool wcwRayTestDone = false;
++
++    static void wcwRunRayTest() {
++        const float lx = getenv("WCW_RT_LIGHT_X") ? float(atof(getenv("WCW_RT_LIGHT_X"))) : 0.0f;
++        const float ly = getenv("WCW_RT_LIGHT_Y") ? float(atof(getenv("WCW_RT_LIGHT_Y"))) : 460.0f;
++        const float lz = getenv("WCW_RT_LIGHT_Z") ? float(atof(getenv("WCW_RT_LIGHT_Z"))) : 0.0f;
++        const float origins[5][3] = { { -40.0f, 90.5f, 0.0f }, { -30.0f, 90.5f, -10.0f }, { -60.0f, 90.5f, 10.0f }, { 0.0f, 90.5f, 0.0f }, { -20.0f, 90.5f, 20.0f } };
++        fprintf(stderr, "[wcw rt raytest] %zu triangles, light=(%.0f,%.0f,%.0f)\n", wcwRayTestTris.size() / 3, lx, ly, lz);
++        for (const auto &o : origins) {
++            float dx = lx - o[0], dy = ly - o[1], dz = lz - o[2];
++            const float len = std::sqrt(dx * dx + dy * dy + dz * dz);
++            dx /= len; dy /= len; dz /= len;
++            float bestT = FLT_MAX; int bestMesh = -1;
++            for (size_t t = 0; t + 2 < wcwRayTestTris.size(); t += 3) {
++                const auto &a = wcwRayTestTris[t], &b = wcwRayTestTris[t + 1], &c = wcwRayTestTris[t + 2];
++                const float e1x = b.x - a.x, e1y = b.y - a.y, e1z = b.z - a.z, e2x = c.x - a.x, e2y = c.y - a.y, e2z = c.z - a.z;
++                const float px = dy * e2z - dz * e2y, py = dz * e2x - dx * e2z, pz = dx * e2y - dy * e2x;
++                const float det = e1x * px + e1y * py + e1z * pz;
++                if (std::abs(det) < 1e-8f) continue;
++                const float inv = 1.0f / det;
++                const float sx = o[0] - a.x, sy = o[1] - a.y, sz = o[2] - a.z;
++                const float u = (sx * px + sy * py + sz * pz) * inv;
++                if ((u < 0.0f) || (u > 1.0f)) continue;
++                const float qx = sy * e1z - sz * e1y, qy = sz * e1x - sx * e1z, qz = sx * e1y - sy * e1x;
++                const float vv = (dx * qx + dy * qy + dz * qz) * inv;
++                if ((vv < 0.0f) || (u + vv > 1.0f)) continue;
++                const float tt = (e2x * qx + e2y * qy + e2z * qz) * inv;
++                if ((tt > 0.5f) && (tt < len) && (tt < bestT)) { bestT = tt; bestMesh = int(a.mesh); }
++            }
++            fprintf(stderr, "[wcw rt raytest] from (%.0f,%.1f,%.0f): %s t=%.1f mesh=%d\n", o[0], o[1], o[2], (bestMesh >= 0) ? "HIT" : "miss", (bestMesh >= 0) ? bestT : 0.0f, bestMesh);
++        }
++    }
++
++    // [wcw rt] True when either blender cycle reads framebuffer memory (G_BL_CLR_MEM = 1 in the
++    // P or M input of othermode L bits 16-31), i.e. the draw is translucent.
++    static bool wcwBlendsWithMemory(const interop::OtherMode &otherMode) {
++        const uint32_t blender = otherMode.L >> 16;
++        const uint32_t p1 = (blender >> 14) & 0x3;
++        const uint32_t p2 = (blender >> 12) & 0x3;
++        const uint32_t m1 = (blender >> 6) & 0x3;
++        const uint32_t m2 = (blender >> 4) & 0x3;
++        return (p1 == 1) || (p2 == 1) || (m1 == 1) || (m2 == 1);
++    }
++
++    // [wcw rt] AKI blob shadows: small translucent quads lying flat (constant world Y) on the
++    // mat under each wrestler. The ray-traced shadows replace them.
++    static bool wcwIsBlobShadow(const DrawData &drawData, uint32_t faceIndicesStart, uint32_t triangleCount, const interop::OtherMode &otherMode) {
++        if ((triangleCount == 0) || (triangleCount > 4) || !wcwBlendsWithMemory(otherMode)) {
++            return false;
++        }
++
++        float minY = FLT_MAX, maxY = -FLT_MAX;
++        for (uint32_t i = 0; i < triangleCount * 3; i++) {
++            const uint32_t v = drawData.faceIndices[faceIndicesStart + i];
++            const hlslpp::float4 objPos(drawData.posFloats[v * 3 + 0], drawData.posFloats[v * 3 + 1], drawData.posFloats[v * 3 + 2], 1.0f);
++            const float y = hlslpp::mul(objPos, hlslpp::float4x4(drawData.worldTransforms[drawData.worldIndices[v]])).y;
++            minY = std::min(minY, y);
++            maxY = std::max(maxY, y);
++        }
++
++        return (maxY - minY) < 0.5f;
++    }
+     // Helper functions.
+     
+     RenderRect convertFixedRect(FixedRect rect, hlslpp::float2 resScale, int32_t fbWidth, float aspectRatioScale, float extOriginPercentage, int32_t horizontalMisalignment, uint16_t leftOrigin, uint16_t rightOrigin) {
+@@ -152,6 +219,12 @@ namespace RT64 {
+         shaderUploader = std::make_unique<BufferUploader>(worker->device);
+         descCommonSet = std::make_unique<FramebufferRendererDescriptorCommonSet>(shaderLibrary->samplerLibrary, worker->device->getCapabilities().raytracing, worker->device);
+ 
++        // [wcw rt] Hybrid ray tracing (menu option or WCW_RT=1; runs on D3D12 + DXR 1.1 only).
++        if (rtSupport) {
++            const RenderShaderFormat wcwShaderFormat = (graphicsAPI == UserConfiguration::GraphicsAPI::D3D12) ? RenderShaderFormat::DXIL : RenderShaderFormat::SPIRV;
++            wcwRaytracer = std::make_unique<WcwRaytracer>(worker->device, wcwShaderFormat);
++        }
++
+ #   if RT_ENABLED
+         if (rtSupport) {
+             this->rtSupport = rtSupport;
+@@ -172,6 +245,10 @@ namespace RT64 {
+         hitGroupVector.clear();
+         renderIndicesVector.clear();
+         rspSmoothNormalVector.clear();
++        if (wcwRaytracer != nullptr) {
++            wcwRaytracer->reset();
++        }
++
+         frameParams.viewUbershaders = ubershadersVisible;
+         frameParams.ditherNoiseStrength = ditherNoiseStrength;
+         framebufferCount = 0;
+@@ -484,6 +561,10 @@ namespace RT64 {
              worker->commandList->setGraphicsDescriptorSet(descTextureSet->get(), 1);
              worker->commandList->setGraphicsDescriptorSet(descTextureSet->get(), 2);
              worker->commandList->setGraphicsDescriptorSet(depthState ? descRealFbSet : descDummyFbSet, 3);
@@ -915,7 +1249,7 @@ index 9fae0d4..632fc9c 100644
              worker->commandList->setViewports(framebuffer.viewport);
          };
  
-@@ -546,6 +550,16 @@ namespace RT64 {
+@@ -546,6 +627,16 @@ namespace RT64 {
                  assert(triangles.pipeline != nullptr);
  
                  // Draw calls can sometimes end up with empty scissors and cause validation errors. We just skip them.
@@ -932,7 +1266,7 @@ index 9fae0d4..632fc9c 100644
                  if (triangles.scissor.isEmpty()) {
                      continue;
                  }
-@@ -576,6 +590,12 @@ namespace RT64 {
+@@ -576,6 +667,12 @@ namespace RT64 {
                  rasterParams.screenOffset = triangles.screenOffset;
                  worker->commandList->setGraphicsPushConstants(0, &rasterParams);
  
@@ -945,7 +1279,44 @@ index 9fae0d4..632fc9c 100644
                  drawCallTriangles(drawCall);
  
                  // Simulate dither noise.
-@@ -1433,7 +1453,12 @@ namespace RT64 {
+@@ -1206,6 +1303,10 @@ namespace RT64 {
+             vertexProcessor->recordCommandList(worker, shaderLibrary, outputBuffers);
+         }
+ 
++        if (wcwRaytracer != nullptr) {
++            wcwRaytracer->recordBuild(worker);
++        }
++
+ #   if RT_ENABLED
+         if (rtEnabled) {
+             assert(rtResources != nullptr);
+@@ -1249,6 +1350,7 @@ namespace RT64 {
+         worker->commandList->barriers(RenderBarrierStage::GRAPHICS, startBarriers);
+ 
+         bool depthState = false;
++        int32_t wcwSceneCursor = 0;
+         worker->commandList->setFramebuffer(targetDrawCall.fbStorage->colorDepthWrite.get());
+         for (const auto &pair : targetDrawCall.sceneIndices) {
+ #       if RT_ENABLED
+@@ -1298,6 +1400,13 @@ namespace RT64 {
+                 submitDepthAccess(worker, targetDrawCall.fbStorage, false, depthState);
+                 submitRasterScene(worker, framebuffer, targetDrawCall.fbStorage, rasterScene, depthState);
+             }
++
++            // [wcw rt] Hybrid ray tracing pass over the traced projection's raster result.
++            if ((wcwRaytracer != nullptr) && (wcwSceneCursor++ == targetDrawCall.wcwRtSceneSlot)) {
++                wcwRaytracer->recordTrace(worker, targetDrawCall.fbStorage->colorTarget, descTextureSet->get());
++                worker->commandList->setFramebuffer(depthState ? targetDrawCall.fbStorage->colorWriteDepthRead.get() : targetDrawCall.fbStorage->colorDepthWrite.get());
++                wcwRaytracer->recordComposite(worker);
++            }
+         }
+     }
+ 
+@@ -1430,10 +1539,16 @@ namespace RT64 {
+ 
+         targetDrawCall.fbStorage = p.fbStorage;
+         targetDrawCall.sceneIndices.clear();
++        targetDrawCall.wcwRtSceneSlot = -1;
  
          const float SimilarityPercentage = 0.1f; // TODO: Make more strict once VI ratios are in.
          const float scissorRatio = static_cast<float>(fbPair.scissorRect.width(false, true)) / static_cast<float>(fbPair.scissorRect.height(false, true));
@@ -959,7 +1330,41 @@ index 9fae0d4..632fc9c 100644
          const float aspectRatioScale = adjustRatio ? (p.aspectRatioTarget / p.aspectRatioSource) : 1.0f;
          InstanceDrawCall instanceDrawCall;
          interop::RenderIndices renderIndices;
-@@ -1607,6 +1632,8 @@ namespace RT64 {
+@@ -1506,6 +1621,33 @@ namespace RT64 {
+                 viewportClip = convertViewportRect(viewport.rect(viewportClipRatios), p.resolutionScale, p.fbWidth, projInvRatioScale, extOriginPercentage, 0.0f, viewportOrigin, viewportOrigin);
+             }
+ 
++            // [wcw rt] The first perspective projection becomes the traced scene. (AKI games draw
++            // without the Z-buffer, back to front, so depth writes can't identify the 3D scene.)
++            const bool wcwRtProj = (wcwRaytracer != nullptr) && wcwRaytracer->wantsScene() && (proj.type == Projection::Type::Perspective) &&
++                (p.fbStorage->colorTarget != nullptr) && proj.usesViewport();
++            {
++                static const bool wcwRtLog = getenv("WCW_RT_LOG") != nullptr;
++                static uint32_t wcwProjLogCount = 0;
++                if (wcwRtLog && (wcwRaytracer != nullptr) && ((wcwProjLogCount++ % 200) == 0)) {
++                    fprintf(stderr, "[wcw rt] fb %u proj %u: type=%d depthWrite=%d color=%d usesViewport=%d calls=%u wants=%d\n",
++                        p.fbPairIndex, pr, int(proj.type), fbPair.depthWrite, p.fbStorage->colorTarget != nullptr, proj.usesViewport(), proj.gameCallCount, wcwRaytracer->wantsScene());
++                }
++            }
++
++            if (wcwRtProj) {
++                // The projection processor only fills the modified transforms on some frames.
++                const bool modified = proj.transformsIndex < drawData.modViewTransforms.size();
++                const auto &wcwView = modified ? drawData.modViewTransforms[proj.transformsIndex] : drawData.viewTransforms[proj.transformsIndex];
++                const auto &wcwProj = modified ? drawData.modProjTransforms[proj.transformsIndex] : drawData.projTransforms[proj.transformsIndex];
++                // The real viewport (unit clip ratios), not the guard-band clip rect used for scissoring.
++                const int16_t unitClipRatios[4] = { 1, 1, -1, -1 };
++                const RenderViewport wcwViewport = convertViewportRect(drawData.rspViewports[proj.transformsIndex].rect(unitClipRatios), p.resolutionScale, p.fbWidth,
++                    projInvRatioScale, extOriginPercentage, 0.0f, viewportOrigin, viewportOrigin);
++                wcwRaytracer->beginScene(wcwView, wcwProj, wcwViewport,
++                    worldPosRes, outputBuffers.worldPosBuffer.allocatedSize, indexRes, uint64_t(indexCount) * IndexStride,
++                    drawBuffers.rdpTilesBuffer.get(), drawBuffers.gpuTilesBuffer.get(), tcRes);
++            }
++
+             for (uint32_t d = 0; (d < proj.gameCallCount) && (globalCallIndex < p.maxGameCall); d++) {
+                 const GameCall &call = proj.gameCalls[d];
+                 renderIndices.instanceIndex = call.callDesc.callIndex;
+@@ -1607,6 +1749,8 @@ namespace RT64 {
                      {
                          triangles.shaderDesc = call.shaderDesc;
  
@@ -968,7 +1373,7 @@ index 9fae0d4..632fc9c 100644
                          RasterShader *gpuShader = p.ubershadersOnly ? nullptr : p.rasterShaderCache->getGPUShader(call.shaderDesc);
                          if (gpuShader != nullptr) {
                              triangles.pipeline = gpuShader->pipeline.get();
-@@ -1618,6 +1645,12 @@ namespace RT64 {
+@@ -1618,6 +1762,12 @@ namespace RT64 {
                                  !copyMode && call.shaderDesc.otherMode.zUpd(),
                                  (call.shaderDesc.otherMode.cvgDst() == CVG_DST_WRAP) || (call.shaderDesc.otherMode.cvgDst() == CVG_DST_SAVE));
                          }
@@ -981,6 +1386,166 @@ index 9fae0d4..632fc9c 100644
                          
                          triangles.faceCount = call.callDesc.triangleCount;
                          triangles.vertexTestZ = (vertexTestZCallIndex >= 0);
+@@ -1676,6 +1826,98 @@ namespace RT64 {
+                             break;
+                         }
+ 
++                        // WCW_RT_DUMP also lists the draws the translucency filter leaves out.
++                        if (wcwRtProj && (call.callDesc.triangleCount > 0) && wcwBlendsWithMemory(call.callDesc.otherMode)) {
++                            static const int wcwDumpExcludedAt = getenv("WCW_RT_DUMP") ? atoi(getenv("WCW_RT_DUMP")) : -1;
++                            static int wcwDumpExcludedCount = 0;
++                            if ((wcwDumpExcludedAt >= 0) && (wcwRtPresentCounter >= wcwDumpExcludedAt) && (wcwDumpExcludedCount++ < 400)) {
++                                const uint32_t v = drawData.faceIndices[call.meshDesc.faceIndicesStart];
++                                const hlslpp::float4 objPos(drawData.posFloats[v * 3 + 0], drawData.posFloats[v * 3 + 1], drawData.posFloats[v * 3 + 2], 1.0f);
++                                const hlslpp::float4 wp = hlslpp::mul(objPos, hlslpp::float4x4(drawData.worldTransforms[drawData.worldIndices[v]]));
++                                fprintf(stderr, "[wcw rt dump] EXCLUDED call %u tris=%u world=(%.1f,%.1f,%.1f) om=0x%08X/0x%08X cc=0x%08X/0x%08X\n",
++                                    d, call.callDesc.triangleCount, (float)wp.x, (float)wp.y, (float)wp.z, call.callDesc.otherMode.L, call.callDesc.otherMode.H,
++                                    call.callDesc.colorCombiner.L, call.callDesc.colorCombiner.H);
++                            }
++                        }
++
++                        // AKI sets forceBlend on opaque geometry too, so translucency is read from the blender
++                        // instead: draws that blend with framebuffer memory (blob shadows, decals, smoke) are
++                        // left out; opaque (IN*0 + IN*1) and alpha-tested geometry is gathered.
++                        if (wcwRtProj && (instanceDrawCall.type == InstanceDrawCall::Type::IndexedTriangles) && !triangles.vertexTestZ &&
++                            (call.callDesc.triangleCount > 0) && !wcwBlendsWithMemory(call.callDesc.otherMode))
++                        {
++                            // AKI scales wrestler models (WCW 1.04, VPW2 1.01); world geometry has unit scale.
++                            const interop::float4x4 &wcwWorld = drawData.worldTransforms[drawData.worldIndices[drawData.faceIndices[call.meshDesc.faceIndicesStart]]];
++                            const float wcwScale = std::sqrt(wcwWorld[0][0] * wcwWorld[0][0] + wcwWorld[0][1] * wcwWorld[0][1] + wcwWorld[0][2] * wcwWorld[0][2]);
++                            const bool wcwCharacter = std::abs(wcwScale - 1.0f) > 0.005f;
++                            // Alpha-tested draws (alpha compare or coverage x alpha) let rays through transparent texels.
++                            const interop::OtherMode &wcwOm = call.callDesc.otherMode;
++                            const bool wcwAlphaTest = (call.callDesc.textureOn != 0) && (call.callDesc.tileCount > 0) &&
++                                ((wcwOm.alphaCompare() != G_AC_NONE) || wcwOm.cvgXAlpha());
++                            const bool wcwUvCorrection = (wcwOm.textPersp() != G_TP_PERSP);
++                            // Screen footprint, so the pass only traces what this workload covers.
++                            uint32_t wcwMaxVertex = 0;
++                            for (uint32_t i = 0; i < call.callDesc.triangleCount * 3; i += 3) {
++                                float wcwTri[9];
++                                for (uint32_t k = 0; k < 3; k++) {
++                                    const uint32_t v = drawData.faceIndices[call.meshDesc.faceIndicesStart + i + k];
++                                    wcwMaxVertex = std::max(wcwMaxVertex, v);
++                                    const hlslpp::float4 objPos(drawData.posFloats[v * 3 + 0], drawData.posFloats[v * 3 + 1], drawData.posFloats[v * 3 + 2], 1.0f);
++                                    const hlslpp::float4 wp = hlslpp::mul(objPos, hlslpp::float4x4(drawData.worldTransforms[drawData.worldIndices[v]]));
++                                    wcwTri[k * 3 + 0] = float(wp.x);
++                                    wcwTri[k * 3 + 1] = float(wp.y);
++                                    wcwTri[k * 3 + 2] = float(wp.z);
++                                }
++
++                                wcwRaytracer->extendBounds(wcwTri);
++                            }
++
++                            // The geometry's vertex range ends at its highest index, not the whole buffer.
++                            wcwRaytracer->addMesh(call.meshDesc.faceIndicesStart, call.callDesc.triangleCount, std::min(wcwMaxVertex + 1, vertexCount), call.shaderDesc.flags.culling, wcwCharacter,
++                                wcwAlphaTest, call.callDesc.tileIndex, wcwUvCorrection);
++
++                            // WCW_RT_RAYTEST=<present>: CPU copy of the gathered triangles for a reference ray test.
++                            static const int wcwRayTestAt = getenv("WCW_RT_RAYTEST") ? atoi(getenv("WCW_RT_RAYTEST")) : -1;
++                            if ((wcwRayTestAt >= 0) && (wcwRtPresentCounter >= wcwRayTestAt) && !wcwRayTestDone) {
++                                for (uint32_t i = 0; i < call.callDesc.triangleCount * 3; i++) {
++                                    const uint32_t v = drawData.faceIndices[call.meshDesc.faceIndicesStart + i];
++                                    const hlslpp::float4 objPos(drawData.posFloats[v * 3 + 0], drawData.posFloats[v * 3 + 1], drawData.posFloats[v * 3 + 2], 1.0f);
++                                    const hlslpp::float4 wp = hlslpp::mul(objPos, hlslpp::float4x4(drawData.worldTransforms[drawData.worldIndices[v]]));
++                                    wcwRayTestTris.push_back({ float(wp.x), float(wp.y), float(wp.z), float(wcwRaytracer->meshes.size() - 1) });
++                                }
++                            }
++
++                            // WCW_RT_DUMP=<present>: dump every gathered call of the first traced scene at that present.
++                            static const int wcwDumpAt = getenv("WCW_RT_DUMP") ? atoi(getenv("WCW_RT_DUMP")) : -1;
++                            static bool wcwDumped = false;
++                            if ((wcwDumpAt >= 0) && (wcwRtPresentCounter >= wcwDumpAt) && (!wcwDumped || (d > 0 && wcwDumpScene == p.curWorkload))) {
++                                wcwDumped = true;
++                                wcwDumpScene = p.curWorkload;
++                                const uint32_t v = drawData.faceIndices[call.meshDesc.faceIndicesStart];
++                                const uint32_t wi = drawData.worldIndices[v];
++                                const auto &w = drawData.worldTransforms[wi];
++                                const auto &rdp = call.callDesc.rdpParams;
++                                fprintf(stderr, "[wcw rt dump] present=%d mesh=%zu call %u tris=%u wIdx=%u w.t=(%.1f,%.1f,%.1f) w.sx=%.3f vtxA=%u primA=%.2f envA=%.2f geo=0x%X om=0x%08X/0x%08X cc=0x%08X/0x%08X tex=%u\n",
++                                    int(wcwRtPresentCounter), wcwRaytracer->meshes.size() - 1, d, call.callDesc.triangleCount, wi, (float)w[3][0], (float)w[3][1], (float)w[3][2],
++                                    std::sqrt(w[0][0] * w[0][0] + w[0][1] * w[0][1] + w[0][2] * w[0][2]), drawData.normColBytes[v * 4 + 3],
++                                    (float)rdp.primColor.w, (float)rdp.envColor.w, call.callDesc.geometryMode, call.callDesc.otherMode.L, call.callDesc.otherMode.H,
++                                    call.callDesc.colorCombiner.L, call.callDesc.colorCombiner.H, call.callDesc.textureOn);
++                                const hlslpp::float4 objPos(drawData.posFloats[v * 3 + 0], drawData.posFloats[v * 3 + 1], drawData.posFloats[v * 3 + 2], 1.0f);
++                                const hlslpp::float4x4 worldM = drawData.worldTransforms[wi];
++                                const hlslpp::float4x4 vpM = drawData.viewProjTransforms[drawData.viewProjIndices[v]];
++                                const hlslpp::float4 wp = hlslpp::mul(objPos, worldM);
++                                const hlslpp::float4 clip = hlslpp::mul(wp, vpM);
++                                const hlslpp::float4 &cpuT = drawData.posTransformed[v];
++                                fprintf(stderr, "[wcw rt dump]   v=%u obj=(%.1f,%.1f,%.1f) world=(%.1f,%.1f,%.1f) ndc=(%.3f,%.3f) posTransformed=(%.1f,%.1f,%.1f,%.1f) screen=(%.1f,%.1f) modifyOps=%zu\n",
++                                    v, (float)objPos.x, (float)objPos.y, (float)objPos.z, (float)wp.x, (float)wp.y, (float)wp.z,
++                                    (float)(clip.x / clip.w), (float)(clip.y / clip.w), (float)cpuT.x, (float)cpuT.y, (float)cpuT.z, (float)cpuT.w,
++                                    (float)drawData.posScreen[v].x, (float)drawData.posScreen[v].y, drawData.modifyPosUints.size() / 2);
++                                fprintf(stderr, "[wcw rt dump]   W rows: (%.3f %.3f %.3f %.4f) (%.3f %.3f %.3f %.4f) (%.3f %.3f %.3f %.4f) (%.1f %.1f %.1f %.4f)\n",
++                                    (float)w[0][0], (float)w[0][1], (float)w[0][2], (float)w[0][3], (float)w[1][0], (float)w[1][1], (float)w[1][2], (float)w[1][3],
++                                    (float)w[2][0], (float)w[2][1], (float)w[2][2], (float)w[2][3], (float)w[3][0], (float)w[3][1], (float)w[3][2], (float)w[3][3]);
++                            }
++                        }
++
+                         triangles.scissor = convertFixedRect(call.callDesc.scissorRect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, int32_t(horizontalMisalignment), call.callDesc.scissorLeftOrigin, call.callDesc.scissorRightOrigin);
+ 
+                         bool usesViewport = (proj.type == Projection::Type::Perspective) || (proj.type == Projection::Type::Orthographic);
+@@ -1746,12 +1988,29 @@ namespace RT64 {
+                 else 
+ #           endif
+                 {
+-                    rasterScene.instanceIndices.push_back(instanceIndex);
++                    // [wcw rt] With ray-traced shadows on, the game's blob shadows are not drawn.
++                    const bool wcwSkipBlob = (wcwRaytracer != nullptr) && wcwRaytracer->replacesBlobShadows() && (proj.type == Projection::Type::Perspective) &&
++                        (instanceDrawCall.type == InstanceDrawCall::Type::IndexedTriangles) &&
++                        wcwIsBlobShadow(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount, call.callDesc.otherMode);
++                    if (!wcwSkipBlob) {
++                        rasterScene.instanceIndices.push_back(instanceIndex);
++                    }
+                 }
+ 
+                 instanceDrawCallVector.push_back(instanceDrawCall);
+                 globalCallIndex++;
+             }
++
++            // [wcw rt] Close the raster scene so the ray tracing pass runs before later (HUD) draws.
++            if (wcwRtProj && !wcwRayTestTris.empty() && !wcwRayTestDone) {
++                wcwRayTestDone = true;
++                wcwRunRayTest();
++            }
++
++            if (wcwRtProj) {
++                checkRasterScene(rasterScene);
++                targetDrawCall.wcwRtSceneSlot = int32_t(targetDrawCall.sceneIndices.size()) - 1;
++            }
+         }
+ 
+ #   if RT_ENABLED
+diff --git a/src/render/rt64_framebuffer_renderer.h b/src/render/rt64_framebuffer_renderer.h
+index 3add9c3..eac76ba 100644
+--- a/src/render/rt64_framebuffer_renderer.h
++++ b/src/render/rt64_framebuffer_renderer.h
+@@ -23,6 +23,7 @@
+ #include "rt64_render_target.h"
+ #include "rt64_rsp_processor.h"
+ #include "rt64_vertex_processor.h"
++#include "rt64_wcw_raytracer.h"
+ 
+ #if RT_ENABLED
+ #   include "rt64_raytracing_resources.h"
+@@ -48,6 +49,9 @@ namespace RT64 {
+         RenderFramebufferStorage *fbStorage = nullptr;
+         std::vector<RasterScene> rasterScenes;
+         std::vector<SceneIndexPair> sceneIndices;
++
++        // [wcw rt] Index into sceneIndices after which the hybrid ray tracing pass runs (-1: none).
++        int32_t wcwRtSceneSlot = -1;
+ #   if RT_ENABLED
+         std::vector<RaytracingScene> rtScenes;
+ #   endif
+@@ -110,6 +114,7 @@ namespace RT64 {
+         std::unique_ptr<RaytracingResources> rtResources;
+         bool rtSupport = false;
+ #   endif
++        std::unique_ptr<WcwRaytracer> wcwRaytracer;
+ 
+         struct Framebuffer {
+             std::unique_ptr<RenderBuffer> paramsBuffer;
 diff --git a/src/render/rt64_raster_shader.cpp b/src/render/rt64_raster_shader.cpp
 index 721a01e..41ee077 100644
 --- a/src/render/rt64_raster_shader.cpp
@@ -1057,3 +1622,1553 @@ index b4ff4e9..5e7ebe5 100644
          const hlslpp::float2 hdSize = computeHDSize(sdSize, resolutionScale, downsamplingScale);
          const hlslpp::float2 windowSize = { float(swapChain->getWidth()), float(swapChain->getHeight()) };
  
+diff --git a/src/render/rt64_wcw_raytracer.cpp b/src/render/rt64_wcw_raytracer.cpp
+new file mode 100644
+index 0000000..b07afb8
+--- /dev/null
++++ b/src/render/rt64_wcw_raytracer.cpp
+@@ -0,0 +1,767 @@
++//
++// RT64
++//
++
++#include "rt64_wcw_raytracer.h"
++
++#include <algorithm>
++#include <cfloat>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++#include "rt64_descriptor_sets.h"
++#include "rt64_render_target.h"
++#include "shared/rt64_gpu_tile.h"
++#include "shared/rt64_rdp_tile.h"
++#include "rt64_render_worker.h"
++
++#ifdef _WIN32
++#   include "shaders/FullScreenVS.hlsl.dxil.h"
++#   include "shaders/WcwRtTraceCS.hlsl.dxil.h"
++#   include "shaders/WcwRtCompositePS.hlsl.dxil.h"
++#   include "shaders/WcwRtResolveCS.hlsl.dxil.h"
++#endif
++
++namespace RT64 {
++    std::atomic<int> wcwRtPresentCounter = 0;
++
++    static uint64_t alignUp(uint64_t value, uint64_t alignment) {
++        return (value + alignment - 1) & ~(alignment - 1);
++    }
++
++    static float envFloat(const char *text, float fallback) {
++        return (text != nullptr) ? float(atof(text)) : fallback;
++    }
++
++    static std::atomic<bool> wcwRtUserEnabled = false;
++    static std::atomic<uint32_t> wcwRtUserQuality = 1;
++
++    void WcwRaytracer::setUserSettings(bool enabled, uint32_t quality) {
++        wcwRtUserEnabled = enabled;
++        wcwRtUserQuality = std::min(quality, 2u);
++    }
++
++    bool WcwRaytracer::active() {
++        // WCW_RT=1 forces it on, WCW_RT=0 forces it off (whatever the menu says).
++        static const char *envText = getenv("WCW_RT");
++        static const int forced = (envText == nullptr) ? -1 : ((atoi(envText) != 0) ? 1 : 0);
++        return (forced >= 0) ? (forced == 1) : wcwRtUserEnabled.load();
++    }
++
++    uint32_t WcwRaytracer::userQuality() {
++        return wcwRtUserQuality;
++    }
++
++    WcwRaytracer::WcwRaytracer(RenderDevice *device, RenderShaderFormat shaderFormat) {
++        this->device = device;
++        this->shaderFormat = shaderFormat;
++
++        if (const char *modeText = getenv("WCW_RT_MODE")) {
++            mode = uint32_t(atoi(modeText));
++        }
++
++        const RenderDeviceCapabilities capabilities = device->getCapabilities();
++#   ifdef _WIN32
++        supported = (shaderFormat == RenderShaderFormat::DXIL) && capabilities.raytracing && capabilities.raytracingStateUpdate;
++#   endif
++        fprintf(stderr, "[wcw rt] raytracer: dxr=%d dxr1.1=%d dxil=%d -> %s (mode %u)\n", capabilities.raytracing, capabilities.raytracingStateUpdate,
++            shaderFormat == RenderShaderFormat::DXIL, supported ? "enabled" : "UNSUPPORTED", mode);
++
++        if (!supported) {
++            return;
++        }
++
++#   ifdef _WIN32
++        // Trace pass: b0 params, t1 scene, t2 world positions, t3 face indices, t4 mesh index starts, u5 output.
++        RenderDescriptorSetBuilder traceBuilder;
++        traceBuilder.begin();
++        traceBuilder.addConstantBuffer(0);
++        traceBuilder.addAccelerationStructure(1);
++        traceBuilder.addStructuredBuffer(2);
++        traceBuilder.addStructuredBuffer(3);
++        traceBuilder.addStructuredBuffer(4);
++        traceBuilder.addReadWriteTexture(5);
++        traceBuilder.addReadWriteTexture(6);
++        traceBuilder.addStructuredBuffer(7);
++        traceBuilder.addStructuredBuffer(8);
++        traceBuilder.addStructuredBuffer(9);
++        traceBuilder.addStructuredBuffer(10);
++        traceBuilder.end();
++        traceSet = traceBuilder.create(device);
++
++        // Set 1: the framebuffer renderer's bindless texture cache (gTextures, space1).
++        RenderPipelineLayoutBuilder layoutBuilder;
++        layoutBuilder.begin();
++        layoutBuilder.addDescriptorSet(traceBuilder);
++        layoutBuilder.addDescriptorSet(FramebufferRendererDescriptorTextureSet());
++        layoutBuilder.end();
++        traceLayout = layoutBuilder.create(device);
++
++        std::unique_ptr<RenderShader> traceShader = device->createShader(WcwRtTraceCSBlobDXIL, std::size(WcwRtTraceCSBlobDXIL), "CSMain", RenderShaderFormat::DXIL);
++        tracePipeline = device->createComputePipeline(RenderComputePipelineDesc(traceLayout.get(), traceShader.get(), 8, 8, 1));
++
++        // Resolve pass: b0 params, t1 current samples, t2 history in, u3 history out, u4 output.
++        RenderDescriptorSetBuilder resolveBuilder;
++        resolveBuilder.begin();
++        resolveBuilder.addConstantBuffer(0);
++        resolveBuilder.addTexture(1);
++        resolveBuilder.addTexture(2);
++        resolveBuilder.addReadWriteTexture(3);
++        resolveBuilder.addReadWriteTexture(4);
++        resolveBuilder.end();
++        resolveSet = resolveBuilder.create(device);
++
++        layoutBuilder.begin();
++        layoutBuilder.addDescriptorSet(resolveBuilder);
++        layoutBuilder.end();
++        resolveLayout = layoutBuilder.create(device);
++
++        std::unique_ptr<RenderShader> resolveShader = device->createShader(WcwRtResolveCSBlobDXIL, std::size(WcwRtResolveCSBlobDXIL), "CSMain", RenderShaderFormat::DXIL);
++        resolvePipeline = device->createComputePipeline(RenderComputePipelineDesc(resolveLayout.get(), resolveShader.get(), 8, 8, 1));
++
++        // Composite pass: t0 trace output.
++        RenderDescriptorSetBuilder compositeBuilder;
++        compositeBuilder.begin();
++        compositeBuilder.addTexture(0);
++        compositeBuilder.end();
++        compositeSet = compositeBuilder.create(device);
++
++        layoutBuilder.begin();
++        layoutBuilder.addPushConstant(0, 0, sizeof(interop::WcwRtCompositeCB), RenderShaderStageFlag::PIXEL);
++        layoutBuilder.addDescriptorSet(compositeBuilder);
++        layoutBuilder.end();
++        compositeLayout = layoutBuilder.create(device);
++
++        fullScreenVS = device->createShader(FullScreenVSBlobDXIL, std::size(FullScreenVSBlobDXIL), "VSMain", RenderShaderFormat::DXIL);
++        compositePS = device->createShader(WcwRtCompositePSBlobDXIL, std::size(WcwRtCompositePSBlobDXIL), "PSMain", RenderShaderFormat::DXIL);
++#   endif
++
++        if (getenv("WCW_GPU_LOG") != nullptr) {
++            timingPool = device->createQueryPool(StampCount);
++        }
++
++        paramsBuffer = device->createBuffer(RenderBufferDesc::UploadBuffer(alignUp(sizeof(interop::WcwRtParams), 256), RenderBufferFlag::CONSTANT));
++    }
++
++    void WcwRaytracer::beginWorkload(uint64_t presentId) {
++        if (presentId != lastPresentId) {
++            lastPresentId = presentId;
++            workloadInFrame = 0;
++            frameCounter++;
++        }
++        else {
++            workloadInFrame++;
++        }
++
++        workloadCounter++;
++    }
++
++    uint32_t WcwRaytracer::chooseSlot() const {
++        // Score = (1 - IoU of the padded world bounds) + relative mesh count difference. The ring
++        // and the floor bits are static, the wrestlers move a little between their workloads.
++        const float Pad = 10.0f;
++        auto volume = [](const float *mn, const float *mx) {
++            return std::max(mx[0] - mn[0], 0.0f) * std::max(mx[1] - mn[1], 0.0f) * std::max(mx[2] - mn[2], 0.0f);
++        };
++
++        float curMin[3], curMax[3];
++        for (uint32_t i = 0; i < 3; i++) {
++            curMin[i] = worldMin[i] - Pad;
++            curMax[i] = worldMax[i] + Pad;
++        }
++
++        const uint32_t meshCount = uint32_t(meshes.size());
++        uint32_t best = UINT32_MAX;
++        float bestScore = 1.0f;
++        uint32_t oldest = 0;
++        for (uint32_t s = 0; s < MaxSlots; s++) {
++            const Slot &slot = slots[s];
++            if (!slot.valid) {
++                if (slots[oldest].valid) {
++                    oldest = s;
++                }
++
++                continue;
++            }
++
++            if (slots[oldest].valid && (slot.builtWorkload < slots[oldest].builtWorkload)) {
++                oldest = s;
++            }
++
++            float slotMin[3], slotMax[3], interMin[3], interMax[3];
++            for (uint32_t i = 0; i < 3; i++) {
++                slotMin[i] = slot.boundsMin[i] - Pad;
++                slotMax[i] = slot.boundsMax[i] + Pad;
++                interMin[i] = std::max(curMin[i], slotMin[i]);
++                interMax[i] = std::min(curMax[i], slotMax[i]);
++            }
++
++            const float inter = volume(interMin, interMax);
++            const float uni = volume(curMin, curMax) + volume(slotMin, slotMax) - inter;
++            const float iou = (uni > 0.0f) ? (inter / uni) : 0.0f;
++            const float meshDiff = float(std::abs(int(meshCount) - int(slot.meshCount))) / float(std::max(std::max(meshCount, slot.meshCount), 1u));
++            const float score = (1.0f - iou) + meshDiff;
++            if (score < bestScore) {
++                bestScore = score;
++                best = s;
++            }
++        }
++
++        return (best != UINT32_MAX) ? best : oldest;
++    }
++
++    void WcwRaytracer::reset() {
++        if (!active()) {
++            wasActive = false;
++        }
++
++        sceneActive = false;
++        structuresBuilt = false;
++        meshes.clear();
++        meshIndexStarts.clear();
++        meshTiles.clear();
++    }
++
++    bool WcwRaytracer::wantsScene() const {
++        return supported && active() && !sceneActive;
++    }
++
++    bool WcwRaytracer::replacesBlobShadows() const {
++        static const bool keepBlobs = getenv("WCW_RT_KEEP_BLOBS") != nullptr;
++        return supported && active() && (mode == WCW_RT_MODE_SHADOW) && !keepBlobs;
++    }
++
++    void WcwRaytracer::beginScene(const hlslpp::float4x4 &view, const hlslpp::float4x4 &proj, const RenderViewport &viewport,
++        const RenderBuffer *worldPosBuffer, uint64_t worldPosSize, const RenderBuffer *faceIndicesBuffer, uint64_t faceIndicesSize,
++        const RenderBuffer *rdpTilesBuffer, const RenderBuffer *gpuTilesBuffer, const RenderBuffer *texCoordBuffer)
++    {
++        boundsViewProj = hlslpp::mul(view, proj);
++        boundsMin[0] = boundsMin[1] = FLT_MAX;
++        boundsMax[0] = boundsMax[1] = -FLT_MAX;
++        boundsFullScreen = false;
++        receiverRadius = std::max(envFloat(getenv("WCW_RT_RADIUS"), 750.0f), 0.0f);
++        receiverCenter[0] = envFloat(getenv("WCW_RT_LIGHT_X"), 0.0f);
++        receiverCenter[1] = envFloat(getenv("WCW_RT_LIGHT_Z"), 0.0f);
++        for (uint32_t i = 0; i < 3; i++) {
++            worldMin[i] = FLT_MAX;
++            worldMax[i] = -FLT_MAX;
++        }
++
++        this->rdpTilesBuffer = rdpTilesBuffer;
++        this->gpuTilesBuffer = gpuTilesBuffer;
++        this->texCoordBuffer = texCoordBuffer;
++        sceneActive = true;
++        viewMatrix = view;
++        projMatrix = proj;
++        this->viewport = viewport;
++        this->worldPosBuffer = worldPosBuffer;
++        this->worldPosSize = worldPosSize;
++        this->faceIndicesBuffer = faceIndicesBuffer;
++        this->faceIndicesSize = faceIndicesSize;
++    }
++
++    void WcwRaytracer::addMesh(uint32_t faceIndicesStart, uint32_t triangleCount, uint32_t vertexCount, bool culled, bool character,
++        bool alphaTest, uint32_t tileIndex, bool uvCorrection)
++    {
++        // Without tile data the alpha test can't be evaluated: keep the draw opaque.
++        alphaTest = alphaTest && (rdpTilesBuffer != nullptr) && (gpuTilesBuffer != nullptr) && (texCoordBuffer != nullptr);
++        const uint32_t IndexStride = sizeof(uint32_t);
++        const uint32_t PosStride = sizeof(float) * 4;
++        meshes.emplace_back(RenderBufferReference(faceIndicesBuffer, faceIndicesStart * IndexStride), RenderBufferReference(worldPosBuffer, 0),
++            RenderFormat::R32_UINT, RenderFormat::R32G32B32_FLOAT, triangleCount * 3, vertexCount, PosStride, !culled && !alphaTest);
++
++        // Culled draws are non-opaque so the trace shader sees their candidates; the top bits
++        // carry the culled/character flags.
++        meshIndexStarts.emplace_back(faceIndicesStart | (culled ? WCW_RT_MESH_CULLED : 0u) | (character ? WCW_RT_MESH_CHARACTER : 0u));
++        meshTiles.emplace_back((tileIndex & WCW_RT_TILE_INDEX_MASK) | (alphaTest ? WCW_RT_TILE_ALPHA_TEST : 0u) | (uvCorrection ? WCW_RT_TILE_UV_CORRECTION : 0u));
++    }
++
++    void WcwRaytracer::extendBounds(const float *positions) {
++        for (uint32_t i = 0; i < 9; i++) {
++            worldMin[i % 3] = std::min(worldMin[i % 3], positions[i]);
++            worldMax[i % 3] = std::max(worldMax[i % 3], positions[i]);
++        }
++
++        if (boundsFullScreen) {
++            return;
++        }
++
++        // Triangles entirely outside the receiver radius only need primary rays where other
++        // geometry is traced anyway: they don't widen the rect.
++        if (receiverRadius > 0.0f) {
++            float minX = FLT_MAX, maxX = -FLT_MAX, minZ = FLT_MAX, maxZ = -FLT_MAX;
++            for (uint32_t i = 0; i < 3; i++) {
++                minX = std::min(minX, positions[i * 3 + 0]);
++                maxX = std::max(maxX, positions[i * 3 + 0]);
++                minZ = std::min(minZ, positions[i * 3 + 2]);
++                maxZ = std::max(maxZ, positions[i * 3 + 2]);
++            }
++
++            const float dx = std::max({ minX - receiverCenter[0], 0.0f, receiverCenter[0] - maxX });
++            const float dz = std::max({ minZ - receiverCenter[1], 0.0f, receiverCenter[1] - maxZ });
++            if ((dx * dx + dz * dz) > (receiverRadius * receiverRadius)) {
++                return;
++            }
++        }
++
++        // Clip the triangle against the near plane (w > NearW) so vertices behind the camera
++        // (crowd and set pieces around it) don't blow the footprint up to the whole screen.
++        const float NearW = 1e-2f;
++        hlslpp::float4 clip[3];
++        bool inside[3];
++        uint32_t insideCount = 0;
++        for (uint32_t i = 0; i < 3; i++) {
++            clip[i] = hlslpp::mul(hlslpp::float4(positions[i * 3 + 0], positions[i * 3 + 1], positions[i * 3 + 2], 1.0f), boundsViewProj);
++            inside[i] = float(clip[i].w) > NearW;
++            insideCount += inside[i] ? 1 : 0;
++        }
++
++        if (insideCount == 0) {
++            return;
++        }
++
++        auto extend = [&](const hlslpp::float4 &c) {
++            const float w = c.w;
++            const float px = viewport.x + (float(c.x) / w * 0.5f + 0.5f) * viewport.width;
++            const float py = viewport.y + (0.5f - float(c.y) / w * 0.5f) * viewport.height;
++            boundsMin[0] = std::min(boundsMin[0], px);
++            boundsMin[1] = std::min(boundsMin[1], py);
++            boundsMax[0] = std::max(boundsMax[0], px);
++            boundsMax[1] = std::max(boundsMax[1], py);
++        };
++
++        for (uint32_t i = 0; i < 3; i++) {
++            const uint32_t j = (i + 1) % 3;
++            if (inside[i]) {
++                extend(clip[i]);
++            }
++
++            if (inside[i] != inside[j]) {
++                const float t = (NearW - float(clip[i].w)) / (float(clip[j].w) - float(clip[i].w));
++                extend(clip[i] + (clip[j] - clip[i]) * t);
++            }
++        }
++    }
++
++    void WcwRaytracer::recordBuild(RenderWorker *worker) {
++        structuresBuilt = false;
++        if (!sceneActive || meshes.empty()) {
++            return;
++        }
++
++        currentSlot = chooseSlot();
++        Slot &slot = slots[currentSlot];
++        if (!slot.valid) {
++            slot.historyValid = false;
++        }
++
++        // Bottom level: every gathered draw call is one geometry over the shared world position buffer.
++        device->setBottomLevelASBuildInfo(blasInfo, meshes.data(), uint32_t(meshes.size()), true, false);
++        if (blasInfo.accelerationStructureSize > slot.blasBufferSize) {
++            slot.blasBufferSize = alignUp((blasInfo.accelerationStructureSize * 3) / 2, 256);
++            slot.blasBuffer = device->createBuffer(RenderBufferDesc::AccelerationStructureBuffer(slot.blasBufferSize));
++            slot.blas = device->createAccelerationStructure(RenderAccelerationStructureDesc(RenderAccelerationStructureType::BOTTOM_LEVEL, RenderBufferReference(slot.blasBuffer.get()), slot.blasBufferSize));
++        }
++
++        slot.valid = true;
++        slot.builtWorkload = workloadCounter;
++        slot.meshCount = uint32_t(meshes.size());
++        for (uint32_t i = 0; i < 3; i++) {
++            slot.boundsMin[i] = worldMin[i];
++            slot.boundsMax[i] = worldMax[i];
++        }
++        if (timingPool != nullptr) {
++            worker->commandList->resetQueryPool(timingPool.get(), 0, StampCount);
++            worker->commandList->writeTimestamp(timingPool.get(), StampBuildBegin);
++            timingWritten = (1u << StampBuildBegin);
++            timingMeshes = uint32_t(meshes.size());
++            timingTriangles = 0;
++            timingAlphaMeshes = 0;
++            timingPixels = 0;
++            for (size_t m = 0; m < meshes.size(); m++) {
++                timingTriangles += meshes[m].indexCount / 3;
++                timingAlphaMeshes += (meshTiles[m] & WCW_RT_TILE_ALPHA_TEST) ? 1 : 0;
++            }
++        }
++
++        // Top level: this workload's geometry (mask 0x1: primary and shadow rays) plus the other
++        // scenes built recently (mask 0x2: shadow rays only). Scenes the game stopped drawing
++        // age out after a few workloads.
++        instances.clear();
++        instances.emplace_back(RenderBufferReference(slot.blasBuffer.get()), 0, 0x1, 0, true, RenderAffineTransform());
++        for (uint32_t s = 0; s < MaxSlots; s++) {
++            const Slot &other = slots[s];
++            if ((s != currentSlot) && other.valid && ((workloadCounter - other.builtWorkload) <= StaleWorkloads)) {
++                instances.emplace_back(RenderBufferReference(other.blasBuffer.get()), s + 1, 0x2, 0, true, RenderAffineTransform());
++            }
++        }
++
++        device->setTopLevelASBuildInfo(tlasInfo, instances.data(), uint32_t(instances.size()), true, false);
++        if (tlasInfo.accelerationStructureSize > tlasBufferSize) {
++            tlasBufferSize = alignUp((tlasInfo.accelerationStructureSize * 3) / 2, 256);
++            tlasBuffer = device->createBuffer(RenderBufferDesc::AccelerationStructureBuffer(tlasBufferSize));
++            tlas = device->createAccelerationStructure(RenderAccelerationStructureDesc(RenderAccelerationStructureType::TOP_LEVEL, RenderBufferReference(tlasBuffer.get()), tlasBufferSize));
++        }
++
++        const uint64_t blasScratch = alignUp(blasInfo.scratchSize, 256);
++        const uint64_t requiredScratch = blasScratch + alignUp(tlasInfo.scratchSize, 256);
++        if (requiredScratch > scratchBufferSize) {
++            scratchBufferSize = alignUp((requiredScratch * 3) / 2, 256);
++            scratchBuffer = device->createBuffer(RenderBufferDesc::DefaultBuffer(scratchBufferSize, RenderBufferFlag::ACCELERATION_STRUCTURE_SCRATCH | RenderBufferFlag::UNORDERED_ACCESS));
++        }
++
++        const uint64_t instancesSize = tlasInfo.instancesBufferData.size();
++        if (instancesSize > instancesBufferSize) {
++            instancesBufferSize = alignUp(instancesSize, 256);
++            instancesBuffer = device->createBuffer(RenderBufferDesc::UploadBuffer(instancesBufferSize, RenderBufferFlag::ACCELERATION_STRUCTURE_INPUT));
++        }
++
++        void *instancesBytes = instancesBuffer->map();
++        memcpy(instancesBytes, tlasInfo.instancesBufferData.data(), instancesSize);
++        instancesBuffer->unmap();
++
++        const uint64_t meshStartsSize = meshIndexStarts.size() * sizeof(uint32_t);
++        if (meshStartsSize > meshStartsBufferSize) {
++            meshStartsBufferSize = alignUp((meshStartsSize * 3) / 2, 256);
++            meshStartsBuffer = device->createBuffer(RenderBufferDesc::UploadBuffer(meshStartsBufferSize, RenderBufferFlag::STORAGE));
++        }
++
++        void *meshStartsBytes = meshStartsBuffer->map();
++        memcpy(meshStartsBytes, meshIndexStarts.data(), meshStartsSize);
++        meshStartsBuffer->unmap();
++
++        const uint64_t meshTilesSize = meshTiles.size() * sizeof(uint32_t);
++        if (meshTilesSize > meshTilesBufferSize) {
++            meshTilesBufferSize = alignUp((meshTilesSize * 3) / 2, 256);
++            meshTilesBuffer = device->createBuffer(RenderBufferDesc::UploadBuffer(meshTilesBufferSize, RenderBufferFlag::STORAGE));
++        }
++
++        void *meshTilesBytes = meshTilesBuffer->map();
++        memcpy(meshTilesBytes, meshTiles.data(), meshTilesSize);
++        meshTilesBuffer->unmap();
++
++        worker->commandList->buildBottomLevelAS(slot.blas.get(), RenderBufferReference(scratchBuffer.get(), 0), blasInfo);
++        worker->commandList->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(slot.blasBuffer.get(), RenderBufferAccess::READ));
++        worker->commandList->buildTopLevelAS(tlas.get(), RenderBufferReference(scratchBuffer.get(), blasScratch), RenderBufferReference(instancesBuffer.get()), tlasInfo);
++        worker->commandList->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(tlasBuffer.get(), RenderBufferAccess::READ));
++        structuresBuilt = true;
++        if (timingPool != nullptr) {
++            worker->commandList->writeTimestamp(timingPool.get(), StampBuildEnd);
++            timingWritten |= (1u << StampBuildEnd);
++        }
++
++        static const bool wcwRtLog = getenv("WCW_RT_LOG") != nullptr;
++        if (wcwRtLog) {
++            static uint32_t buildCount = 0;
++            if ((buildCount++ % 300) == 0) {
++                uint32_t triangleCount = 0;
++                for (const RenderBottomLevelASMesh &mesh : meshes) {
++                    triangleCount += mesh.indexCount / 3;
++                }
++
++                fprintf(stderr, "[wcw rt] build #%u slot %u (+%zu other): %zu meshes, %u triangles, blas=%llu tlas=%llu scratch=%llu vp=(%.0f,%.0f %.0fx%.0f)\n",
++                    buildCount, currentSlot, instances.size() - 1, meshes.size(), triangleCount, (unsigned long long)blasInfo.accelerationStructureSize,
++                    (unsigned long long)tlasInfo.accelerationStructureSize, (unsigned long long)requiredScratch,
++                    viewport.x, viewport.y, viewport.width, viewport.height);
++            }
++        }
++    }
++
++    void WcwRaytracer::recordTrace(RenderWorker *worker, RenderTarget *colorTarget, RenderDescriptorSet *textureSet) {
++        if (!structuresBuilt || (colorTarget == nullptr)) {
++            return;
++        }
++
++        // Output texture at the color target's resolution.
++        // Quality preset (or env overrides) for this frame.
++        const uint32_t quality = userQuality();
++        // Soft, temporally resolved shadows don't need the full internal resolution: the presets
++        // also cap the trace height (Performance 720 lines, Balanced 1080), so 4K+ targets don't
++        // multiply the ray count. WCW_RT_MAX_LINES overrides the cap, WCW_RT_SCALE the whole scale.
++        const float presetLines = envFloat(getenv("WCW_RT_MAX_LINES"), (quality == 0) ? 720.0f : ((quality == 1) ? 1080.0f : 0.0f));
++        float presetScale = (quality >= 2) ? 1.0f : 0.5f;
++        if ((presetLines > 0.0f) && (colorTarget->height > 0)) {
++            presetScale = std::min(presetScale, presetLines / float(colorTarget->height));
++        }
++
++        const float frameScale = std::clamp(envFloat(getenv("WCW_RT_SCALE"), presetScale), 0.1f, 1.0f);
++        const uint32_t presetSamples = (quality == 0) ? 1u : 2u;
++
++        // Re-enabled after being off: the histories are stale.
++        if (!wasActive) {
++            for (Slot &s : slots) {
++                s.historyValid = false;
++            }
++        }
++
++        wasActive = true;
++
++        // Trace-resolution textures (traceScale of the color target).
++        if ((outputTexture == nullptr) || (outputWidth != colorTarget->width) || (outputHeight != colorTarget->height) || (frameScale != traceScale)) {
++            traceScale = frameScale;
++            outputWidth = colorTarget->width;
++            outputHeight = colorTarget->height;
++            traceWidth = std::max(uint32_t(std::ceil(outputWidth * traceScale)), 1u);
++            traceHeight = std::max(uint32_t(std::ceil(outputHeight * traceScale)), 1u);
++            outputTexture = device->createTexture(RenderTextureDesc::Texture2D(traceWidth, traceHeight, 1, RenderFormat::R8G8B8A8_UNORM, RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS));
++            currentTexture = device->createTexture(RenderTextureDesc::Texture2D(traceWidth, traceHeight, 1, RenderFormat::R32G32_FLOAT, RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS));
++        }
++
++        Slot &slot = slots[currentSlot];
++        if ((slot.history[0] == nullptr) || (slot.historyWidth != traceWidth) || (slot.historyHeight != traceHeight)) {
++            slot.historyWidth = traceWidth;
++            slot.historyHeight = traceHeight;
++            for (auto &history : slot.history) {
++                history = device->createTexture(RenderTextureDesc::Texture2D(traceWidth, traceHeight, 1, RenderFormat::R16_FLOAT, RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS));
++            }
++
++            slot.historyValid = false;
++        }
++
++        // Composite pipeline matching the target's format and sample count; blend depends on the mode.
++        if ((compositePipeline == nullptr) || (compositeFormat != colorTarget->format) || (compositeSamples != colorTarget->multisampling.sampleCount) || (compositeMode != mode)) {
++            compositeFormat = colorTarget->format;
++            compositeSamples = colorTarget->multisampling.sampleCount;
++            compositeMode = mode;
++
++            RenderGraphicsPipelineDesc pipelineDesc;
++            pipelineDesc.pipelineLayout = compositeLayout.get();
++            pipelineDesc.vertexShader = fullScreenVS.get();
++            pipelineDesc.pixelShader = compositePS.get();
++            pipelineDesc.renderTargetFormat[0] = compositeFormat;
++            pipelineDesc.renderTargetCount = 1;
++            pipelineDesc.depthTargetFormat = RenderFormat::D32_FLOAT;
++            pipelineDesc.multisampling = colorTarget->multisampling;
++            if ((mode == WCW_RT_MODE_SHADOW) || (mode == WCW_RT_MODE_AO)) {
++                RenderBlendDesc multiply;
++                multiply.blendEnabled = true;
++                multiply.srcBlend = RenderBlend::ZERO;
++                multiply.dstBlend = RenderBlend::SRC_COLOR;
++                multiply.blendOp = RenderBlendOperation::ADD;
++                multiply.srcBlendAlpha = RenderBlend::ZERO;
++                multiply.dstBlendAlpha = RenderBlend::ONE;
++                multiply.blendOpAlpha = RenderBlendOperation::ADD;
++                pipelineDesc.renderTargetBlend[0] = multiply;
++            }
++            else {
++                pipelineDesc.renderTargetBlend[0] = RenderBlendDesc::AlphaBlend();
++            }
++
++            pipelineDesc.renderTargetBlend[0].renderTargetWriteMask = uint8_t(RenderColorWriteEnable::RED) | uint8_t(RenderColorWriteEnable::GREEN) | uint8_t(RenderColorWriteEnable::BLUE);
++            compositePipeline = device->createGraphicsPipeline(pipelineDesc);
++        }
++
++        // Parameters.
++        interop::WcwRtParams params;
++        const hlslpp::float4x4 viewProj = hlslpp::mul(viewMatrix, projMatrix);
++        const hlslpp::float4x4 invView = hlslpp::inverse(viewMatrix);
++        params.invViewProj = hlslpp::inverse(viewProj);
++        params.eyePosition = hlslpp::float4(invView[3].xyz, 1.0f);
++        params.lightPosition = hlslpp::float4(envFloat(getenv("WCW_RT_LIGHT_X"), 0.0f), envFloat(getenv("WCW_RT_LIGHT_Y"), 460.0f), envFloat(getenv("WCW_RT_LIGHT_Z"), 0.0f), 1.0f);
++        params.viewport = hlslpp::float4(viewport.x, viewport.y, viewport.width, viewport.height);
++        params.resolution = { traceWidth, traceHeight };
++        params.mode = mode;
++        params.shadowStrength = envFloat(getenv("WCW_RT_SHADOW"), 0.6f);
++        params.lightSpread = envFloat(getenv("WCW_RT_LIGHT_SPREAD"), 200.0f);
++        params.lightCount = uint32_t(envFloat(getenv("WCW_RT_LIGHTS"), 4.0f));
++        params.cullSign = envFloat(getenv("WCW_RT_CULL_SIGN"), 1.0f);
++        params.keyWeight = envFloat(getenv("WCW_RT_KEY_WEIGHT"), 0.5f);
++        params.characterShadowStrength = envFloat(getenv("WCW_RT_SHADOW_CHAR"), 0.35f);
++        params.lightSize = envFloat(getenv("WCW_RT_LIGHT_SIZE"), 20.0f);
++        params.temporalAlpha = envFloat(getenv("WCW_RT_TEMPORAL"), 0.1f);
++        params.frameIndex = frameIndex++;
++        params.prevViewProj = slot.prevViewProj;
++        params.historyValid = slot.historyValid ? 1 : 0;
++        params.samplesPerLight = std::max(uint32_t(envFloat(getenv("WCW_RT_SAMPLES"), float(presetSamples))), 1u);
++        params.aoSamples = uint32_t(envFloat(getenv("WCW_RT_AO_SAMPLES"), float(presetSamples)));
++        params.aoRadius = envFloat(getenv("WCW_RT_AO_RADIUS"), 25.0f);
++        params.aoStrength = envFloat(getenv("WCW_RT_AO"), 0.5f);
++        params.traceScale = float(traceWidth) / float(outputWidth);
++
++        // Trace only this workload's screen footprint (plus a margin for the bilinear upsample
++        // and the resolve's 3x3 neighborhood).
++        if (boundsFullScreen) {
++            traceRect[0] = traceRect[1] = 0;
++            traceRect[2] = traceWidth;
++            traceRect[3] = traceHeight;
++        }
++        else {
++            const float scale = params.traceScale;
++            traceRect[0] = uint32_t(std::clamp(std::floor(boundsMin[0] * scale) - 3.0f, 0.0f, float(traceWidth)));
++            traceRect[1] = uint32_t(std::clamp(std::floor(boundsMin[1] * scale) - 3.0f, 0.0f, float(traceHeight)));
++            traceRect[2] = uint32_t(std::clamp(std::ceil(boundsMax[0] * scale) + 3.0f, 0.0f, float(traceWidth)));
++            traceRect[3] = uint32_t(std::clamp(std::ceil(boundsMax[1] * scale) + 3.0f, 0.0f, float(traceHeight)));
++        }
++
++        traceRectEmpty = (traceRect[2] <= traceRect[0]) || (traceRect[3] <= traceRect[1]);
++        if (traceRectEmpty) {
++            return;
++        }
++
++        params.traceOffset = { traceRect[0], traceRect[1] };
++        params.receiverRadius = receiverRadius;
++        void *paramsBytes = paramsBuffer->map();
++        memcpy(paramsBytes, &params, sizeof(params));
++        paramsBuffer->unmap();
++
++        traceSet->setBuffer(0, paramsBuffer.get(), alignUp(sizeof(interop::WcwRtParams), 256));
++        traceSet->setAccelerationStructure(1, tlas.get());
++        const RenderBufferStructuredView float4View(sizeof(float) * 4);
++        const RenderBufferStructuredView uintView(sizeof(uint32_t));
++        traceSet->setBuffer(2, worldPosBuffer, worldPosSize, &float4View);
++        traceSet->setBuffer(3, faceIndicesBuffer, faceIndicesSize, &uintView);
++        traceSet->setBuffer(4, meshStartsBuffer.get(), meshStartsBufferSize, &uintView);
++        traceSet->setTexture(5, outputTexture.get(), RenderTextureLayout::GENERAL);
++        traceSet->setTexture(6, currentTexture.get(), RenderTextureLayout::GENERAL);
++        const RenderBufferStructuredView rdpTileView(sizeof(interop::RDPTile));
++        const RenderBufferStructuredView gpuTileView(sizeof(interop::GPUTile));
++        const RenderBufferStructuredView float2View(sizeof(float) * 2);
++        traceSet->setBuffer(7, (rdpTilesBuffer != nullptr) ? rdpTilesBuffer : meshTilesBuffer.get(), 0, &rdpTileView);
++        traceSet->setBuffer(8, (gpuTilesBuffer != nullptr) ? gpuTilesBuffer : meshTilesBuffer.get(), 0, &gpuTileView);
++        traceSet->setBuffer(9, (texCoordBuffer != nullptr) ? texCoordBuffer : meshTilesBuffer.get(), 0, &float2View);
++        traceSet->setBuffer(10, meshTilesBuffer.get(), meshTilesBufferSize, &uintView);
++        compositeSet->setTexture(0, outputTexture.get(), RenderTextureLayout::SHADER_READ);
++
++        // Trace.
++        worker->commandList->barriers(RenderBarrierStage::COMPUTE, {
++            RenderTextureBarrier(outputTexture.get(), RenderTextureLayout::GENERAL),
++            RenderTextureBarrier(currentTexture.get(), RenderTextureLayout::GENERAL)
++        });
++        if (timingPool != nullptr) {
++            worker->commandList->writeTimestamp(timingPool.get(), StampTraceBegin);
++            timingWritten |= (1u << StampTraceBegin);
++        }
++
++        worker->commandList->setPipeline(tracePipeline.get());
++        worker->commandList->setComputePipelineLayout(traceLayout.get());
++        worker->commandList->setComputeDescriptorSet(traceSet.get(), 0);
++        worker->commandList->setComputeDescriptorSet(textureSet, 1);
++        const uint32_t rectWidth = traceRect[2] - traceRect[0];
++        const uint32_t rectHeight = traceRect[3] - traceRect[1];
++        worker->commandList->dispatch((rectWidth + 7) / 8, (rectHeight + 7) / 8, 1);
++        if (timingPool != nullptr) {
++            worker->commandList->writeTimestamp(timingPool.get(), StampTraceEnd);
++            timingWritten |= (1u << StampTraceEnd);
++            timingPixels = rectWidth * rectHeight;
++            timingFullScreen = boundsFullScreen;
++            timingTraceHeight = traceHeight;
++            // WCW_RT_TRACELOG=1: every 100th frame; =<present>: every trace for 30 presents from there.
++            static const int traceLogAt = getenv("WCW_RT_TRACELOG") ? atoi(getenv("WCW_RT_TRACELOG")) : -1;
++            const bool traceLogNow = (traceLogAt == 1) ? ((frameCounter % 100) == 0) : ((traceLogAt > 1) && (wcwRtPresentCounter >= traceLogAt) && (wcwRtPresentCounter < traceLogAt + 30));
++            if (traceLogNow) {
++                fprintf(stderr, "[wcw rt trace] present %d frame %llu slot %u others %u hist %d target %p %ux%u rect (%u,%u)-(%u,%u) of %ux%u meshes %u tris %u world (%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f)\n",
++                    int(wcwRtPresentCounter), (unsigned long long)frameCounter, currentSlot, uint32_t(instances.size() - 1), slot.historyValid ? 1 : 0, (void *)colorTarget, outputWidth, outputHeight, traceRect[0], traceRect[1], traceRect[2], traceRect[3],
++                    traceWidth, traceHeight, timingMeshes, timingTriangles, worldMin[0], worldMin[1], worldMin[2], worldMax[0], worldMax[1], worldMax[2]);
++            }
++        }
++
++        // Shadow mode: temporal resolve of the jittered samples into this slot's history.
++        if ((mode == WCW_RT_MODE_SHADOW) || (mode == WCW_RT_MODE_AO)) {
++            RenderTexture *historyIn = slot.history[slot.historyIndex].get();
++            RenderTexture *historyOut = slot.history[slot.historyIndex ^ 1].get();
++            resolveSet->setBuffer(0, paramsBuffer.get(), alignUp(sizeof(interop::WcwRtParams), 256));
++            resolveSet->setTexture(1, currentTexture.get(), RenderTextureLayout::SHADER_READ);
++            resolveSet->setTexture(2, historyIn, RenderTextureLayout::SHADER_READ);
++            resolveSet->setTexture(3, historyOut, RenderTextureLayout::GENERAL);
++            resolveSet->setTexture(4, outputTexture.get(), RenderTextureLayout::GENERAL);
++            worker->commandList->barriers(RenderBarrierStage::COMPUTE, {
++                RenderTextureBarrier(currentTexture.get(), RenderTextureLayout::SHADER_READ),
++                RenderTextureBarrier(historyIn, RenderTextureLayout::SHADER_READ),
++                RenderTextureBarrier(historyOut, RenderTextureLayout::GENERAL),
++                RenderTextureBarrier(outputTexture.get(), RenderTextureLayout::GENERAL)
++            });
++
++            worker->commandList->setPipeline(resolvePipeline.get());
++            worker->commandList->setComputePipelineLayout(resolveLayout.get());
++            worker->commandList->setComputeDescriptorSet(resolveSet.get(), 0);
++            worker->commandList->dispatch((rectWidth + 7) / 8, (rectHeight + 7) / 8, 1);
++
++            slot.historyIndex ^= 1;
++            slot.historyValid = true;
++            slot.prevViewProj = viewProj;
++        }
++
++        if (timingPool != nullptr) {
++            worker->commandList->writeTimestamp(timingPool.get(), StampResolveEnd);
++            timingWritten |= (1u << StampResolveEnd);
++        }
++
++        worker->commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(outputTexture.get(), RenderTextureLayout::SHADER_READ));
++    }
++
++    void WcwRaytracer::recordComposite(RenderWorker *worker) {
++        if (!structuresBuilt || (compositePipeline == nullptr) || traceRectEmpty) {
++            return;
++        }
++
++        // Composite only the traced rect (inside its margin), in color target pixels.
++        const float invScale = float(outputWidth) / float(traceWidth);
++        const RenderViewport fullViewport(0.0f, 0.0f, float(outputWidth), float(outputHeight));
++        const RenderRect fullRect(int32_t((traceRect[0] + 1) * invScale), int32_t((traceRect[1] + 1) * invScale),
++            std::min(int32_t((traceRect[2] - 1) * invScale), int32_t(outputWidth)), std::min(int32_t((traceRect[3] - 1) * invScale), int32_t(outputHeight)));
++        worker->commandList->setPipeline(compositePipeline.get());
++        worker->commandList->setGraphicsPipelineLayout(compositeLayout.get());
++        interop::WcwRtCompositeCB compositeCB;
++        compositeCB.scale = { float(traceWidth) / float(outputWidth), float(traceHeight) / float(outputHeight) };
++        compositeCB.traceSize = { float(traceWidth), float(traceHeight) };
++        worker->commandList->setGraphicsPushConstants(0, &compositeCB);
++        worker->commandList->setGraphicsDescriptorSet(compositeSet.get(), 0);
++        worker->commandList->setViewports(fullViewport);
++        worker->commandList->setScissors(fullRect);
++        if (timingPool != nullptr) {
++            worker->commandList->writeTimestamp(timingPool.get(), StampCompositeBegin);
++        }
++
++        worker->commandList->drawInstanced(3, 1, 0, 0);
++        if (timingPool != nullptr) {
++            worker->commandList->writeTimestamp(timingPool.get(), StampCompositeEnd);
++            timingWritten |= (1u << StampCompositeBegin) | (1u << StampCompositeEnd);
++        }
++    }
++
++    void WcwRaytracer::collectTimings() {
++        if ((timingPool == nullptr) || (timingWritten == 0)) {
++            return;
++        }
++
++        static double sums[5] = {};
++        static double maxTotal = 0.0;
++        static uint64_t triangleSum = 0, meshSum = 0, alphaSum = 0, pixelSum = 0, fullScreenSum = 0;
++        static uint32_t count = 0;
++        timingPool->queryResults();
++        const uint64_t *t = timingPool->getResults();
++        auto span = [&](uint32_t a, uint32_t b) {
++            const uint32_t need = (1u << a) | (1u << b);
++            return ((timingWritten & need) == need) ? double(t[b] - t[a]) / 1000000.0 : 0.0;
++        };
++
++        const double build = span(StampBuildBegin, StampBuildEnd);
++        const double trace = span(StampTraceBegin, StampTraceEnd);
++        const double resolve = span(StampTraceEnd, StampResolveEnd);
++        const double composite = span(StampCompositeBegin, StampCompositeEnd);
++        const double total = span(StampBuildBegin, StampCompositeEnd);
++        sums[0] += build;
++        sums[1] += trace;
++        sums[2] += resolve;
++        sums[3] += composite;
++        sums[4] += total;
++        maxTotal = std::max(maxTotal, total);
++        triangleSum += timingTriangles;
++        meshSum += timingMeshes;
++        alphaSum += timingAlphaMeshes;
++        pixelSum += timingPixels;
++        fullScreenSum += timingFullScreen ? 1 : 0;
++        timingWritten = 0;
++        if (++count == 300) {
++            fprintf(stderr, "[wcw rt gpu] per traced workload avg: build=%.3f trace=%.3f resolve=%.3f composite=%.3f ms, build->composite span=%.3f (max %.3f) ms; %llu meshes (%llu alpha-tested), %llu tris, %llu trace px of %u lines, %llu full-screen (300 workloads)\n",
++                sums[0] / count, sums[1] / count, sums[2] / count, sums[3] / count, sums[4] / count, maxTotal,
++                (unsigned long long)(meshSum / count), (unsigned long long)(alphaSum / count), (unsigned long long)(triangleSum / count), (unsigned long long)(pixelSum / count), timingTraceHeight, (unsigned long long)fullScreenSum);
++            memset(sums, 0, sizeof(sums));
++            maxTotal = 0.0;
++            triangleSum = meshSum = alphaSum = pixelSum = fullScreenSum = 0;
++            count = 0;
++        }
++    }
++};
+diff --git a/src/render/rt64_wcw_raytracer.h b/src/render/rt64_wcw_raytracer.h
+new file mode 100644
+index 0000000..110ddc1
+--- /dev/null
++++ b/src/render/rt64_wcw_raytracer.h
+@@ -0,0 +1,192 @@
++//
++// RT64
++//
++
++#pragma once
++
++#include <atomic>
++#include <memory>
++#include <vector>
++
++#include "common/rt64_common.h"
++#include "common/rt64_plume.h"
++#include "shared/rt64_wcw_rt.h"
++
++namespace RT64 {
++    // [wcw rt] Presented frame count (mirrors the WCW_PRESENT_LUM counter) for targeted dumps.
++    extern std::atomic<int> wcwRtPresentCounter;
++
++    struct RenderTarget;
++    struct RenderWorker;
++
++    // [wcw rt] Hybrid ray tracing for forceMatrix-only AKI games (WCW_RT=1, D3D12 + DXR 1.1).
++    //
++    // The raster image is left untouched. Per workload, the depth-writing triangles of the
++    // first perspective projection are gathered (addMesh) into one bottom-level structure built
++    // straight from RT64's world-space vertex and face index buffers (recordBuild), and after
++    // that projection's raster scene a compute pass casts inline rays from the game camera
++    // (recordTrace). Its output is composited over the color target: alpha blended for the
++    // debug views, multiplied for shadows. WCW_RT_MODE selects the output (rt64_wcw_rt.h).
++    struct WcwRaytracer {
++        RenderDevice *device = nullptr;
++        RenderShaderFormat shaderFormat = RenderShaderFormat::UNKNOWN;
++        bool supported = false;
++        uint32_t mode = WCW_RT_MODE_SHADOW;
++        bool wasActive = false;
++
++        // Scene gathered for the current workload.
++        bool sceneActive = false;
++        std::vector<RenderBottomLevelASMesh> meshes;
++        std::vector<uint32_t> meshIndexStarts;
++        const RenderBuffer *worldPosBuffer = nullptr;
++        const RenderBuffer *rdpTilesBuffer = nullptr;
++        const RenderBuffer *gpuTilesBuffer = nullptr;
++        const RenderBuffer *texCoordBuffer = nullptr;
++        std::vector<uint32_t> meshTiles;
++        std::unique_ptr<RenderBuffer> meshTilesBuffer;
++        uint64_t meshTilesBufferSize = 0;
++        const RenderBuffer *faceIndicesBuffer = nullptr;
++        uint64_t worldPosSize = 0;
++        uint64_t faceIndicesSize = 0;
++        hlslpp::float4x4 viewMatrix;
++        hlslpp::float4x4 projMatrix;
++        RenderViewport viewport;
++        bool structuresBuilt = false;
++
++        // Screen bounds (color target pixels) of this workload's gathered geometry.
++        hlslpp::float4x4 boundsViewProj;
++        float boundsMin[2] = {};
++        float boundsMax[2] = {};
++        bool boundsFullScreen = false;
++        // Shadows and AO are only cast onto surfaces within receiverRadius (XZ) of the lights'
++        // center: the ring and ringside. The arena and crowd beyond it only get primary rays,
++        // and geometry entirely outside it doesn't widen the traced rect (WCW_RT_RADIUS, 0 = off).
++        float receiverRadius = 750.0f;
++        float receiverCenter[2] = {};
++        float worldMin[3] = {};
++        float worldMax[3] = {};
++
++        // AKI games build one frame from several RSP workloads (WCW: floor bits, ring and
++        // wrestlers apart), and each workload gets its own pass. Every slot keeps one scene's
++        // bottom-level structure so the others' passes can include it as a shadow caster, plus
++        // that scene's soft-shadow history. Slots follow scene identity (mesh count and world
++        // bounds), not the workload's position within the present: the game's workload cycle
++        // drifts against presents, so positions would swap scenes from frame to frame.
++        static const uint32_t MaxSlots = 8;
++        static const uint32_t StaleWorkloads = 8;
++        struct Slot {
++            std::unique_ptr<RenderBuffer> blasBuffer;
++            std::unique_ptr<RenderAccelerationStructure> blas;
++            uint64_t blasBufferSize = 0;
++            uint64_t builtWorkload = 0;
++            uint32_t meshCount = 0;
++            float boundsMin[3] = {};
++            float boundsMax[3] = {};
++            bool valid = false;
++
++            // Soft-shadow history (ping-pong) of this workload's pass, with the camera it used.
++            std::unique_ptr<RenderTexture> history[2];
++            uint32_t historyIndex = 0;
++            uint32_t historyWidth = 0;
++            uint32_t historyHeight = 0;
++            bool historyValid = false;
++            hlslpp::float4x4 prevViewProj;
++        };
++
++        Slot slots[MaxSlots];
++        uint32_t currentSlot = 0;
++        uint32_t workloadInFrame = 0;
++        uint64_t workloadCounter = 0;
++        // Picks the slot whose last scene best matches the gathered one (or the oldest slot).
++        uint32_t chooseSlot() const;
++        uint64_t lastPresentId = UINT64_MAX;
++        uint64_t frameCounter = 0;
++        std::vector<RenderTopLevelASInstance> instances;
++
++        // Acceleration structures (grow-only).
++        RenderBottomLevelASBuildInfo blasInfo;
++        RenderTopLevelASBuildInfo tlasInfo;
++        std::unique_ptr<RenderBuffer> tlasBuffer;
++        std::unique_ptr<RenderBuffer> scratchBuffer;
++        std::unique_ptr<RenderBuffer> instancesBuffer;
++        std::unique_ptr<RenderAccelerationStructure> tlas;
++        uint64_t tlasBufferSize = 0;
++        uint64_t scratchBufferSize = 0;
++        uint64_t instancesBufferSize = 0;
++
++        // Trace pass.
++        std::unique_ptr<RenderBuffer> paramsBuffer;
++        std::unique_ptr<RenderBuffer> meshStartsBuffer;
++        uint64_t meshStartsBufferSize = 0;
++        std::unique_ptr<RenderTexture> outputTexture;
++        std::unique_ptr<RenderTexture> currentTexture;
++        uint32_t frameIndex = 0;
++        std::unique_ptr<RenderDescriptorSet> resolveSet;
++        std::unique_ptr<RenderPipelineLayout> resolveLayout;
++        std::unique_ptr<RenderPipeline> resolvePipeline;
++        uint32_t outputWidth = 0;
++        uint32_t outputHeight = 0;
++        uint32_t traceWidth = 0;
++        uint32_t traceHeight = 0;
++        float traceScale = 0.5f;
++        bool traceRectEmpty = true;
++        uint32_t traceRect[4] = {};
++        bool outputNeedsTransition = false;
++        std::unique_ptr<RenderDescriptorSet> traceSet;
++        std::unique_ptr<RenderPipelineLayout> traceLayout;
++        std::unique_ptr<RenderPipeline> tracePipeline;
++        std::unique_ptr<RenderDescriptorSet> compositeSet;
++        std::unique_ptr<RenderPipelineLayout> compositeLayout;
++        std::unique_ptr<RenderShader> fullScreenVS;
++        std::unique_ptr<RenderShader> compositePS;
++        std::unique_ptr<RenderPipeline> compositePipeline;
++        RenderFormat compositeFormat = RenderFormat::UNKNOWN;
++        RenderSampleCounts compositeSamples = RenderSampleCount::COUNT_0;
++        uint32_t compositeMode = UINT32_MAX;
++
++        // WCW_GPU_LOG=1: per-stage GPU timestamps (build, trace, resolve, composite) of each workload.
++        enum TimingStamp : uint32_t { StampBuildBegin, StampBuildEnd, StampTraceBegin, StampTraceEnd, StampResolveEnd, StampCompositeBegin, StampCompositeEnd, StampCount };
++        std::unique_ptr<RenderQueryPool> timingPool;
++        uint32_t timingWritten = 0;
++        uint32_t timingTriangles = 0;
++        uint32_t timingMeshes = 0;
++        uint32_t timingAlphaMeshes = 0;
++        uint32_t timingPixels = 0;
++        uint32_t timingTraceHeight = 0;
++        bool timingFullScreen = false;
++
++        // Runtime settings from the frontend's graphics menu. Quality: 0 Performance (half-res,
++        // 1 sample per light, 1 AO ray), 1 Balanced (half-res, 2/2), 2 Quality (full-res, 2/2).
++        // WCW_RT forces it on; WCW_RT_SCALE / WCW_RT_SAMPLES / WCW_RT_AO_SAMPLES override quality.
++        static void setUserSettings(bool enabled, uint32_t quality);
++        // True when ray tracing should run this frame (WCW_RT or the menu option). The camera
++        // hand-off in rt64_rsp.cpp follows it, so Off keeps the original rendering.
++        static bool active();
++        static uint32_t userQuality();
++
++        WcwRaytracer(RenderDevice *device, RenderShaderFormat shaderFormat);
++        void reset();
++        // Called before each workload is recorded. Workloads sharing a presentId belong to the
++        // same displayed frame; the slot is the workload's index within it.
++        void beginWorkload(uint64_t presentId);
++        bool wantsScene() const;
++        // Shadow mode drops the game's blob shadows (WCW_RT_KEEP_BLOBS=1 keeps them).
++        bool replacesBlobShadows() const;
++        void beginScene(const hlslpp::float4x4 &view, const hlslpp::float4x4 &proj, const RenderViewport &viewport,
++            const RenderBuffer *worldPosBuffer, uint64_t worldPosSize, const RenderBuffer *faceIndicesBuffer, uint64_t faceIndicesSize,
++            const RenderBuffer *rdpTilesBuffer, const RenderBuffer *gpuTilesBuffer, const RenderBuffer *texCoordBuffer);
++        // culled: the draw has N64 face culling on, so primary rays skip its back faces.
++        // character: a wrestler draw, shadowed with the weaker character strength.
++        // alphaTest: rays skip the draw's transparent texels (tileIndex, uvCorrection: its texture).
++        void addMesh(uint32_t faceIndicesStart, uint32_t triangleCount, uint32_t vertexCount, bool culled, bool character,
++            bool alphaTest, uint32_t tileIndex, bool uvCorrection);
++        // Grows the screen bounds with a world-space triangle (3 xyz positions) of a gathered draw.
++        void extendBounds(const float *positions);
++        void recordBuild(RenderWorker *worker);
++        // textureSet: the framebuffer renderer's bindless texture cache set (alpha tests).
++        void recordTrace(RenderWorker *worker, RenderTarget *colorTarget, RenderDescriptorSet *textureSet);
++        void recordComposite(RenderWorker *worker);
++        // After the workload's GPU work finished: accumulates and logs the stage timings (WCW_GPU_LOG).
++        void collectTimings();
++    };
++};
+diff --git a/src/shaders/WcwRtCompositePS.hlsl b/src/shaders/WcwRtCompositePS.hlsl
+new file mode 100644
+index 0000000..334836e
+--- /dev/null
++++ b/src/shaders/WcwRtCompositePS.hlsl
+@@ -0,0 +1,26 @@
++//
++// RT64
++//
++
++// [wcw rt] Composites the hybrid ray tracing output onto the framebuffer's color target:
++// alpha blended for the debug views, multiplied for shadows (pipeline blend state).
++
++#include "shared/rt64_wcw_rt.h"
++
++[[vk::push_constant]] ConstantBuffer<WcwRtCompositeCB> gComposite : register(b0);
++Texture2D<float4> gRtOutput : register(t0);
++
++// The trace may run below the color target's resolution: bilinear upsample (soft shadows are
++// low frequency; no-hit texels carry factor 1 so edges just fade).
++float4 PSMain(in float4 pos : SV_Position, in float2 uv : TEXCOORD0) : SV_TARGET {
++    const float2 coord = pos.xy * gComposite.scale - 0.5f;
++    const int2 maxTexel = int2(gComposite.traceSize) - 1;
++    const int2 t0 = clamp(int2(floor(coord)), int2(0, 0), maxTexel);
++    const int2 t1 = clamp(t0 + 1, int2(0, 0), maxTexel);
++    const float2 f = saturate(coord - floor(coord));
++    const float4 a = gRtOutput.Load(int3(t0.x, t0.y, 0));
++    const float4 b = gRtOutput.Load(int3(t1.x, t0.y, 0));
++    const float4 c = gRtOutput.Load(int3(t0.x, t1.y, 0));
++    const float4 d = gRtOutput.Load(int3(t1.x, t1.y, 0));
++    return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
++}
+diff --git a/src/shaders/WcwRtResolveCS.hlsl b/src/shaders/WcwRtResolveCS.hlsl
+new file mode 100644
+index 0000000..7a32b71
+--- /dev/null
++++ b/src/shaders/WcwRtResolveCS.hlsl
+@@ -0,0 +1,88 @@
++//
++// RT64
++//
++
++// [wcw rt] Temporal resolve for the hybrid ray tracing shadows (D3D12 only).
++// The trace pass samples each area light once per pixel per frame; this pass reprojects the
++// pixel's world position into the previous frame of the same workload slot, clamps that
++// history to the current 3x3 neighborhood (limits ghosting on moving wrestlers) and blends.
++
++#include "shared/rt64_wcw_rt.h"
++
++ConstantBuffer<WcwRtParams> gParams : register(b0);
++Texture2D<float2> gCurrent : register(t1);
++Texture2D<float> gHistoryIn : register(t2);
++RWTexture2D<float> gHistoryOut : register(u3);
++RWTexture2D<float4> gOutput : register(u4);
++
++[numthreads(8, 8, 1)]
++void CSMain(uint2 dispatchPixel : SV_DispatchThreadID) {
++    const uint2 pixel = dispatchPixel + gParams.traceOffset;
++    if (any(pixel >= gParams.resolution)) {
++        return;
++    }
++
++    const float2 current = gCurrent[pixel];
++    if (current.y <= 0.0f) {
++        gHistoryOut[pixel] = 1.0f;
++        gOutput[pixel] = float4(1.0f, 1.0f, 1.0f, 0.0f);
++        return;
++    }
++
++    // Neighborhood range of this frame's samples (hit pixels only) and a depth-aware 3x3 tent
++    // filter of them: neighbors on the same surface (similar hit distance) are averaged, so a
++    // single jittered sample per light doesn't speckle penumbrae, while object edges stay sharp.
++    float filteredSum = 0.0f;
++    float filteredSqSum = 0.0f;
++    float weightSum = 0.0f;
++    for (int y = -1; y <= 1; y++) {
++        for (int x = -1; x <= 1; x++) {
++            const int2 neighbor = clamp(int2(pixel) + int2(x, y), int2(0, 0), int2(gParams.resolution) - 1);
++            const float2 sample = gCurrent[neighbor];
++            if (sample.y > 0.0f) {
++                const float spatial = ((x == 0) ? 2.0f : 1.0f) * ((y == 0) ? 2.0f : 1.0f);
++                const float depth = exp(-abs(sample.y - current.y) / max(current.y * 0.01f, 0.5f));
++                filteredSum += sample.x * spatial * depth;
++                filteredSqSum += sample.x * sample.x * spatial * depth;
++                weightSum += spatial * depth;
++            }
++        }
++    }
++
++    const float filtered = filteredSum / max(weightSum, 1e-4f);
++
++    // History is clipped to the same-surface neighborhood's mean +- spread (variance clipping).
++    // A min/max clamp of one or two noisy samples per light is so tight it rejects the history
++    // every frame and the penumbrae shimmer; the spread bound still drops history when the
++    // shadow really moves (a wrestler steps away).
++    const float variance = max(filteredSqSum / max(weightSum, 1e-4f) - filtered * filtered, 0.0f);
++    const float spread = 1.25f * sqrt(variance) + 0.04f;
++    const float minFactor = filtered - spread;
++    const float maxFactor = filtered + spread;
++
++    // Same primary ray as the trace pass, so the hit distance gives the world position.
++    const float2 local = ((float2(pixel) + 0.5f) / gParams.traceScale - gParams.viewport.xy) / gParams.viewport.zw;
++    const float2 ndc = float2(local.x * 2.0f - 1.0f, 1.0f - local.y * 2.0f);
++    const float4 nearPoint = mul(gParams.invViewProj, float4(ndc, -1.0f, 1.0f));
++    const float4 farPoint = mul(gParams.invViewProj, float4(ndc, 1.0f, 1.0f));
++    const float3 rayStart = nearPoint.xyz / nearPoint.w;
++    const float3 rayDir = normalize(farPoint.xyz / farPoint.w - rayStart);
++    const float3 worldPos = rayStart + rayDir * current.y;
++
++    float result = filtered;
++    if (gParams.historyValid != 0) {
++        const float4 prevClip = mul(gParams.prevViewProj, float4(worldPos, 1.0f));
++        if (prevClip.w > 0.0f) {
++            const float2 prevNdc = prevClip.xy / prevClip.w;
++            const float2 prevLocal = float2(prevNdc.x * 0.5f + 0.5f, 0.5f - prevNdc.y * 0.5f);
++            const float2 prevPixel = (gParams.viewport.xy + prevLocal * gParams.viewport.zw) * gParams.traceScale;
++            if (all(prevPixel >= 0.0f) && all(prevPixel < float2(gParams.resolution))) {
++                const float history = clamp(gHistoryIn[int2(prevPixel)], minFactor, maxFactor);
++                result = lerp(history, filtered, gParams.temporalAlpha);
++            }
++        }
++    }
++
++    gHistoryOut[pixel] = result;
++    gOutput[pixel] = float4(result, result, result, 1.0f);
++}
+diff --git a/src/shaders/WcwRtTraceCS.hlsl b/src/shaders/WcwRtTraceCS.hlsl
+new file mode 100644
+index 0000000..3e04335
+--- /dev/null
++++ b/src/shaders/WcwRtTraceCS.hlsl
+@@ -0,0 +1,359 @@
++//
++// RT64
++//
++
++// [wcw rt] Hybrid ray tracing pass (D3D12 only, inline ray queries, cs_6_5).
++// Casts a primary ray from the game camera through every pixel of the traced projection's
++// viewport against the frame's world-space geometry, then either visualizes the hit
++// (debug modes) or traces a shadow ray toward the scene light (shadow mode).
++
++#include "shared/rt64_wcw_rt.h"
++#include "shared/rt64_f3d_defines.h"
++#include "shared/rt64_gpu_tile.h"
++#include "shared/rt64_rdp_tile.h"
++
++ConstantBuffer<WcwRtParams> gParams : register(b0);
++RaytracingAccelerationStructure gScene : register(t1);
++StructuredBuffer<float4> gWorldPos : register(t2);
++StructuredBuffer<uint> gFaceIndices : register(t3);
++StructuredBuffer<uint> gMeshIndexStarts : register(t4);
++RWTexture2D<float4> gOutput : register(u5);
++// Shadow mode: (shadow factor, primary hit distance; 0 = no hit) for the resolve pass.
++RWTexture2D<float2> gCurrent : register(u6);
++StructuredBuffer<RDPTile> gRDPTiles : register(t7);
++StructuredBuffer<GPUTile> gGPUTiles : register(t8);
++StructuredBuffer<float2> gTexCoords : register(t9);
++StructuredBuffer<uint> gMeshTiles : register(t10);
++// The framebuffer renderer's bindless RGBA texture cache.
++Texture2D<float4> gTextures[8192] : register(t0, space1);
++
++int moduloInt(int a, int b) {
++    return (b > 0) ? (a - b * int(floor(float(a) / float(b)))) : a;
++}
++
++// Texel alpha of an alpha-tested draw at a hit, point sampled with the same tile transform
++// and clamp/wrap/mirror rules as TextureSampler.hlsli. Tiles needing raw TMEM decoding are
++// treated as opaque.
++float hitAlpha(uint geometryIndex, uint primitiveIndex, float2 barycentrics) {
++    const uint tileWord = gMeshTiles[geometryIndex];
++    const uint base = (gMeshIndexStarts[geometryIndex] & ~WCW_RT_MESH_FLAGS) + primitiveIndex * 3;
++    const float2 uv0 = gTexCoords[gFaceIndices[base + 0]];
++    const float2 uv1 = gTexCoords[gFaceIndices[base + 1]];
++    const float2 uv2 = gTexCoords[gFaceIndices[base + 2]];
++    const float2 inputUV = uv0 * (1.0f - barycentrics.x - barycentrics.y) + uv1 * barycentrics.x + uv2 * barycentrics.y;
++
++    const uint tileIndex = tileWord & WCW_RT_TILE_INDEX_MASK;
++    const RDPTile rdpTile = gRDPTiles[tileIndex];
++    const GPUTile gpuTile = gGPUTiles[tileIndex];
++    if (gpuTileFlagRawTMEM(gpuTile.flags)) {
++        return 1.0f;
++    }
++
++    const float correction = ((tileWord & WCW_RT_TILE_UV_CORRECTION) != 0) ? 0.5f : 1.0f;
++    float2 uvCoord = inputUV * correction * float2(rdpTile.shifts, rdpTile.shiftt);
++    if (gpuTileFlagShiftedByHalf(gpuTile.flags)) {
++        uvCoord += float2(0.5f, 0.5f);
++    }
++
++    uvCoord *= gpuTile.tcScale;
++    uvCoord -= (float2(rdpTile.uls, rdpTile.ult) * gpuTile.ulScale) / 4.0f;
++    int2 texel = int2(floor(uvCoord));
++    const float2 tcScale = gpuTile.tcScale;
++    if (rdpTile.cms & G_TX_CLAMP) {
++        texel.x = clamp(texel.x, 0, int(round(tcScale.x * rdpTile.lrs) / 4 - round(tcScale.x * rdpTile.uls) / 4 + round(tcScale.x - 1.0f)));
++    }
++
++    if (rdpTile.cmt & G_TX_CLAMP) {
++        texel.y = clamp(texel.y, 0, int(round(tcScale.y * rdpTile.lrt) / 4 - round(tcScale.y * rdpTile.ult) / 4 + round(tcScale.y - 1.0f)));
++    }
++
++    const int masks = int(round(rdpTile.masks * tcScale.x));
++    if ((rdpTile.cms & G_TX_MIRROR) && (masks > 0) && (moduloInt(texel.x, masks * 2) >= masks)) {
++        texel.x = (masks - 1) - moduloInt(texel.x, masks);
++    }
++    else {
++        texel.x = moduloInt(texel.x, masks);
++    }
++
++    const int maskt = int(round(rdpTile.maskt * tcScale.y));
++    if ((rdpTile.cmt & G_TX_MIRROR) && (maskt > 0) && (moduloInt(texel.y, maskt * 2) >= maskt)) {
++        texel.y = (maskt - 1) - moduloInt(texel.y, maskt);
++    }
++    else {
++        texel.y = moduloInt(texel.y, maskt);
++    }
++
++    const int2 size = int2(gpuTile.textureDimensions.xy);
++    texel = clamp(texel, int2(0, 0), max(size - 1, int2(0, 0)));
++    return gTextures[NonUniformResourceIndex(gpuTile.textureIndex)].Load(int3(texel, 0)).a;
++}
++
++// Non-opaque candidates of this workload's alpha-tested draws only count where the texel is
++// solid; other workloads' geometry (instance ID > 0) has no bound texture data here.
++bool candidateIsSolid(uint instanceId, uint geometryIndex, uint primitiveIndex, float2 barycentrics) {
++    if ((instanceId != 0) || ((gMeshTiles[geometryIndex] & WCW_RT_TILE_ALPHA_TEST) == 0)) {
++        return true;
++    }
++
++    return hitAlpha(geometryIndex, primitiveIndex, barycentrics) >= 0.5f;
++}
++
++// Interleaved gradient noise, decorrelated per frame and per use.
++float noise(uint2 pixel, uint seed) {
++    const float2 p = float2(pixel) + float(seed) * 5.588238f;
++    return frac(52.9829189f * frac(0.06711056f * p.x + 0.00583715f * p.y));
++}
++
++bool resolvedMode() {
++    return (gParams.mode == WCW_RT_MODE_SHADOW) || (gParams.mode == WCW_RT_MODE_AO);
++}
++
++void writeNoHit(uint2 pixel) {
++    if (resolvedMode()) {
++        gCurrent[pixel] = float2(1.0f, 0.0f);
++    }
++    else {
++        gOutput[pixel] = float4(1.0f, 1.0f, 1.0f, 0.0f);
++    }
++}
++
++// Unnormalized: the winding (v0, v1, v2) is kept, which back-face culling relies on.
++float3 triangleCross(uint geometryIndex, uint primitiveIndex) {
++    const uint base = (gMeshIndexStarts[geometryIndex] & ~WCW_RT_MESH_FLAGS) + primitiveIndex * 3;
++    const float3 v0 = gWorldPos[gFaceIndices[base + 0]].xyz;
++    const float3 v1 = gWorldPos[gFaceIndices[base + 1]].xyz;
++    const float3 v2 = gWorldPos[gFaceIndices[base + 2]].xyz;
++    return cross(v1 - v0, v2 - v0);
++}
++
++float3 triangleNormal(uint geometryIndex, uint primitiveIndex) {
++    const uint base = (gMeshIndexStarts[geometryIndex] & ~WCW_RT_MESH_FLAGS) + primitiveIndex * 3;
++    const float3 v0 = gWorldPos[gFaceIndices[base + 0]].xyz;
++    const float3 v1 = gWorldPos[gFaceIndices[base + 1]].xyz;
++    const float3 v2 = gWorldPos[gFaceIndices[base + 2]].xyz;
++    const float3 n = cross(v1 - v0, v2 - v0);
++    const float len = length(n);
++    return (len > 1e-8f) ? (n / len) : float3(0.0f, 1.0f, 0.0f);
++}
++
++[numthreads(8, 8, 1)]
++void CSMain(uint2 dispatchPixel : SV_DispatchThreadID) {
++    const uint2 pixel = dispatchPixel + gParams.traceOffset;
++    if (any(pixel >= gParams.resolution)) {
++        return;
++    }
++
++    const float2 pixelCenter = (float2(pixel) + 0.5f) / gParams.traceScale;
++    const float2 local = (pixelCenter - gParams.viewport.xy) / gParams.viewport.zw;
++    if (any(local < 0.0f) || any(local > 1.0f)) {
++        writeNoHit(pixel);
++        return;
++    }
++
++    // Primary rays span the clip volume (N64 projections map near/far to NDC z -1/+1), so
++    // geometry the raster clips at the near plane (e.g. a wrestler right at the camera) is skipped.
++    const float2 ndc = float2(local.x * 2.0f - 1.0f, 1.0f - local.y * 2.0f);
++    const float4 nearPoint = mul(gParams.invViewProj, float4(ndc, -1.0f, 1.0f));
++    const float4 farPoint = mul(gParams.invViewProj, float4(ndc, 1.0f, 1.0f));
++    const float3 rayStart = nearPoint.xyz / nearPoint.w;
++    const float3 rayEnd = farPoint.xyz / farPoint.w;
++
++    RayDesc ray;
++    ray.Origin = rayStart;
++    ray.Direction = normalize(rayEnd - rayStart);
++    ray.TMin = 0.0f;
++    ray.TMax = length(rayEnd - rayStart);
++
++    // Culled draws are non-opaque: commit their candidates only when front-facing, matching
++    // the raster (N64 front faces wind counter-clockwise as seen from the camera).
++    // Primary rays only see this workload's geometry (instance mask 0x1); the other workloads'
++    // geometry (0x2) is drawn and shaded by their own passes but still casts shadows here.
++    RayQuery<RAY_FLAG_NONE> primary;
++    primary.TraceRayInline(gScene, RAY_FLAG_NONE, 0x1, ray);
++    while (primary.Proceed()) {
++        if (primary.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
++            const uint geometryIndex = primary.CandidateGeometryIndex();
++            const uint primitiveIndex = primary.CandidatePrimitiveIndex();
++            const bool culled = (gMeshIndexStarts[geometryIndex] & WCW_RT_MESH_CULLED) != 0;
++            const float3 n = triangleCross(geometryIndex, primitiveIndex);
++            const bool facing = !culled || ((dot(n, ray.Direction) * gParams.cullSign) < 0.0f);
++            if (facing && candidateIsSolid(primary.CandidateInstanceID(), geometryIndex, primitiveIndex, primary.CandidateTriangleBarycentrics())) {
++                primary.CommitNonOpaqueTriangleHit();
++            }
++        }
++    }
++
++    if (primary.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {
++        writeNoHit(pixel);
++        return;
++    }
++
++    const float hitT = primary.CommittedRayT();
++    float3 normal = triangleNormal(primary.CommittedGeometryIndex(), primary.CommittedPrimitiveIndex());
++    if (dot(normal, ray.Direction) > 0.0f) {
++        normal = -normal;
++    }
++
++    if (gParams.mode == WCW_RT_MODE_HIT_NORMAL) {
++        gOutput[pixel] = float4(normal * 0.5f + 0.5f, 0.75f);
++        return;
++    }
++    else if (gParams.mode == WCW_RT_MODE_HIT_MESH) {
++        const uint id = primary.CommittedGeometryIndex();
++        const float3 hue = frac(float(id) * float3(0.618034f, 0.414214f, 0.732051f));
++        gOutput[pixel] = float4(hue, 0.75f);
++        return;
++    }
++    else if (gParams.mode == WCW_RT_MODE_HIT_DEPTH) {
++        const float shade = frac(hitT / 200.0f);
++        gOutput[pixel] = float4(shade, shade, shade, 0.75f);
++        return;
++    }
++
++    const float3 hitPos = ray.Origin + ray.Direction * hitT;
++    if (gParams.mode == WCW_RT_MODE_HIT_POSITION) {
++        // R/B: 50-unit X/Z grid; G: height in 0..300.
++        const float2 grid = step(0.5f, frac(hitPos.xz / 50.0f));
++        gOutput[pixel] = float4(grid.x, saturate(hitPos.y / 300.0f), grid.y, 0.85f);
++        return;
++    }
++
++    if (gParams.mode == WCW_RT_MODE_SHADOW_DISTANCE) {
++        // Key light only, closest hit: red = hit distance / light distance, blue = unoccluded.
++        const float3 toLight = gParams.lightPosition.xyz - hitPos;
++        const float lightDist = length(toLight);
++        RayDesc probe;
++        probe.Origin = hitPos + normal * 0.5f;
++        probe.Direction = toLight / lightDist;
++        probe.TMin = 0.5f;
++        probe.TMax = lightDist;
++        RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
++        q.TraceRayInline(gScene, RAY_FLAG_NONE, 0xFF, probe);
++        q.Proceed();
++        if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
++            gOutput[pixel] = float4(saturate(q.CommittedRayT() / lightDist), 0.0f, 0.0f, 0.85f);
++        }
++        else {
++            gOutput[pixel] = float4(0.0f, 0.0f, 1.0f, 0.85f);
++        }
++
++        return;
++    }
++
++    // Outside the receiver radius (arena, crowd): no shadow or AO rays, faded out over its
++    // last 15% so the cutoff has no visible edge.
++    float receiverFade = 0.0f;
++    if (resolvedMode() && (gParams.receiverRadius > 0.0f)) {
++        const float receiverDist = length(hitPos.xz - gParams.lightPosition.xz);
++        if (receiverDist >= gParams.receiverRadius) {
++            gCurrent[pixel] = float2(1.0f, hitT);
++            return;
++        }
++
++        receiverFade = smoothstep(gParams.receiverRadius * 0.85f, gParams.receiverRadius, receiverDist);
++    }
++
++    const float2 lightOffsets[5] = { float2(0.0f, 0.0f), float2(-1.0f, -1.0f), float2(1.0f, -1.0f), float2(-1.0f, 1.0f), float2(1.0f, 1.0f) };
++    const uint fillCount = min(gParams.lightCount, 4);
++    const float keyWeight = (fillCount > 0) ? gParams.keyWeight : 1.0f;
++    const float fillWeight = (fillCount > 0) ? (1.0f - keyWeight) / float(fillCount) : 0.0f;
++    float lit = 0.0f;
++    int occluderId = -1;
++    const uint samples = max(gParams.samplesPerLight, 1);
++    for (uint i = 0; i < (fillCount + 1) * samples; i++) {
++        // Area light: jittered samples on the light's panel (soft penumbrae, refined over
++        // frames by the resolve pass).
++        const uint l = i / samples;
++        const uint seed = gParams.frameIndex * 64 + i * 2;
++        const float2 jitter = float2(noise(pixel, seed), noise(pixel + uint2(37, 113), seed + 1)) - 0.5f;
++        const float2 offset = lightOffsets[l] * gParams.lightSpread + jitter * gParams.lightSize;
++        const float weight = ((l == 0) ? keyWeight : fillWeight) / float(samples);
++        const float3 lightPos = gParams.lightPosition.xyz + float3(offset.x, 0.0f, offset.y);
++        const float3 toLight = lightPos - hitPos;
++        const float lightDist = length(toLight);
++
++        // Surfaces facing away from a light are already dark from N64 vertex lighting:
++        // only light-facing surfaces receive its shadow (no double darkening).
++        if (dot(normal, toLight) <= 0.0f) {
++            lit += weight;
++            continue;
++        }
++
++        RayDesc shadowRay;
++        shadowRay.Origin = hitPos + normal * 0.5f;
++        shadowRay.Direction = toLight / lightDist;
++        shadowRay.TMin = 0.5f;
++        shadowRay.TMax = lightDist;
++
++        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> shadow;
++        shadow.TraceRayInline(gScene, RAY_FLAG_NONE, 0xFF, shadowRay);
++        while (shadow.Proceed()) {
++            if (candidateIsSolid(shadow.CandidateInstanceID(), shadow.CandidateGeometryIndex(), shadow.CandidatePrimitiveIndex(), shadow.CandidateTriangleBarycentrics())) {
++                shadow.CommitNonOpaqueTriangleHit();
++            }
++        }
++
++        if (shadow.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
++            occluderId = int(shadow.CommittedGeometryIndex());
++        }
++        else {
++            lit += weight;
++        }
++    }
++
++    if (gParams.mode == WCW_RT_MODE_SHADOW_OCCLUDER) {
++        if (occluderId >= 0) {
++            gOutput[pixel] = float4(frac(float(occluderId) * float3(0.618034f, 0.414214f, 0.732051f)), 0.75f);
++        }
++        else {
++            gOutput[pixel] = float4(1.0f, 1.0f, 1.0f, 0.0f);
++        }
++
++        return;
++    }
++
++    const bool characterReceiver = (gMeshIndexStarts[primary.CommittedGeometryIndex()] & WCW_RT_MESH_CHARACTER) != 0;
++    const float strength = characterReceiver ? gParams.characterShadowStrength : gParams.shadowStrength;
++    float factor = 1.0f - strength * (1.0f - lit);
++
++    // Contact shadows: short cosine-weighted hemisphere rays against all workloads' geometry.
++    if (gParams.aoSamples > 0) {
++        const float3 helper = (abs(normal.y) < 0.99f) ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
++        const float3 tangent = normalize(cross(helper, normal));
++        const float3 bitangent = cross(normal, tangent);
++        float occluded = 0.0f;
++        for (uint a = 0; a < gParams.aoSamples; a++) {
++            const uint seed = gParams.frameIndex * 64 + 40 + a * 2;
++            const float u = noise(pixel + uint2(71, 29), seed);
++            const float v = noise(pixel + uint2(13, 97), seed + 1);
++            const float r = sqrt(u);
++            const float phi = 6.2831853f * v;
++            const float3 dir = normalize(tangent * (r * cos(phi)) + bitangent * (r * sin(phi)) + normal * sqrt(max(1.0f - u, 0.0f)));
++
++            RayDesc aoRay;
++            aoRay.Origin = hitPos + normal * 0.5f;
++            aoRay.Direction = dir;
++            aoRay.TMin = 0.5f;
++            aoRay.TMax = gParams.aoRadius;
++            RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> ao;
++            ao.TraceRayInline(gScene, RAY_FLAG_NONE, 0xFF, aoRay);
++            while (ao.Proceed()) {
++                if (candidateIsSolid(ao.CandidateInstanceID(), ao.CandidateGeometryIndex(), ao.CandidatePrimitiveIndex(), ao.CandidateTriangleBarycentrics())) {
++                    ao.CommitNonOpaqueTriangleHit();
++                }
++            }
++
++            if (ao.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
++                occluded += 1.0f;
++            }
++        }
++
++        const float aoStrength = gParams.aoStrength * (characterReceiver ? 0.5f : 1.0f);
++        const float aoFactor = 1.0f - aoStrength * (occluded / float(gParams.aoSamples));
++        factor = (gParams.mode == WCW_RT_MODE_AO) ? aoFactor : factor * aoFactor;
++    }
++
++    factor = lerp(factor, 1.0f, receiverFade);
++
++    gCurrent[pixel] = float2(factor, hitT);
++}
+diff --git a/src/shared/rt64_wcw_rt.h b/src/shared/rt64_wcw_rt.h
+new file mode 100644
+index 0000000..3d98eca
+--- /dev/null
++++ b/src/shared/rt64_wcw_rt.h
+@@ -0,0 +1,82 @@
++//
++// RT64
++//
++
++#pragma once
++
++#include "shared/rt64_hlsl.h"
++
++// [wcw rt] Constants for the hybrid ray tracing pass (rt64_wcw_raytracer.cpp).
++
++#define WCW_RT_MODE_HIT_NORMAL 0
++#define WCW_RT_MODE_HIT_DEPTH 1
++#define WCW_RT_MODE_SHADOW 2
++#define WCW_RT_MODE_HIT_MESH 3
++#define WCW_RT_MODE_SHADOW_OCCLUDER 4
++#define WCW_RT_MODE_HIT_POSITION 5
++#define WCW_RT_MODE_SHADOW_DISTANCE 6
++#define WCW_RT_MODE_AO 7
++
++// Bit 31 of a mesh index start: N64 face culling is on for that draw.
++#define WCW_RT_MESH_CULLED 0x80000000u
++// Bit 30: a character draw (AKI scales wrestler models, world geometry has unit scale).
++#define WCW_RT_MESH_CHARACTER 0x40000000u
++#define WCW_RT_MESH_FLAGS (WCW_RT_MESH_CULLED | WCW_RT_MESH_CHARACTER)
++
++// Per-mesh tile word: RDP/GPU tile index in the low bits, plus whether the draw alpha tests
++// (rays skip its transparent texels) and whether its UVs get the non-perspective correction.
++#define WCW_RT_TILE_ALPHA_TEST 0x80000000u
++#define WCW_RT_TILE_UV_CORRECTION 0x40000000u
++#define WCW_RT_TILE_INDEX_MASK 0x3FFFFFFFu
++
++#ifdef HLSL_CPU
++namespace interop {
++#endif
++    struct WcwRtParams {
++        float4x4 invViewProj;
++        float4 eyePosition;
++        float4 lightPosition;
++        // Viewport of the traced projection in output pixels: x, y, width, height.
++        float4 viewport;
++        uint2 resolution;
++        uint mode;
++        float shadowStrength;
++        // A key light at lightPosition (weight keyWeight) plus lightCount fill lights at
++        // lightPosition +- lightSpread on X/Z (a ring lighting rig) sharing the rest.
++        float lightSpread;
++        uint lightCount;
++        // +1 or -1: which winding counts as front-facing for culled draws (WCW_RT_CULL_SIGN).
++        float cullSign;
++        float keyWeight;
++        // Shadow strength on character surfaces (they already carry N64 vertex shading).
++        float characterShadowStrength;
++        // Soft shadows: each light is a square panel lightSize wide on X/Z, sampled once per
++        // pixel per frame; the resolve pass blends with reprojected history by temporalAlpha.
++        float lightSize;
++        float temporalAlpha;
++        uint frameIndex;
++        float4x4 prevViewProj;
++        uint historyValid;
++        // Jittered shadow rays per light per pixel per frame.
++        uint samplesPerLight;
++        // Contact shadows: aoSamples short cosine-weighted rays of length aoRadius per pixel
++        // per frame; occluded fraction darkens by aoStrength (halved on characters).
++        uint aoSamples;
++        float aoRadius;
++        float aoStrength;
++        // Trace/resolve resolution relative to the color target (resolution is the trace size;
++        // viewport stays in color target pixels).
++        float traceScale;
++        // Only the screen rect covered by this workload's geometry is traced (trace pixels).
++        uint2 traceOffset;
++        float receiverRadius;
++    };
++
++    struct WcwRtCompositeCB {
++        // Trace texels per color target pixel, and the trace texture size.
++        float2 scale;
++        float2 traceSize;
++    };
++#ifdef HLSL_CPU
++};
++#endif
