@@ -24,11 +24,58 @@ index 716d48b..bbc5b5f 100644
      "${CMAKE_CURRENT_SOURCE_DIR}/src/sp.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/ultra_stubs.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/ultra_translation.cpp"
+diff --git a/librecomp/include/librecomp/mods.hpp b/librecomp/include/librecomp/mods.hpp
+index 37556bd..e3acf87 100644
+--- a/librecomp/include/librecomp/mods.hpp
++++ b/librecomp/include/librecomp/mods.hpp
+@@ -397,6 +397,12 @@ namespace recomp {
+                 const std::unordered_map<uint32_t, uint16_t>& section_vrom_map,
+                 const std::unordered_map<recomp_func_t*, overlays::BasePatchedFunction>& base_patched_funcs,
+                 std::span<const uint8_t> decompressed_rom);
++            // [wcw romhack] Recompiles the functions a ROM patch mod changed (see mods.cpp).
++            std::vector<ModLoadErrorDetails> regenerate_rom_patch_code(
++                const std::string& mod_id,
++                std::span<const uint8_t> unpatched_rom,
++                std::span<const uint8_t> patched_rom,
++                const std::unordered_map<recomp_func_t*, overlays::BasePatchedFunction>& base_patched_funcs);
+             void dirty_mod_configuration_thread_process();
+             void rebuild_mod_order_lookup();
+ 
+@@ -429,6 +435,8 @@ namespace recomp {
+             std::unique_ptr<LiveRecompilerCodeHandle> regenerated_code_handle;
+             // Code handle for base patched code that was regenerated to add hooks.
+             std::unique_ptr<LiveRecompilerCodeHandle> base_patched_code_handle;
++            // [wcw romhack] Code handle for functions recompiled from a ROM patch mod's changed code.
++            std::unique_ptr<LiveRecompilerCodeHandle> rom_patch_code_handle;
+             // Map of hook definition to the entry hook slot's index.
+             std::unordered_map<HookDefinition, size_t> hook_slots;
+             // Tracks which hook slots have already been processed. Used to regenerate vanilla functions as needed
+@@ -627,6 +635,10 @@ namespace recomp {
+         void close_mods();
+         std::filesystem::path get_mods_directory();
+         std::optional<ModDetails> get_details_for_mod(const std::string& mod_id);
++        // [wcw romhack] Save subfolder for the running game: the id of the active ROM-patch mod,
++        // empty when none is active. A hack can change the save layout, so its saves (and the
++        // pak images next to them) are kept apart from the stock game's.
++        std::u8string get_rom_patch_save_subfolder();
+         std::vector<ModDetails> get_all_mod_details(const std::string& mod_game_id);
+         size_t game_mode_count(const std::string& mod_game_id, bool include_disabled);
+         recomp::Version get_mod_version(size_t mod_index);
 diff --git a/librecomp/include/librecomp/overlays.hpp b/librecomp/include/librecomp/overlays.hpp
-index 35703bd..a39baeb 100644
+index 35703bd..daba598 100644
 --- a/librecomp/include/librecomp/overlays.hpp
 +++ b/librecomp/include/librecomp/overlays.hpp
-@@ -63,5 +63,9 @@ namespace recomp {
+@@ -35,6 +35,9 @@ namespace recomp {
+         const std::unordered_map<uint32_t, uint16_t>& get_vrom_to_section_map();
+         uint32_t get_section_ram_addr(uint16_t code_section_index);
+         std::span<const RelocEntry> get_section_relocs(uint16_t code_section_index);
++        // [wcw romhack] The registered code sections (functions with their ROM ranges).
++        size_t num_code_sections();
++        const SectionTableEntry& get_code_section(uint16_t code_section_index);
+         recomp_func_t* get_func_by_section_rom_function_vram(uint32_t section_rom, uint32_t function_vram);
+         bool get_func_entry_by_section_index_function_offset(uint16_t code_section_index, uint32_t function_offset, FuncEntry& func_out);
+         recomp_func_t* get_func_by_section_index_function_offset(uint16_t code_section_index, uint32_t function_offset);
+@@ -63,5 +66,9 @@ namespace recomp {
  
  extern "C" void load_overlays(uint32_t rom, int32_t ram_addr, uint32_t size);
  extern "C" void unload_overlays(int32_t ram_addr, uint32_t size);
@@ -136,11 +183,178 @@ index 4d6a01d..9e2dc24 100644
 +
 +    ctx->f0.d = ret;
 +}
+diff --git a/librecomp/src/mods.cpp b/librecomp/src/mods.cpp
+index 0f7de83..e0e7790 100644
+--- a/librecomp/src/mods.cpp
++++ b/librecomp/src/mods.cpp
+@@ -1571,8 +1571,16 @@ void recomp::mods::ModContext::set_latest_game_mode_id(const std::string& game_m
+     mod_configuration_thread_queue.enqueue(ModConfigSetLatestGamemode());
+ }
+ 
++// [wcw romhack] The active ROM-patch mod's id, as the save subfolder (see get_rom_patch_save_subfolder).
++static std::u8string rom_patch_save_subfolder{};
++
++std::u8string recomp::mods::get_rom_patch_save_subfolder() {
++    return rom_patch_save_subfolder;
++}
++
+ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mods(const GameEntry& game_entry, const std::string& game_mode_id, uint8_t* rdram, int32_t load_address, uint32_t& ram_used) {
+     std::vector<recomp::mods::ModLoadErrorDetails> ret{};
++    rom_patch_save_subfolder.clear();
+     ram_used = 0;
+     num_events = recomp::overlays::num_base_events();
+     loaded_code_mods.clear();
+@@ -1680,7 +1688,29 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
+             return ret;
+         }
+ 
++        // [wcw romhack] Keep the unpatched code bytes to find the functions the patch changes.
++        std::vector<uint8_t> unpatched_code_rom(decompressed_rom.begin(), decompressed_rom.end());
++
+         recomp::set_rom_contents(std::move(patched_rom));
++        rom_patch_save_subfolder = std::u8string{ reinterpret_cast<const char8_t*>(mod.manifest.mod_id.data()), mod.manifest.mod_id.size() };
++
++        // [wcw romhack] The ROM was replaced, so the decompressed view would reference the freed
++        // unpatched ROM: point it at the patched contents (hooks are regenerated from it too).
++        if (game_entry.has_compressed_code) {
++            decompressed_rom_data = (game_entry.decompression_routine != nullptr) ?
++                game_entry.decompression_routine(recomp::get_rom()) : std::vector<uint8_t>{};
++            decompressed_rom = std::span{decompressed_rom_data};
++        }
++        else {
++            decompressed_rom = recomp::get_rom();
++        }
++
++        std::vector<ModLoadErrorDetails> code_errors = regenerate_rom_patch_code(mod.manifest.mod_id, unpatched_code_rom, decompressed_rom, base_patched_funcs);
++        if (!code_errors.empty()) {
++            ret.insert(ret.end(), code_errors.begin(), code_errors.end());
++            unload_mods();
++            return ret;
++        }
+     }
+ 
+     // Check that mod dependencies are met.
+@@ -2066,6 +2096,99 @@ std::unique_ptr<recomp::mods::LiveRecompilerCodeHandle> apply_regenlist(Regenera
+     return regenerated_code_handle;
+ }
+ 
++// [wcw romhack] A ROM patch can change code as well as data, but the recompiled functions are
++// built from the unpatched ROM. Every recompiled function whose ROM bytes the patch changed is
++// recompiled from the patched ROM with the live recompiler and replaces the static one. Only
++// in-place edits are found this way: code the patch adds or moves outside the known function
++// boundaries is not (it needs a full recompile of the hacked ROM).
++std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::regenerate_rom_patch_code(
++    const std::string& mod_id,
++    std::span<const uint8_t> unpatched_rom,
++    std::span<const uint8_t> patched_rom,
++    const std::unordered_map<recomp_func_t*, recomp::overlays::BasePatchedFunction>& base_patched_funcs)
++{
++    RegeneratedList regenlist{};
++    size_t num_skipped = 0;
++    for (size_t section_index = 0; section_index < recomp::overlays::num_code_sections(); section_index++) {
++        const SectionTableEntry& section = recomp::overlays::get_code_section(static_cast<uint16_t>(section_index));
++        bool section_added = false;
++        for (size_t func_index = 0; func_index < section.num_funcs; func_index++) {
++            const FuncEntry& func = section.funcs[func_index];
++            // A size of 0 means the function has no ROM code (e.g. a native reimplementation).
++            if (func.rom_size == 0) {
++                continue;
++            }
++
++            const size_t start = size_t(section.rom_addr) + func.offset;
++            const size_t end = start + func.rom_size;
++            if ((end > unpatched_rom.size()) || (end > patched_rom.size()) ||
++                (memcmp(unpatched_rom.data() + start, patched_rom.data() + start, func.rom_size) == 0))
++            {
++                continue;
++            }
++
++            // Functions replaced by the base recomp keep the replacement.
++            if (base_patched_funcs.contains(func.func)) {
++                fprintf(stderr, "[romhack] %s: 0x%08X changed but is replaced by the base recomp; keeping the replacement\n",
++                    mod_id.c_str(), section.ram_addr + func.offset);
++                num_skipped++;
++                continue;
++            }
++
++            if (!section_added) {
++                regenlist.sections.emplace_back(RegeneratedSection{
++                    .rom_addr = section.rom_addr,
++                    .ram_addr = section.ram_addr,
++                    .original_index = static_cast<uint16_t>(section_index),
++                    .first_func_index = regenlist.functions.size(),
++                    .first_reloc_index = regenlist.relocs.size(),
++                    .relocatable = section.num_relocs != 0
++                });
++                section_added = true;
++            }
++
++            regenlist.functions.emplace_back(RegeneratedFunction{
++                .section_offset = func.offset,
++                .size = func.rom_size
++            });
++            regenlist.func_ptrs.push_back(func.func);
++
++            for (size_t reloc_index = 0; reloc_index < section.num_relocs; reloc_index++) {
++                const RelocEntry& reloc = section.relocs[reloc_index];
++                if ((reloc.offset >= func.offset) && (reloc.offset < func.offset + func.rom_size)) {
++                    regenlist.relocs.emplace_back(RegeneratedReloc{
++                        .section_offset = reloc.offset,
++                        .target_section = reloc.target_section,
++                        .target_section_offset = reloc.target_section_offset,
++                        .type = reloc.type
++                    });
++                }
++            }
++        }
++    }
++
++    fprintf(stderr, "[romhack] %s: %zu changed function(s) to recompile from the patch, %zu kept\n",
++        mod_id.c_str(), regenlist.functions.size(), num_skipped);
++    if (regenlist.functions.empty()) {
++        return {};
++    }
++
++    for (const RegeneratedSection& section : regenlist.sections) {
++        const size_t last = (&section == &regenlist.sections.back()) ? regenlist.functions.size() : (&section + 1)->first_func_index;
++        for (size_t i = section.first_func_index; i < last; i++) {
++            fprintf(stderr, "[romhack]   0x%08X (%u bytes)\n", section.ram_addr + regenlist.functions[i].section_offset, regenlist.functions[i].size);
++        }
++    }
++
++    rom_patch_code_handle = apply_regenlist(regenlist, patched_rom);
++    if (!rom_patch_code_handle || !rom_patch_code_handle->good()) {
++        rom_patch_code_handle.reset();
++        return { ModLoadErrorDetails{ mod_id, ModLoadError::FailedToLoadPatch, "could not recompile the code it changes" } };
++    }
++
++    return {};
++}
++
+ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::regenerate_with_hooks(
+     const std::vector<std::pair<HookDefinition, size_t>>& sorted_unprocessed_hooks,
+     const std::unordered_map<uint32_t, uint16_t>& section_vrom_map,
 diff --git a/librecomp/src/overlays.cpp b/librecomp/src/overlays.cpp
-index 8c8e5d1..3051706 100644
+index 8c8e5d1..ec6176b 100644
 --- a/librecomp/src/overlays.cpp
 +++ b/librecomp/src/overlays.cpp
-@@ -200,7 +200,19 @@ extern "C" void load_overlays(uint32_t rom, int32_t ram_addr, uint32_t size) {
+@@ -146,6 +146,15 @@ std::span<const RelocEntry> recomp::overlays::get_section_relocs(uint16_t code_s
+     return {};
+ }
+ 
++size_t recomp::overlays::num_code_sections() {
++    return sections_info.num_code_sections;
++}
++
++const SectionTableEntry& recomp::overlays::get_code_section(uint16_t code_section_index) {
++    assert(code_section_index < sections_info.num_code_sections);
++    return sections_info.code_sections[code_section_index];
++}
++
+ void recomp::overlays::add_loaded_function(int32_t ram, recomp_func_t* func) {
+     func_map[ram] = func;
+ }
+@@ -200,7 +209,19 @@ extern "C" void load_overlays(uint32_t rom, int32_t ram_addr, uint32_t size) {
      );
      // Load the overlays that were found
      for (auto it = lower; it != upper; ++it) {
@@ -161,7 +375,7 @@ index 8c8e5d1..3051706 100644
      }
  }
  
-@@ -238,6 +250,111 @@ extern "C" void load_overlay_by_id(uint32_t id, uint32_t ram_addr) {
+@@ -238,6 +259,111 @@ extern "C" void load_overlay_by_id(uint32_t id, uint32_t ram_addr) {
      }
  }
  
@@ -274,18 +488,19 @@ index 8c8e5d1..3051706 100644
      for (auto it = loaded_sections.begin(); it != loaded_sections.end();) {
          const auto& section = sections_info.code_sections[it->section_table_index];
 diff --git a/librecomp/src/pi.cpp b/librecomp/src/pi.cpp
-index 62656ad..fa20ce1 100644
+index 62656ad..f6705d1 100644
 --- a/librecomp/src/pi.cpp
 +++ b/librecomp/src/pi.cpp
-@@ -8,6 +8,7 @@
+@@ -8,6 +8,8 @@
  #include "librecomp/addresses.hpp"
  #include "librecomp/game.hpp"
  #include "librecomp/files.hpp"
 +#include "librecomp/overlays.hpp"
++#include "librecomp/mods.hpp"
  #include <ultramodern/ultra64.h>
  #include <ultramodern/ultramodern.hpp>
  
-@@ -63,6 +64,28 @@ extern "C" void osCreatePiManager_recomp(uint8_t* rdram, recomp_context* ctx) {
+@@ -63,6 +65,28 @@ extern "C" void osCreatePiManager_recomp(uint8_t* rdram, recomp_context* ctx) {
  
  void recomp::do_rom_read(uint8_t* rdram, gpr ram_address, uint32_t physical_addr, size_t num_bytes) {
      // TODO use word copies when possible
@@ -314,7 +529,7 @@ index 62656ad..fa20ce1 100644
  
      // TODO handle misaligned DMA
      assert((physical_addr & 0x1) == 0 && "Only PI DMA from aligned ROM addresses is currently supported");
-@@ -195,6 +218,15 @@ void save_read(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t coun
+@@ -195,6 +219,15 @@ void save_read(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t coun
      }
  }
  
@@ -330,7 +545,17 @@ index 62656ad..fa20ce1 100644
  void save_clear(uint32_t start, uint32_t size, char value) {
      assert(start + size < save_context.save_buffer.size());
  
-@@ -266,6 +298,40 @@ void ultramodern::join_saving_thread() {
+@@ -241,7 +274,8 @@ void read_save_file() {
+ }
+ 
+ void ultramodern::init_saving(RDRAM_ARG1) {
+-    set_save_file_path(u8"", recomp::current_game_id());
++    // [wcw romhack] A ROM-patch mod's saves live in saves/<mod id>/.
++    set_save_file_path(recomp::mods::get_rom_patch_save_subfolder(), recomp::current_game_id());
+ 
+     save_context.save_buffer.resize(get_save_size(recomp::get_save_type()));
+ 
+@@ -266,6 +300,40 @@ void ultramodern::join_saving_thread() {
      }
  }
  
@@ -371,7 +596,7 @@ index 62656ad..fa20ce1 100644
  void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_addr, uint32_t size, uint32_t direction) {
      // TODO asynchronous transfer
      // TODO implement unaligned DMA correctly
-@@ -273,6 +339,7 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
+@@ -273,6 +341,7 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
          if (physical_addr >= recomp::rom_base) {
              // read cart rom
              recomp::do_rom_read(rdram, rdram_address, physical_addr, size);
