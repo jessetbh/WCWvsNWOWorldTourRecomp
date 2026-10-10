@@ -9,6 +9,7 @@
 #include <vector>
 #include <array>
 #include <filesystem>
+#include <algorithm>
 #include <cmath>
 #include <atomic>
 #include <fstream>
@@ -304,12 +305,23 @@ static bool reset_audio(uint32_t freq) {
 void set_frequency(uint32_t freq) { reset_audio(freq); }
 
 void queue_samples(int16_t* audio_data, size_t sample_count) {
-    // audio_data is interleaved stereo; swap L/R to correct for endianness handling.
+    // audio_data is interleaved stereo; swap L/R to correct for endianness handling, and apply
+    // Settings > Sound > Main Volume (0-100, linear like BMHero's; read per batch so the slider
+    // takes effect immediately).
     static std::vector<int16_t> buf;
     buf.resize(sample_count);
-    for (size_t i = 0; i + 1 < sample_count; i += 2) {
-        buf[i + 0] = audio_data[i + 1];
-        buf[i + 1] = audio_data[i + 0];
+    const float volume = std::clamp(static_cast<float>(recompui::config::sound::get_main_volume()) / 100.0f, 0.0f, 1.0f);
+    if (volume >= 1.0f) {
+        for (size_t i = 0; i + 1 < sample_count; i += 2) {
+            buf[i + 0] = audio_data[i + 1];
+            buf[i + 1] = audio_data[i + 0];
+        }
+    }
+    else {
+        for (size_t i = 0; i + 1 < sample_count; i += 2) {
+            buf[i + 0] = static_cast<int16_t>(std::lround(audio_data[i + 1] * volume));
+            buf[i + 1] = static_cast<int16_t>(std::lround(audio_data[i + 0] * volume));
+        }
     }
     uint32_t queued_frames_before = g_audio_device ? SDL_GetQueuedAudioSize(g_audio_device) / bytes_per_frame : 0;
     if (g_audio_device) SDL_QueueAudio(g_audio_device, buf.data(), (Uint32)(sample_count * sizeof(int16_t)));
