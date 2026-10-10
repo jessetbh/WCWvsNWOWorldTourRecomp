@@ -4,8 +4,8 @@
  * Ray tracing experiment (exp/raytracing): hand RT64 the real camera.
  *
  * WCW composes every MVP on the CPU (object world matrix x D_80042C80, where
- * D_80042C80 = V x P is latched only by func_800016F8 from the camera setup in
- * widescreen.c) and submits them via G_FORCEMTX, so RT64 never sees a projection and
+ * D_80042C80 = V x P is latched only by func_800016F8 from the camera setup,
+ * func_80006860) and submits them via G_FORCEMTX, so RT64 never sees a projection and
  * its "world" transforms are clip-space MVPs. Ray tracing needs true world space.
  *
  * This patch writes the camera into the head of each frame's display list, right

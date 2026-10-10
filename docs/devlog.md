@@ -9,6 +9,27 @@ the relevant section at the time, so it reads as a layered status document, not 
 diary. For current contributor instructions see the root CLAUDE.md and BUILDING.md.
 
 ---
+# 2026-10-10 — Issue #2 "21:9 aspect wrong": widescreen was widened twice (patch removed)
+
+**Symptom.** With Aspect Ratio = Expand, 3D geometry was squeezed horizontally by
+(4/3) / window aspect — 0.75x at 16:9 (barely noticed), 0.57x at 21:9 (reported). Measured on the
+same attract frame (present 600) at equal window height: ring-post offset from centre 80 px (4:3
+Original) vs 62 (16:9) vs 47 (21:9); wrestler heights equal, widths shrunk.
+
+**Root cause.** `patches/widescreen.c` (2026-07-05) rebuilt the camera's guPerspectiveF with the
+window aspect, relying on RT64 to stretch the viewport. At the time RT64 saw the 480x240 match fb as
+a 2:1 source, so its own Expand widening was a no-op in matches. The v0.1.2 aspect fix
+(`[wcw fix]` rt64 8d70049: source aspect = 4:3) made RT64's projection processor widen WCW's camera
+too (`adjustProjectionMatrix` on full-width perspective projections — the same condition as
+`useWideViewport`), so both widened. The sibling games never had a widening patch and rely on RT64
+alone, which is correct.
+
+**Fix.** Removed `patches/widescreen.c`; the camera keeps its original 4:3 projection and RT64's
+Expand does Hor+ widening. `recomp_get_target_aspect_ratio` stays exported for mods. Verified:
+16:9 and 21:9 Expand centres match 4:3 Original (2520x1080 and 1920x1080 windows); ray-traced
+shadows still line up at 21:9 (the RT camera hand-off copies the same projection, which RT64
+widens the same way).
+
 # 2026-10-10 — HDR output (scRGB) + adaptive CRT phosphor mask (plume/rt64/RecompFrontend `wcw`)
 
 Graphics → **HDR** (Off/On, next launch; the description says whether HDR started) and
