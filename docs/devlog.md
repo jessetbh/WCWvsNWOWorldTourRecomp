@@ -50,9 +50,12 @@ CRT always runs at 60 Hz — a 30 fps game is scanned twice per frame, as on har
   `SIGABRT` backtrace handler in `main.cpp`.
 - `WCW_PRESENT_LUM` swap chain readback crashes on Vulkan (`copyTextureRegion` on a swap
   chain image) — D3D12-only diagnostic.
-- Beam pacing drops to ~50 idle sub-frames/s (vblank wait ~10 ms, ~1 refresh skipped per
-  sub-frame) while **another game is rendering on the same GPU/display**; measured 130-135/s
-  (+30 game presents = 165) when it's alone. Phase stays correct either way.
+- **VRR breaks vblank pacing.** With G-Sync/FreeSync engaged (it engages for the focused
+  window) the display refreshes when the app presents, so `WaitForVBlank` keeps returning a
+  refresh late: ~50 idle sub-frames/s, a skip every sub-frame. It looked game-specific and
+  then environmental (it came and went with window focus). Fix: if 45 of 60 vblank waits
+  overshoot, pace by `Timer::preciseSleepUntil` at the refresh rate (logged; `WCW_CRT_PACE=`
+  `vblank|timer` forces). All six games: 135 idle + 30 game = 165 presents/s, 0 skipped.
 
 # 2026-07-08 — v0.1.1 (launcher branding) + v0.1.2 (aspect-ratio fix)
 
