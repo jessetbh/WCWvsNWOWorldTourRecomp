@@ -75,6 +75,7 @@ Thumbs.db
 
 # Agent instructions + planning docs — local-only, never publish
 CLAUDE.md
+AGENTS.md
 docs/*-plan.md
 
 # Claude Code local (per-machine) settings

@@ -9,6 +9,9 @@
 #include <vector>
 #include <array>
 #include <filesystem>
+#include <cmath>
+#include <atomic>
+#include <fstream>
 #include <thread>
 #include <chrono>
 
@@ -31,6 +34,8 @@
 #include "recompinput/players.h"
 #include "librecomp/game.hpp"
 #include "librecomp/rsp.hpp"
+#include "librecomp/helpers.hpp"
+#include "librecomp/overlays.hpp"
 #include "ovl_patches.hpp"
 #include "icon_bytes.h"
 #include "logo_bytes.h"
@@ -412,6 +417,151 @@ static void wcw_setup_logging(bool show_console) {
 }
 #endif
 
+// Bundled mods (assets/mods/*.nrm, built in the AkiMods repo) ship in every release zip and
+// AKI Launcher install, but librecomp only scans <config>/mods. Copy each one there when it's
+// missing or differs from the bundled copy, so a new release updates it. librecomp enables a
+// newly found mod by default (manifest enabled_by_default; RecompModTool always leaves it true),
+// so every bundled mod must do nothing until configured. A deleted one comes back on the next
+// launch; disabling it in the Mods menu is the way to turn it off.
+static void install_bundled_mods(const std::filesystem::path& app_folder) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path src_dir = recompui::file::get_program_path() / "assets" / "mods";
+    if (!fs::is_directory(src_dir, ec)) {
+        return;
+    }
+    const fs::path dst_dir = app_folder / "mods";
+    fs::create_directories(dst_dir, ec);
+    auto read_all = [](const fs::path& p) {
+        std::ifstream f(p, std::ios::binary);
+        return std::vector<char>(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    };
+    for (const auto& entry : fs::directory_iterator(src_dir, ec)) {
+        if (entry.path().extension() != ".nrm") {
+            continue;
+        }
+        const fs::path dst = dst_dir / entry.path().filename();
+        if (fs::exists(dst, ec) && read_all(dst) == read_all(entry.path())) {
+            continue;
+        }
+        fs::copy_file(entry.path(), dst, fs::copy_options::overwrite_existing, ec);
+        fprintf(stderr, "[wcw] bundled mod %s: %s\n", entry.path().filename().string().c_str(),
+            ec ? ec.message().c_str() : "installed");
+    }
+}
+
+// Right-stick access for mods (AkiMods camera). The N64 has no right stick; by default it
+// drives the C buttons, so a mod that takes it over also suppresses that mapping (the C
+// buttons stay on their digital bindings). Player 1's stick, -1..1, deadzone applied.
+static void mod_get_right_analog_x(uint8_t* rdram, recomp_context* ctx) {
+    float x, y;
+    recompinput::get_right_analog(0, &x, &y);
+    _return(ctx, x);
+}
+
+static void mod_get_right_analog_y(uint8_t* rdram, recomp_context* ctx) {
+    float x, y;
+    recompinput::get_right_analog(0, &x, &y);
+    _return(ctx, y);
+}
+
+static void mod_set_right_analog_suppressed(uint8_t* rdram, recomp_context* ctx) {
+    recompinput::set_right_analog_suppressed(_arg<0, uint32_t>(rdram, ctx) != 0);
+}
+
+// Right stick click (R3), player 1. Note R3 is also bound to C-up by default.
+static void mod_get_right_stick_click(uint8_t* rdram, recomp_context* ctx) {
+    _return(ctx, uint32_t(recompinput::get_input_digital(0, recompinput::InputField::controller_digital(SDL_CONTROLLER_BUTTON_RIGHTSTICK)) ? 1 : 0));
+}
+
+// Camera-relative movement for mods (AkiMods camera): a rotation (radians) applied to the
+// players' movement before the game sees it. AKI games move on the N64 d-pad, so the
+// d-pad direction is rotated and snapped back to the nearest of its 8 directions. 0 = off.
+static std::atomic<float> mod_movement_rotation{0.0f};
+
+static void mod_set_movement_rotation(uint8_t* rdram, recomp_context* ctx) {
+    mod_movement_rotation.store(_arg<0, float>(rdram, ctx));
+}
+
+static bool get_n64_input_for_mods(int controller_num, uint16_t* buttons, float* x, float* y) {
+    const bool ok = recompinput::profiles::get_n64_input(controller_num, buttons, x, y);
+    const float rotation = mod_movement_rotation.load();
+    if (!ok || rotation == 0.0f) {
+        return ok;
+    }
+    constexpr uint16_t up = 0x0800, down = 0x0400, left = 0x0200, right = 0x0100;
+    const int dx = ((*buttons & right) ? 1 : 0) - ((*buttons & left) ? 1 : 0);
+    const int dy = ((*buttons & up) ? 1 : 0) - ((*buttons & down) ? 1 : 0);
+    if (dx == 0 && dy == 0) {
+        return ok;
+    }
+    // Octant 0 = right, counter-clockwise in 45-degree steps.
+    static constexpr int dirs[8][2] = { {1, 0}, {1, 1}, {0, 1}, {-1, 1}, {-1, 0}, {-1, -1}, {0, -1}, {1, -1} };
+    const float angle = std::atan2(float(dy), float(dx)) + rotation;
+    const int octant = int(std::lround(angle / 0.785398163f)) & 7;
+    *buttons &= ~(up | down | left | right);
+    *buttons |= dirs[octant][0] > 0 ? right : dirs[octant][0] < 0 ? left : 0;
+    *buttons |= dirs[octant][1] > 0 ? up : dirs[octant][1] < 0 ? down : 0;
+    return ok;
+}
+
+// Keyboard and mouse for mods (AkiMods camera free-fly mode). Keys are read straight from SDL,
+// so a mod still sees them while recomp_set_keyboard_suppressed keeps the game's keyboard
+// bindings quiet. Mouse motion and wheel are raw (unscaled) and only collected while game input
+// is enabled (not while a menu is open); recomp_take_mouse_motion latches what accumulated since
+// the last call for the three getters.
+static float mod_mouse_dx = 0.0f;
+static float mod_mouse_dy = 0.0f;
+static int32_t mod_mouse_wheel = 0;
+
+static void mod_get_key_down(uint8_t* rdram, recomp_context* ctx) {
+    const uint32_t scancode = _arg<0, uint32_t>(rdram, ctx);
+    int count = 0;
+    const Uint8* keys = SDL_GetKeyboardState(&count);
+    // Nothing while a menu has the input, so typing in it doesn't drive the mod.
+    const bool down = !recompinput::game_input_disabled() && (keys != nullptr) && (scancode < uint32_t(count)) && keys[scancode];
+    _return(ctx, uint32_t(down ? 1 : 0));
+}
+
+static void mod_take_mouse_motion(uint8_t* rdram, recomp_context* ctx) {
+    recompinput::take_raw_mouse_motion(&mod_mouse_dx, &mod_mouse_dy, &mod_mouse_wheel);
+}
+
+static void mod_get_mouse_dx(uint8_t* rdram, recomp_context* ctx) {
+    _return(ctx, mod_mouse_dx);
+}
+
+static void mod_get_mouse_dy(uint8_t* rdram, recomp_context* ctx) {
+    _return(ctx, mod_mouse_dy);
+}
+
+static void mod_get_mouse_wheel(uint8_t* rdram, recomp_context* ctx) {
+    _return(ctx, int32_t(mod_mouse_wheel));
+}
+
+static void mod_set_mouse_captured(uint8_t* rdram, recomp_context* ctx) {
+    recompinput::set_mouse_capture_requested(_arg<0, uint32_t>(rdram, ctx) != 0);
+}
+
+static void mod_set_keyboard_suppressed(uint8_t* rdram, recomp_context* ctx) {
+    recompinput::set_keyboard_suppressed(_arg<0, uint32_t>(rdram, ctx) != 0);
+}
+
+static void register_mod_input_exports() {
+    recomp::overlays::register_base_export("recomp_get_key_down", mod_get_key_down);
+    recomp::overlays::register_base_export("recomp_take_mouse_motion", mod_take_mouse_motion);
+    recomp::overlays::register_base_export("recomp_get_mouse_dx", mod_get_mouse_dx);
+    recomp::overlays::register_base_export("recomp_get_mouse_dy", mod_get_mouse_dy);
+    recomp::overlays::register_base_export("recomp_get_mouse_wheel", mod_get_mouse_wheel);
+    recomp::overlays::register_base_export("recomp_set_mouse_captured", mod_set_mouse_captured);
+    recomp::overlays::register_base_export("recomp_set_keyboard_suppressed", mod_set_keyboard_suppressed);
+    recomp::overlays::register_base_export("recomp_get_right_analog_x", mod_get_right_analog_x);
+    recomp::overlays::register_base_export("recomp_get_right_analog_y", mod_get_right_analog_y);
+    recomp::overlays::register_base_export("recomp_set_right_analog_suppressed", mod_set_right_analog_suppressed);
+    recomp::overlays::register_base_export("recomp_get_right_stick_click", mod_get_right_stick_click);
+    recomp::overlays::register_base_export("recomp_set_movement_rotation", mod_set_movement_rotation);
+}
+
 int main(int argc, char** argv) {
     bool show_console = false;
     for (int i = 1; i < argc; i++) {
@@ -538,6 +688,8 @@ int main(int argc, char** argv) {
     std::error_code app_folder_ec;
     std::filesystem::create_directories(app_folder, app_folder_ec);
     recomp::register_config_path(app_folder);
+    install_bundled_mods(app_folder);
+    register_mod_input_exports();
     wcw::register_wcw_overlays();
     wcw::register_wcw_patches();
 
@@ -611,6 +763,10 @@ int main(int argc, char** argv) {
     recompui::config::create_graphics_tab();
     recompui::config::create_controls_tab();
     recompui::config::create_sound_tab();
+    // The Mods tab must be created here, not just selected. The launcher's Mods entry
+    // (add_mods_option) only calls config::set_tab(config::mods::id); without this the
+    // tab doesn't exist, set_tab is a no-op and the config UI opens on General instead.
+    recompui::config::create_mods_tab();
     recompui::config::finalize();
 
     // ROM intake. Default: the recompui launcher menu — first run shows "Load ROM" (nfd
@@ -630,8 +786,11 @@ int main(int argc, char** argv) {
         }
     }
     else {
-        // Launcher menu options: no Mods entry (add_default_options has one) until mod
-        // support is actually wired up.
+        // Launcher menu options. The Mods entry is live: librecomp already calls
+        // initialize_mods() + scan_mods() unconditionally from recomp::start
+        // (recomp.cpp), so the live recompiler, the mods/ folder under the config path
+        // and .nrm scanning were all running before this option existed — only the UI
+        // entry point was missing.
         recompui::register_launcher_init_callback([](recompui::LauncherMenu* menu) {
             // Game logo in place of the default program-name text title. The image must be
             // queued before the Image element referencing its src is created.
@@ -657,6 +816,7 @@ int main(int argc, char** argv) {
             game_options_menu->add_start_game_or_load_rom_option();
             game_options_menu->add_setup_controls_option();
             game_options_menu->add_settings_option();
+            game_options_menu->add_mods_option();
             game_options_menu->add_exit_option();
         });
     }
@@ -692,7 +852,7 @@ int main(int argc, char** argv) {
     ultramodern::audio_callbacks_t audio_callbacks{ .queue_samples = queue_samples, .get_frames_remaining = get_frames_remaining, .set_frequency = set_frequency };
     ultramodern::input::callbacks_t input_callbacks{
         .poll_input = recompinput::poll_inputs,
-        .get_input = recompinput::profiles::get_n64_input,
+        .get_input = get_n64_input_for_mods,
         .set_rumble = recompinput::set_rumble,
         .get_connected_device_info = get_connected_device_info,
     };
