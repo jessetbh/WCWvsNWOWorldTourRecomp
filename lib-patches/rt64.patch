@@ -12268,7 +12268,7 @@ index 785de27..cb5f3b9 100644
          state->updateScreen(core.decodeVI(), false);
      }
 diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
-index 3227ab1..e6f0567 100644
+index 3227ab1..bcd943c 100644
 --- a/src/hle/rt64_present_queue.cpp
 +++ b/src/hle/rt64_present_queue.cpp
 @@ -9,7 +9,13 @@
@@ -12447,7 +12447,7 @@ index 3227ab1..e6f0567 100644
                  }
  
                  RenderHookDraw *drawHook = GetRenderHookDraw();
-@@ -358,7 +451,39 @@ namespace RT64 {
+@@ -358,7 +451,43 @@ namespace RT64 {
                      if (inspector != nullptr) {
                          inspector->draw(commandList);
                      }
@@ -12463,6 +12463,9 @@ index 3227ab1..e6f0567 100644
 +                    static const int wcwBmpStart = getenv("WCW_BMP_START") ? atoi(getenv("WCW_BMP_START")) : 600;
 +                    static const int wcwBmpCount = getenv("WCW_BMP_COUNT") ? atoi(getenv("WCW_BMP_COUNT")) : 13;
 +                    static const int wcwLumEnd = getenv("WCW_LUM_END") ? atoi(getenv("WCW_LUM_END")) : 1500;
++                    // WCW_BMP_EVERY=N: dump every Nth present from WCW_BMP_START instead (WCW_BMP_COUNT
++                    // dumps), reading back only those presents.
++                    static const int wcwBmpEvery = getenv("WCW_BMP_EVERY") ? atoi(getenv("WCW_BMP_EVERY")) : 0;
 +                    static std::unique_ptr<RenderBuffer> wcwReadback;
 +                    static uint32_t wcwRbW = 0, wcwRbH = 0, wcwRbRow = 0;
 +                    static int wcwPresentN = 0;
@@ -12470,7 +12473,8 @@ index 3227ab1..e6f0567 100644
 +                    if (wcwLum) {
 +                        wcwPresentN++;
 +                        wcwRtPresentCounter = wcwPresentN;
-+                        if (wcwPresentN >= 240 && wcwPresentN <= wcwLumEnd) {
++                        const bool wcwEveryHit = (wcwBmpEvery <= 0) || ((wcwPresentN >= wcwBmpStart) && (((wcwPresentN - wcwBmpStart) % wcwBmpEvery) == 0));
++                        if (wcwPresentN >= 240 && wcwPresentN <= wcwLumEnd && wcwEveryHit) {
 +                            uint32_t w = ext.swapChain->getWidth(), h = ext.swapChain->getHeight();
 +                            uint32_t row = (w + 63) & ~63u;
 +                            if (!wcwReadback || wcwRbW != w || wcwRbH != h) {
@@ -12488,7 +12492,7 @@ index 3227ab1..e6f0567 100644
                      commandList->barriers(RenderBarrierStage::NONE, RenderTextureBarrier(swapChainTexture, RenderTextureLayout::PRESENT));
                      commandList->end();
                      const RenderCommandList *commandList = ext.presentGraphicsWorker->commandList.get();
-@@ -366,6 +491,44 @@ namespace RT64 {
+@@ -366,6 +495,46 @@ namespace RT64 {
                      RenderCommandSemaphore *signalSemaphore = drawSemaphores[swapChainIndex].get();
                      ext.presentGraphicsWorker->commandQueue->executeCommandLists(&commandList, 1, &waitSemaphore, 1, &signalSemaphore, 1, ext.presentGraphicsWorker->commandFence.get());
                      ext.presentGraphicsWorker->wait();
@@ -12511,7 +12515,9 @@ index 3227ab1..e6f0567 100644
 +                            fprintf(lumf, "%d,%.1f,0x%X,0x%X,%.2f\n", wcwPresentN, msNow, present.screenVI.fbAddress(), wcw_addr, double(sum) / cnt);
 +                            fflush(lumf);
 +                        }
-+                        if (wcwPresentN >= wcwBmpStart && wcwPresentN < wcwBmpStart + wcwBmpCount) {
++                        const bool wcwBmpWanted = (wcwBmpEvery > 0) ? ((wcwPresentN >= wcwBmpStart) && ((wcwPresentN - wcwBmpStart) / wcwBmpEvery < wcwBmpCount))
++                            : ((wcwPresentN >= wcwBmpStart) && (wcwPresentN < wcwBmpStart + wcwBmpCount));
++                        if (wcwBmpWanted) {
 +                            char name[64]; snprintf(name, sizeof(name), "wcw_present_%04d.bmp", wcwPresentN);
 +                            FILE *bf = fopen(name, "wb");
 +                            if (bf != nullptr) {
@@ -12533,7 +12539,7 @@ index 3227ab1..e6f0567 100644
                  }
              }
  
-@@ -398,6 +561,11 @@ namespace RT64 {
+@@ -398,6 +567,11 @@ namespace RT64 {
                      ext.swapChain->wait();
                  }
  
@@ -12545,7 +12551,7 @@ index 3227ab1..e6f0567 100644
                  RenderCommandSemaphore *waitSemaphore = drawSemaphores[swapChainIndex].get();
                  presentTimestamp = Timer::current();
                  swapChainValid = ext.swapChain->present(swapChainIndex, &waitSemaphore, 1);
-@@ -430,6 +598,224 @@ namespace RT64 {
+@@ -430,6 +604,224 @@ namespace RT64 {
          barrierCursor = (barrierCursor + 1) % presents.size();
      }
  
@@ -12770,7 +12776,7 @@ index 3227ab1..e6f0567 100644
      void PresentQueue::threadLoop() {
          Thread::setCurrentThreadName("RT64 Present");
  
-@@ -452,14 +838,36 @@ namespace RT64 {
+@@ -452,14 +844,36 @@ namespace RT64 {
          while (presentThreadRunning) {
              {
                  std::unique_lock<std::mutex> cursorLock(cursorMutex);
@@ -14298,7 +14304,7 @@ index 0000000..b08a621
 +    };
 +};
 diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
-index 9fae0d4..262eae4 100644
+index 9fae0d4..50943e4 100644
 --- a/src/render/rt64_framebuffer_renderer.cpp
 +++ b/src/render/rt64_framebuffer_renderer.cpp
 @@ -4,6 +4,8 @@
@@ -14310,7 +14316,7 @@ index 9fae0d4..262eae4 100644
  #include "../include/rt64_extended_gbi.h"
  
  #include "common/rt64_elapsed_timer.h"
-@@ -50,6 +52,71 @@ namespace interop {
+@@ -50,6 +52,102 @@ namespace interop {
  };
  
  namespace RT64 {
@@ -14361,28 +14367,59 @@ index 9fae0d4..262eae4 100644
 +        return (p1 == 1) || (p2 == 1) || (m1 == 1) || (m2 == 1);
 +    }
 +
-+    // [wcw rt] AKI blob shadows: small translucent quads lying flat (constant world Y) on the
-+    // mat under each wrestler. The ray-traced shadows replace them.
-+    static bool wcwIsBlobShadow(const DrawData &drawData, uint32_t faceIndicesStart, uint32_t triangleCount, const interop::OtherMode &otherMode) {
-+        if ((triangleCount == 0) || (triangleCount > 4) || !wcwBlendsWithMemory(otherMode)) {
++    // [wcw rt] AKI blob shadows: small translucent quads lying flat (or gently tilted, at the ring's edge) on the
++    // mat under each wrestler, a few dozen units across. The ray-traced shadows replace them.
++    // Screen-space overlays (intro art, entrance videos, select-screen backgrounds) are also
++    // small blended quads, but their world positions collapse to a point: require a real
++    // footprint on the floor so they are kept.
++    static bool wcwIsBlobShadow(const DrawData &drawData, uint32_t faceIndicesStart, uint32_t triangleCount, const interop::OtherMode &otherMode, uint64_t textureHash) {
++        if ((triangleCount == 0) || (triangleCount > 16) || !wcwBlendsWithMemory(otherMode)) {
 +            return false;
 +        }
 +
-+        float minY = FLT_MAX, maxY = -FLT_MAX;
++        // WCW_RT_BLOB_LOG=1: learn the blob textures from detected blobs and log the draws using
++        // them that the test lets through (with their shape).
++        static const bool blobLog = getenv("WCW_RT_BLOB_LOG") != nullptr;
++        static std::unordered_set<uint64_t> blobTextures;
++
++        float minPos[3] = { FLT_MAX, FLT_MAX, FLT_MAX };
++        float maxPos[3] = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
 +        for (uint32_t i = 0; i < triangleCount * 3; i++) {
 +            const uint32_t v = drawData.faceIndices[faceIndicesStart + i];
 +            const hlslpp::float4 objPos(drawData.posFloats[v * 3 + 0], drawData.posFloats[v * 3 + 1], drawData.posFloats[v * 3 + 2], 1.0f);
-+            const float y = hlslpp::mul(objPos, hlslpp::float4x4(drawData.worldTransforms[drawData.worldIndices[v]])).y;
-+            minY = std::min(minY, y);
-+            maxY = std::max(maxY, y);
++            const hlslpp::float4 worldPos = hlslpp::mul(objPos, hlslpp::float4x4(drawData.worldTransforms[drawData.worldIndices[v]]));
++            const float pos[3] = { worldPos.x, worldPos.y, worldPos.z };
++            for (uint32_t c = 0; c < 3; c++) {
++                minPos[c] = std::min(minPos[c], pos[c]);
++                maxPos[c] = std::max(maxPos[c], pos[c]);
++            }
 +        }
 +
-+        return (maxY - minY) < 0.5f;
++        const float extentX = maxPos[0] - minPos[0];
++        const float extentZ = maxPos[2] - minPos[2];
++        const bool blob = (triangleCount <= 4) && ((maxPos[1] - minPos[1]) < std::max(0.5f, 0.15f * std::max(extentX, extentZ))) && (extentX > 1.0f) && (extentZ > 1.0f) && (extentX < 200.0f) && (extentZ < 200.0f);
++        static const int blobLogAll = getenv("WCW_RT_BLOB_LOG_AT") ? atoi(getenv("WCW_RT_BLOB_LOG_AT")) : -1;
++        if ((blobLogAll >= 0) && (wcwRtPresentCounter >= blobLogAll) && (wcwRtPresentCounter < blobLogAll + 4)) {
++            fprintf(stderr, "[wcw rt] blob cand present %d: blob %d tex %016llX tris %u y %.1f..%.1f x %.1f..%.1f z %.1f..%.1f\n", int(wcwRtPresentCounter), int(blob), (unsigned long long)(textureHash),
++                triangleCount, minPos[1], maxPos[1], minPos[0], maxPos[0], minPos[2], maxPos[2]);
++        }
++
++        if (blobLog) {
++            if (blob && blobTextures.insert(textureHash).second) {
++                fprintf(stderr, "[wcw rt] blob texture %016llX learned (present %d)\n", (unsigned long long)(textureHash), int(wcwRtPresentCounter));
++            }
++            else if (!blob && blobTextures.count(textureHash)) {
++                fprintf(stderr, "[wcw rt] blob miss present %d: tex %016llX tris %u y %.1f..%.1f x %.1f..%.1f z %.1f..%.1f\n", int(wcwRtPresentCounter), (unsigned long long)(textureHash),
++                    triangleCount, minPos[1], maxPos[1], minPos[0], maxPos[0], minPos[2], maxPos[2]);
++            }
++        }
++
++        return blob;
 +    }
      // Helper functions.
      
      RenderRect convertFixedRect(FixedRect rect, hlslpp::float2 resScale, int32_t fbWidth, float aspectRatioScale, float extOriginPercentage, int32_t horizontalMisalignment, uint16_t leftOrigin, uint16_t rightOrigin) {
-@@ -152,6 +219,12 @@ namespace RT64 {
+@@ -152,6 +250,12 @@ namespace RT64 {
          shaderUploader = std::make_unique<BufferUploader>(worker->device);
          descCommonSet = std::make_unique<FramebufferRendererDescriptorCommonSet>(shaderLibrary->samplerLibrary, worker->device->getCapabilities().raytracing, worker->device);
  
@@ -14395,7 +14432,7 @@ index 9fae0d4..262eae4 100644
  #   if RT_ENABLED
          if (rtSupport) {
              this->rtSupport = rtSupport;
-@@ -172,6 +245,10 @@ namespace RT64 {
+@@ -172,6 +276,10 @@ namespace RT64 {
          hitGroupVector.clear();
          renderIndicesVector.clear();
          rspSmoothNormalVector.clear();
@@ -14406,7 +14443,7 @@ index 9fae0d4..262eae4 100644
          frameParams.viewUbershaders = ubershadersVisible;
          frameParams.ditherNoiseStrength = ditherNoiseStrength;
          framebufferCount = 0;
-@@ -484,6 +561,10 @@ namespace RT64 {
+@@ -484,6 +592,10 @@ namespace RT64 {
              worker->commandList->setGraphicsDescriptorSet(descTextureSet->get(), 1);
              worker->commandList->setGraphicsDescriptorSet(descTextureSet->get(), 2);
              worker->commandList->setGraphicsDescriptorSet(depthState ? descRealFbSet : descDummyFbSet, 3);
@@ -14417,7 +14454,7 @@ index 9fae0d4..262eae4 100644
              worker->commandList->setViewports(framebuffer.viewport);
          };
  
-@@ -546,6 +627,16 @@ namespace RT64 {
+@@ -546,6 +658,16 @@ namespace RT64 {
                  assert(triangles.pipeline != nullptr);
  
                  // Draw calls can sometimes end up with empty scissors and cause validation errors. We just skip them.
@@ -14434,7 +14471,7 @@ index 9fae0d4..262eae4 100644
                  if (triangles.scissor.isEmpty()) {
                      continue;
                  }
-@@ -576,6 +667,12 @@ namespace RT64 {
+@@ -576,6 +698,12 @@ namespace RT64 {
                  rasterParams.screenOffset = triangles.screenOffset;
                  worker->commandList->setGraphicsPushConstants(0, &rasterParams);
  
@@ -14447,7 +14484,7 @@ index 9fae0d4..262eae4 100644
                  drawCallTriangles(drawCall);
  
                  // Simulate dither noise.
-@@ -1206,6 +1303,10 @@ namespace RT64 {
+@@ -1206,6 +1334,10 @@ namespace RT64 {
              vertexProcessor->recordCommandList(worker, shaderLibrary, outputBuffers);
          }
  
@@ -14458,7 +14495,7 @@ index 9fae0d4..262eae4 100644
  #   if RT_ENABLED
          if (rtEnabled) {
              assert(rtResources != nullptr);
-@@ -1249,6 +1350,7 @@ namespace RT64 {
+@@ -1249,6 +1381,7 @@ namespace RT64 {
          worker->commandList->barriers(RenderBarrierStage::GRAPHICS, startBarriers);
  
          bool depthState = false;
@@ -14466,7 +14503,7 @@ index 9fae0d4..262eae4 100644
          worker->commandList->setFramebuffer(targetDrawCall.fbStorage->colorDepthWrite.get());
          for (const auto &pair : targetDrawCall.sceneIndices) {
  #       if RT_ENABLED
-@@ -1298,6 +1400,13 @@ namespace RT64 {
+@@ -1298,6 +1431,13 @@ namespace RT64 {
                  submitDepthAccess(worker, targetDrawCall.fbStorage, false, depthState);
                  submitRasterScene(worker, framebuffer, targetDrawCall.fbStorage, rasterScene, depthState);
              }
@@ -14480,7 +14517,7 @@ index 9fae0d4..262eae4 100644
          }
      }
  
-@@ -1430,10 +1539,16 @@ namespace RT64 {
+@@ -1430,10 +1570,16 @@ namespace RT64 {
  
          targetDrawCall.fbStorage = p.fbStorage;
          targetDrawCall.sceneIndices.clear();
@@ -14498,7 +14535,7 @@ index 9fae0d4..262eae4 100644
          const float aspectRatioScale = adjustRatio ? (p.aspectRatioTarget / p.aspectRatioSource) : 1.0f;
          InstanceDrawCall instanceDrawCall;
          interop::RenderIndices renderIndices;
-@@ -1506,6 +1621,33 @@ namespace RT64 {
+@@ -1506,6 +1652,33 @@ namespace RT64 {
                  viewportClip = convertViewportRect(viewport.rect(viewportClipRatios), p.resolutionScale, p.fbWidth, projInvRatioScale, extOriginPercentage, 0.0f, viewportOrigin, viewportOrigin);
              }
  
@@ -14532,7 +14569,7 @@ index 9fae0d4..262eae4 100644
              for (uint32_t d = 0; (d < proj.gameCallCount) && (globalCallIndex < p.maxGameCall); d++) {
                  const GameCall &call = proj.gameCalls[d];
                  renderIndices.instanceIndex = call.callDesc.callIndex;
-@@ -1607,6 +1749,8 @@ namespace RT64 {
+@@ -1607,6 +1780,8 @@ namespace RT64 {
                      {
                          triangles.shaderDesc = call.shaderDesc;
  
@@ -14541,7 +14578,7 @@ index 9fae0d4..262eae4 100644
                          RasterShader *gpuShader = p.ubershadersOnly ? nullptr : p.rasterShaderCache->getGPUShader(call.shaderDesc);
                          if (gpuShader != nullptr) {
                              triangles.pipeline = gpuShader->pipeline.get();
-@@ -1618,6 +1762,12 @@ namespace RT64 {
+@@ -1618,6 +1793,12 @@ namespace RT64 {
                                  !copyMode && call.shaderDesc.otherMode.zUpd(),
                                  (call.shaderDesc.otherMode.cvgDst() == CVG_DST_WRAP) || (call.shaderDesc.otherMode.cvgDst() == CVG_DST_SAVE));
                          }
@@ -14554,7 +14591,7 @@ index 9fae0d4..262eae4 100644
                          
                          triangles.faceCount = call.callDesc.triangleCount;
                          triangles.vertexTestZ = (vertexTestZCallIndex >= 0);
-@@ -1676,6 +1826,98 @@ namespace RT64 {
+@@ -1676,6 +1857,104 @@ namespace RT64 {
                              break;
                          }
  
@@ -14601,12 +14638,18 @@ index 9fae0d4..262eae4 100644
 +                                    wcwTri[k * 3 + 2] = float(wp.z);
 +                                }
 +
-+                                wcwRaytracer->extendBounds(wcwTri);
++                                wcwRaytracer->extendBounds(wcwTri, wcwCharacter);
 +                            }
 +
 +                            // The geometry's vertex range ends at its highest index, not the whole buffer.
++                            uint64_t wcwTextureHash = 0;
++                            if ((call.callDesc.textureOn != 0) && (call.callDesc.tileCount > 0)) {
++                                const DrawCallTile &wcwTile = drawData.callTiles[call.callDesc.tileIndex];
++                                wcwTextureHash = wcwTile.tileCopyUsed ? 0 : wcwTile.tmemHashOrID;
++                            }
++
 +                            wcwRaytracer->addMesh(call.meshDesc.faceIndicesStart, call.callDesc.triangleCount, std::min(wcwMaxVertex + 1, vertexCount), call.shaderDesc.flags.culling, wcwCharacter,
-+                                wcwAlphaTest, call.callDesc.tileIndex, wcwUvCorrection);
++                                wcwAlphaTest, call.callDesc.tileIndex, wcwUvCorrection, wcwTextureHash);
 +
 +                            // WCW_RT_RAYTEST=<present>: CPU copy of the gathered triangles for a reference ray test.
 +                            static const int wcwRayTestAt = getenv("WCW_RT_RAYTEST") ? atoi(getenv("WCW_RT_RAYTEST")) : -1;
@@ -14653,15 +14696,28 @@ index 9fae0d4..262eae4 100644
                          triangles.scissor = convertFixedRect(call.callDesc.scissorRect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, int32_t(horizontalMisalignment), call.callDesc.scissorLeftOrigin, call.callDesc.scissorRightOrigin);
  
                          bool usesViewport = (proj.type == Projection::Type::Perspective) || (proj.type == Projection::Type::Orthographic);
-@@ -1746,12 +1988,29 @@ namespace RT64 {
+@@ -1746,12 +2025,42 @@ namespace RT64 {
                  else 
  #           endif
                  {
 -                    rasterScene.instanceIndices.push_back(instanceIndex);
 +                    // [wcw rt] With ray-traced shadows on, the game's blob shadows are not drawn.
-+                    const bool wcwSkipBlob = (wcwRaytracer != nullptr) && wcwRaytracer->replacesBlobShadows() && (proj.type == Projection::Type::Perspective) &&
++                    uint64_t wcwBlobTexture = 0;
++                    if ((call.callDesc.textureOn != 0) && (call.callDesc.tileCount > 0)) {
++                        const DrawCallTile &wcwTile = drawData.callTiles[call.callDesc.tileIndex];
++                        wcwBlobTexture = wcwTile.tileCopyUsed ? 0 : wcwTile.tmemHashOrID;
++                    }
++
++                    bool wcwSkipBlob = (wcwRaytracer != nullptr) && wcwRaytracer->replacesBlobShadows() && (proj.type == Projection::Type::Perspective) &&
 +                        (instanceDrawCall.type == InstanceDrawCall::Type::IndexedTriangles) &&
-+                        wcwIsBlobShadow(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount, call.callDesc.otherMode);
++                        wcwIsBlobShadow(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount, call.callDesc.otherMode, wcwBlobTexture);
++
++                    // Split screen: keep the blobs on the left (original) half.
++                    if (wcwSkipBlob && WcwRaytracer::splitScreen() && (p.fbStorage->colorTarget != nullptr)) {
++                        instanceDrawCall.triangles.scissor.right = std::min(instanceDrawCall.triangles.scissor.right, int32_t(p.fbStorage->colorTarget->width / 2));
++                        wcwSkipBlob = instanceDrawCall.triangles.scissor.isEmpty();
++                    }
++
 +                    if (!wcwSkipBlob) {
 +                        rasterScene.instanceIndices.push_back(instanceIndex);
 +                    }
@@ -14938,10 +14994,10 @@ index 8a3782a..0789a75 100644
 \ No newline at end of file
 diff --git a/src/render/rt64_wcw_raytracer.cpp b/src/render/rt64_wcw_raytracer.cpp
 new file mode 100644
-index 0000000..b07afb8
+index 0000000..b3bbb90
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.cpp
-@@ -0,0 +1,767 @@
+@@ -0,0 +1,1138 @@
 +//
 +// RT64
 +//
@@ -14954,6 +15010,10 @@ index 0000000..b07afb8
 +#include <cstdio>
 +#include <cstdlib>
 +#include <cstring>
++#include <filesystem>
++#include <fstream>
++
++#include <json/json.hpp>
 +
 +#include "rt64_descriptor_sets.h"
 +#include "rt64_render_target.h"
@@ -15004,6 +15064,7 @@ index 0000000..b07afb8
 +
 +        if (const char *modeText = getenv("WCW_RT_MODE")) {
 +            mode = uint32_t(atoi(modeText));
++            envMode = mode;
 +        }
 +
 +        const RenderDeviceCapabilities capabilities = device->getCapabilities();
@@ -15091,6 +15152,7 @@ index 0000000..b07afb8
 +
 +    void WcwRaytracer::beginWorkload(uint64_t presentId) {
 +        if (presentId != lastPresentId) {
++            finishPresent();
 +            lastPresentId = presentId;
 +            workloadInFrame = 0;
 +            frameCounter++;
@@ -15100,6 +15162,278 @@ index 0000000..b07afb8
 +        }
 +
 +        workloadCounter++;
++    }
++
++    static WcwRaytracer::LightPreset parsePreset(const nlohmann::json &j, const WcwRaytracer::LightPreset &base) {
++        WcwRaytracer::LightPreset p = base;
++        p.name = j.value("name", std::string());
++        p.match.clear();
++        if (j.contains("match")) {
++            for (const auto &h : j["match"]) {
++                p.match.push_back(strtoull(h.get<std::string>().c_str(), nullptr, 16));
++            }
++        }
++
++        if (j.contains("center")) {
++            for (uint32_t i = 0; i < 3; i++) {
++                p.center[i] = j["center"][i].get<float>();
++            }
++        }
++
++        p.spread = j.value("spread", p.spread);
++        p.fills = j.value("fills", p.fills);
++        p.keyWeight = j.value("keyWeight", p.keyWeight);
++        p.size = j.value("size", p.size);
++        p.radius = j.value("radius", p.radius);
++        p.clearance = j.value("clearance", p.clearance);
++        p.falloff = j.value("falloff", p.falloff);
++        if (j.contains("glows")) {
++            p.glows.clear();
++            for (const auto &g : j["glows"]) {
++                p.glows.push_back({ g[0].get<float>(), g[1].get<float>(), g[2].get<float>(), g[3].get<float>(), g[4].get<float>() });
++            }
++        }
++        p.shadow = j.value("shadow", p.shadow);
++        p.characterShadow = j.value("characterShadow", p.characterShadow);
++        p.anchorScene = (j.value("anchor", std::string(p.anchorScene ? "scene" : "world")) == "scene");
++        if (j.contains("lights")) {
++            p.lights.clear();
++            for (const auto &l : j["lights"]) {
++                p.lights.push_back({ l[0].get<float>(), l[1].get<float>(), l[2].get<float>(), (l.size() > 3) ? l[3].get<float>() : 1.0f });
++            }
++        }
++
++        return p;
++    }
++
++    void WcwRaytracer::loadPresets(bool force) {
++        if (presetsPath.empty()) {
++            const char *pathText = getenv("WCW_RT_LIGHTS_FILE");
++            presetsPath = (pathText != nullptr) ? pathText : "assets/rt_lights.json";
++        }
++
++        std::error_code ec;
++        const auto stampTime = std::filesystem::last_write_time(presetsPath, ec);
++        const int64_t stamp = ec ? INT64_MIN + 1 : int64_t(stampTime.time_since_epoch().count());
++        if (!force && (stamp == presetsStamp)) {
++            return;
++        }
++
++        presetsStamp = stamp;
++        defaultPreset = LightPreset();
++        venuePresets.clear();
++        mode = envMode;
++        activeVenue = -1;
++        candidateVenue = -1;
++        candidateFrames = 0;
++        if (ec) {
++            return;
++        }
++
++        try {
++            std::ifstream file(presetsPath);
++            const nlohmann::json root = nlohmann::json::parse(file, nullptr, true, true);
++            if (root.contains("debugMode")) {
++                mode = root["debugMode"].get<uint32_t>();
++            }
++
++            if (root.contains("default")) {
++                defaultPreset = parsePreset(root["default"], LightPreset());
++                defaultPreset.name = "default";
++            }
++
++            roomEnabled = false;
++            if (root.contains("room")) {
++                const nlohmann::json &room = root["room"];
++                roomPreset = parsePreset(room, defaultPreset);
++                roomPreset.name = "room (fallback)";
++                roomPreset.anchorScene = false;
++                roomMaxExtent = room.value("maxExtent", 3000.0f);
++                roomCount = std::clamp(room.value("count", 3u), 1u, uint32_t(WCW_RT_MAX_LIGHTS));
++                roomHeight = room.value("height", 0.85f);
++                roomEnabled = true;
++            }
++
++            if (root.contains("venues")) {
++                for (const auto &v : root["venues"]) {
++                    venuePresets.push_back(parsePreset(v, defaultPreset));
++                }
++            }
++
++            // Textures listed by several venues (shared arena parts) can't tell them apart.
++            for (LightPreset &p : venuePresets) {
++                p.uniqueMatch.clear();
++                for (uint64_t h : p.match) {
++                    bool shared = false;
++                    for (const LightPreset &o : venuePresets) {
++                        if ((&o != &p) && (std::find(o.match.begin(), o.match.end(), h) != o.match.end())) {
++                            shared = true;
++                            break;
++                        }
++                    }
++
++                    if (!shared) {
++                        p.uniqueMatch.push_back(h);
++                    }
++                }
++            }
++
++            fprintf(stderr, "[wcw rt] light presets loaded from %s: %zu venue(s)\n", presetsPath.c_str(), venuePresets.size());
++        }
++        catch (const std::exception &e) {
++            fprintf(stderr, "[wcw rt] light presets %s failed to parse: %s\n", presetsPath.c_str(), e.what());
++        }
++    }
++
++    void WcwRaytracer::finishPresent() {
++        // Textures drawn by world geometry this present, kept for the last VenueWindow presents.
++        std::vector<uint64_t> hashes;
++        hashes.reserve(frameTextureTris.size());
++        for (const auto &it : frameTextureTris) {
++            hashes.push_back(it.first);
++            textureCounts[it.first]++;
++            uint32_t &maxTris = textureMaxTris[it.first];
++            maxTris = std::max(maxTris, it.second);
++        }
++
++        frameTextureTris.clear();
++        textureHistory.push_back(std::move(hashes));
++        if (presentMin[0] <= presentMax[0]) {
++            for (uint32_t i = 0; i < 3; i++) {
++                sceneMin[i] = presentMin[i];
++                sceneMax[i] = presentMax[i];
++                presentMin[i] = FLT_MAX;
++                presentMax[i] = -FLT_MAX;
++            }
++
++            sceneBoundsValid = true;
++        }
++
++        if (textureHistory.size() > VenueWindow) {
++            for (uint64_t h : textureHistory.front()) {
++                auto it = textureCounts.find(h);
++                if ((it != textureCounts.end()) && (--it->second == 0)) {
++                    textureCounts.erase(it);
++                    textureMaxTris.erase(h);
++                }
++            }
++
++            textureHistory.pop_front();
++        }
++
++        if ((presentCount++ % 30) == 0) {
++            loadPresets(false);
++        }
++
++        // Best venue: the largest fraction of its match textures seen in the window (at least half).
++        int best = -1;
++        float bestScore = 0.5f;
++        for (size_t v = 0; v < venuePresets.size(); v++) {
++            const LightPreset &p = venuePresets[v];
++            if (p.match.empty()) {
++                continue;
++            }
++
++            const std::vector<uint64_t> &scored = p.uniqueMatch.empty() ? p.match : p.uniqueMatch;
++            uint32_t seen = 0;
++            for (uint64_t h : scored) {
++                seen += textureCounts.count(h) ? 1 : 0;
++            }
++
++            const float score = float(seen) / float(scored.size());
++            if (score >= bestScore) {
++                bestScore = score;
++                best = int(v);
++            }
++        }
++
++        // Switch only after the choice held for a few presents (no flapping on cut scenes).
++        if (best != activeVenue) {
++            candidateFrames = (best == candidateVenue) ? (candidateFrames + 1) : 0;
++            candidateVenue = best;
++            if (candidateFrames >= 10) {
++                activeVenue = best;
++                fprintf(stderr, "[wcw rt] venue: %s\n", (best >= 0) ? venuePresets[best].name.c_str() : "default");
++            }
++        }
++        else {
++            candidateVenue = best;
++            candidateFrames = 0;
++        }
++
++        updateRoomPreset();
++
++        static const bool venueLog = getenv("WCW_RT_VENUE_LOG") != nullptr;
++        if (venueLog && ((presentCount % 300) == 0) && (textureHistory.size() == VenueWindow)) {
++            std::vector<std::pair<uint32_t, uint64_t>> stable;
++            for (const auto &it : textureCounts) {
++                if (it.second >= (VenueWindow * 9) / 10) {
++                    stable.emplace_back(textureMaxTris[it.first], it.first);
++                }
++            }
++
++            std::sort(stable.begin(), stable.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
++            fprintf(stderr, "[wcw rt] venue log present %d (active %s%s): scene (%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f), %zu stable world textures (hash(max tris)), largest first:", int(wcwRtPresentCounter), (activeVenue >= 0) ? venuePresets[activeVenue].name.c_str() : "default", roomActive ? ", room" : "",
++                sceneMin[0], sceneMin[1], sceneMin[2], sceneMax[0], sceneMax[1], sceneMax[2], stable.size());
++            for (size_t i = 0; i < stable.size(); i++) {
++                fprintf(stderr, " %016llX(%u)", (unsigned long long)stable[i].second, stable[i].first);
++            }
++
++            fprintf(stderr, "\n");
++        }
++    }
++
++    void WcwRaytracer::presetOrigin(const LightPreset &preset, float origin[3]) const {
++        if (preset.anchorScene && sceneBoundsValid) {
++            origin[0] = (sceneMin[0] + sceneMax[0]) * 0.5f;
++            origin[1] = sceneMin[1];
++            origin[2] = (sceneMin[2] + sceneMax[2]) * 0.5f;
++        }
++        else {
++            origin[0] = origin[1] = origin[2] = 0.0f;
++        }
++    }
++
++    void WcwRaytracer::updateRoomPreset() {
++        const float extentX = sceneMax[0] - sceneMin[0];
++        const float extentZ = sceneMax[2] - sceneMin[2];
++        const bool wasActive = roomActive;
++        roomActive = roomEnabled && (activeVenue < 0) && sceneBoundsValid && (std::max(extentX, extentZ) <= roomMaxExtent);
++        if (roomActive != wasActive) {
++            fprintf(stderr, "[wcw rt] venue: %s\n", roomActive ? "room (fallback)" : "default");
++        }
++
++        if (!roomActive) {
++            return;
++        }
++
++        // Lights along the long axis, centered on the short one, just under the ceiling.
++        const bool alongX = extentX >= extentZ;
++        const float longMin = alongX ? sceneMin[0] : sceneMin[2];
++        const float longLen = alongX ? extentX : extentZ;
++        const float shortCenter = alongX ? (sceneMin[2] + sceneMax[2]) * 0.5f : (sceneMin[0] + sceneMax[0]) * 0.5f;
++        const float height = sceneMin[1] + (sceneMax[1] - sceneMin[1]) * roomHeight;
++        roomPreset.lights.clear();
++        for (uint32_t i = 0; i < roomCount; i++) {
++            const float along = longMin + longLen * (float(i) + 0.5f) / float(roomCount);
++            roomPreset.lights.push_back(alongX ? std::array<float, 4>{ along, height, shortCenter, 1.0f } : std::array<float, 4>{ shortCenter, height, along, 1.0f });
++        }
++
++        roomPreset.center[0] = (sceneMin[0] + sceneMax[0]) * 0.5f;
++        roomPreset.center[1] = height;
++        roomPreset.center[2] = (sceneMin[2] + sceneMax[2]) * 0.5f;
++        roomPreset.radius = 0.0f;
++        if (roomPreset.falloff <= 0.0f) {
++            roomPreset.falloff = 0.0f;
++        }
++    }
++
++    const WcwRaytracer::LightPreset &WcwRaytracer::activePreset() const {
++        if (activeVenue >= 0) {
++            return venuePresets[activeVenue];
++        }
++
++        return roomActive ? roomPreset : defaultPreset;
 +    }
 +
 +    uint32_t WcwRaytracer::chooseSlot() const {
@@ -15147,7 +15481,9 @@ index 0000000..b07afb8
 +            const float iou = (uni > 0.0f) ? (inter / uni) : 0.0f;
 +            const float meshDiff = float(std::abs(int(meshCount) - int(slot.meshCount))) / float(std::max(std::max(meshCount, slot.meshCount), 1u));
 +            const float score = (1.0f - iou) + meshDiff;
-+            if (score < bestScore) {
++            // Different scenes can have similar mesh counts (a backstage room and the wrestlers in
++            // it): reuse a slot only when the bounds really overlap.
++            if ((iou >= 0.25f) && (score < bestScore)) {
 +                bestScore = score;
 +                best = s;
 +            }
@@ -15172,6 +15508,11 @@ index 0000000..b07afb8
 +        return supported && active() && !sceneActive;
 +    }
 +
++    bool WcwRaytracer::splitScreen() {
++        static const bool split = getenv("WCW_RT_SPLIT") != nullptr;
++        return split;
++    }
++
 +    bool WcwRaytracer::replacesBlobShadows() const {
 +        static const bool keepBlobs = getenv("WCW_RT_KEEP_BLOBS") != nullptr;
 +        return supported && active() && (mode == WCW_RT_MODE_SHADOW) && !keepBlobs;
@@ -15185,9 +15526,16 @@ index 0000000..b07afb8
 +        boundsMin[0] = boundsMin[1] = FLT_MAX;
 +        boundsMax[0] = boundsMax[1] = -FLT_MAX;
 +        boundsFullScreen = false;
-+        receiverRadius = std::max(envFloat(getenv("WCW_RT_RADIUS"), 750.0f), 0.0f);
-+        receiverCenter[0] = envFloat(getenv("WCW_RT_LIGHT_X"), 0.0f);
-+        receiverCenter[1] = envFloat(getenv("WCW_RT_LIGHT_Z"), 0.0f);
++        if (presetsStamp == INT64_MIN) {
++            loadPresets(true);
++        }
++
++        const LightPreset &preset = activePreset();
++        receiverRadius = std::max(envFloat(getenv("WCW_RT_RADIUS"), preset.radius), 0.0f);
++        float origin[3];
++        presetOrigin(preset, origin);
++        receiverCenter[0] = envFloat(getenv("WCW_RT_LIGHT_X"), origin[0] + preset.center[0]);
++        receiverCenter[1] = envFloat(getenv("WCW_RT_LIGHT_Z"), origin[2] + preset.center[2]);
 +        for (uint32_t i = 0; i < 3; i++) {
 +            worldMin[i] = FLT_MAX;
 +            worldMax[i] = -FLT_MAX;
@@ -15207,8 +15555,12 @@ index 0000000..b07afb8
 +    }
 +
 +    void WcwRaytracer::addMesh(uint32_t faceIndicesStart, uint32_t triangleCount, uint32_t vertexCount, bool culled, bool character,
-+        bool alphaTest, uint32_t tileIndex, bool uvCorrection)
++        bool alphaTest, uint32_t tileIndex, bool uvCorrection, uint64_t textureHash)
 +    {
++        if ((textureHash != 0) && !character) {
++            frameTextureTris[textureHash] += triangleCount;
++        }
++
 +        // Without tile data the alpha test can't be evaluated: keep the draw opaque.
 +        alphaTest = alphaTest && (rdpTilesBuffer != nullptr) && (gpuTilesBuffer != nullptr) && (texCoordBuffer != nullptr);
 +        const uint32_t IndexStride = sizeof(uint32_t);
@@ -15222,10 +15574,14 @@ index 0000000..b07afb8
 +        meshTiles.emplace_back((tileIndex & WCW_RT_TILE_INDEX_MASK) | (alphaTest ? WCW_RT_TILE_ALPHA_TEST : 0u) | (uvCorrection ? WCW_RT_TILE_UV_CORRECTION : 0u));
 +    }
 +
-+    void WcwRaytracer::extendBounds(const float *positions) {
++    void WcwRaytracer::extendBounds(const float *positions, bool character) {
 +        for (uint32_t i = 0; i < 9; i++) {
 +            worldMin[i % 3] = std::min(worldMin[i % 3], positions[i]);
 +            worldMax[i % 3] = std::max(worldMax[i % 3], positions[i]);
++            if (!character) {
++                presentMin[i % 3] = std::min(presentMin[i % 3], positions[i]);
++                presentMax[i % 3] = std::max(presentMax[i % 3], positions[i]);
++            }
 +        }
 +
 +        if (boundsFullScreen) {
@@ -15449,7 +15805,7 @@ index 0000000..b07afb8
 +            outputHeight = colorTarget->height;
 +            traceWidth = std::max(uint32_t(std::ceil(outputWidth * traceScale)), 1u);
 +            traceHeight = std::max(uint32_t(std::ceil(outputHeight * traceScale)), 1u);
-+            outputTexture = device->createTexture(RenderTextureDesc::Texture2D(traceWidth, traceHeight, 1, RenderFormat::R8G8B8A8_UNORM, RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS));
++            outputTexture = device->createTexture(RenderTextureDesc::Texture2D(traceWidth, traceHeight, 1, RenderFormat::R16G16B16A16_FLOAT, RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS));
 +            currentTexture = device->createTexture(RenderTextureDesc::Texture2D(traceWidth, traceHeight, 1, RenderFormat::R32G32_FLOAT, RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS));
 +        }
 +
@@ -15460,6 +15816,9 @@ index 0000000..b07afb8
 +            for (auto &history : slot.history) {
 +                history = device->createTexture(RenderTextureDesc::Texture2D(traceWidth, traceHeight, 1, RenderFormat::R16_FLOAT, RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS));
 +            }
++
++            slot.output = device->createTexture(RenderTextureDesc::Texture2D(traceWidth, traceHeight, 1, RenderFormat::R16G16B16A16_FLOAT, RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS));
++            slot.tracedPresent = UINT64_MAX;
 +
 +            slot.historyValid = false;
 +        }
@@ -15481,7 +15840,8 @@ index 0000000..b07afb8
 +            if ((mode == WCW_RT_MODE_SHADOW) || (mode == WCW_RT_MODE_AO)) {
 +                RenderBlendDesc multiply;
 +                multiply.blendEnabled = true;
-+                multiply.srcBlend = RenderBlend::ZERO;
++                // 2x multiply: dst * src + src * dst. The resolve stores factors at half scale.
++                multiply.srcBlend = RenderBlend::DEST_COLOR;
 +                multiply.dstBlend = RenderBlend::SRC_COLOR;
 +                multiply.blendOp = RenderBlendOperation::ADD;
 +                multiply.srcBlendAlpha = RenderBlend::ZERO;
@@ -15503,17 +15863,60 @@ index 0000000..b07afb8
 +        const hlslpp::float4x4 invView = hlslpp::inverse(viewMatrix);
 +        params.invViewProj = hlslpp::inverse(viewProj);
 +        params.eyePosition = hlslpp::float4(invView[3].xyz, 1.0f);
-+        params.lightPosition = hlslpp::float4(envFloat(getenv("WCW_RT_LIGHT_X"), 0.0f), envFloat(getenv("WCW_RT_LIGHT_Y"), 460.0f), envFloat(getenv("WCW_RT_LIGHT_Z"), 0.0f), 1.0f);
++        const LightPreset &preset = activePreset();
++        float origin[3];
++        presetOrigin(preset, origin);
++        const float centerX = envFloat(getenv("WCW_RT_LIGHT_X"), origin[0] + preset.center[0]);
++        const float centerY = envFloat(getenv("WCW_RT_LIGHT_Y"), origin[1] + preset.center[1]);
++        const float centerZ = envFloat(getenv("WCW_RT_LIGHT_Z"), origin[2] + preset.center[2]);
++        params.lightPosition = hlslpp::float4(centerX, centerY, centerZ, 1.0f);
 +        params.viewport = hlslpp::float4(viewport.x, viewport.y, viewport.width, viewport.height);
 +        params.resolution = { traceWidth, traceHeight };
 +        params.mode = mode;
-+        params.shadowStrength = envFloat(getenv("WCW_RT_SHADOW"), 0.6f);
-+        params.lightSpread = envFloat(getenv("WCW_RT_LIGHT_SPREAD"), 200.0f);
-+        params.lightCount = uint32_t(envFloat(getenv("WCW_RT_LIGHTS"), 4.0f));
++        params.shadowStrength = envFloat(getenv("WCW_RT_SHADOW"), preset.shadow);
++        params.lightSpread = envFloat(getenv("WCW_RT_LIGHT_SPREAD"), preset.spread);
++        params.lightCount = std::min(uint32_t(envFloat(getenv("WCW_RT_LIGHTS"), float(preset.fills))), 4u);
 +        params.cullSign = envFloat(getenv("WCW_RT_CULL_SIGN"), 1.0f);
-+        params.keyWeight = envFloat(getenv("WCW_RT_KEY_WEIGHT"), 0.5f);
-+        params.characterShadowStrength = envFloat(getenv("WCW_RT_SHADOW_CHAR"), 0.35f);
-+        params.lightSize = envFloat(getenv("WCW_RT_LIGHT_SIZE"), 20.0f);
++        params.keyWeight = envFloat(getenv("WCW_RT_KEY_WEIGHT"), preset.keyWeight);
++        params.characterShadowStrength = envFloat(getenv("WCW_RT_SHADOW_CHAR"), preset.characterShadow);
++        params.lightSize = envFloat(getenv("WCW_RT_LIGHT_SIZE"), preset.size);
++
++        // Light list: the preset's explicit lights, or the generated rig (key + fills at +-spread).
++        params.lightListCount = 0;
++        params.lightClearance = std::max(preset.clearance, 0.0f);
++        params.lightFalloff = std::max(envFloat(getenv("WCW_RT_FALLOFF"), preset.falloff), 0.0f);
++        params.glowCount = 0;
++        params.glowPadding0 = params.glowPadding1 = params.glowPadding2 = 0.0f;
++        params.glowIntensity = { 0.0f, 0.0f, 0.0f, 0.0f };
++        for (const auto &g : preset.glows) {
++            if (params.glowCount < WCW_RT_MAX_GLOWS) {
++                params.glows[params.glowCount] = { origin[0] + g[0], origin[1] + g[1], origin[2] + g[2], std::max(g[4], 1.0f) };
++                params.glowIntensity[params.glowCount] = g[3];
++                params.glowCount++;
++            }
++        }
++        if (!preset.lights.empty() && (getenv("WCW_RT_LIGHTS") == nullptr)) {
++            float weightSum = 0.0f;
++            for (const auto &l : preset.lights) {
++                weightSum += l[3];
++            }
++
++            for (const auto &l : preset.lights) {
++                if (params.lightListCount < WCW_RT_MAX_LIGHTS) {
++                    params.lights[params.lightListCount++] = { origin[0] + l[0], origin[1] + l[1], origin[2] + l[2], l[3] / std::max(weightSum, 1e-6f) };
++                }
++            }
++        }
++        else {
++            const float offsets[4][2] = { { -1.0f, -1.0f }, { 1.0f, -1.0f }, { -1.0f, 1.0f }, { 1.0f, 1.0f } };
++            const uint32_t fills = params.lightCount;
++            const float keyWeight = (fills > 0) ? params.keyWeight : 1.0f;
++            const float fillWeight = (fills > 0) ? (1.0f - keyWeight) / float(fills) : 0.0f;
++            params.lights[params.lightListCount++] = { centerX, centerY, centerZ, keyWeight };
++            for (uint32_t f = 0; f < fills; f++) {
++                params.lights[params.lightListCount++] = { centerX + offsets[f][0] * params.lightSpread, centerY, centerZ + offsets[f][1] * params.lightSpread, fillWeight };
++            }
++        }
 +        params.temporalAlpha = envFloat(getenv("WCW_RT_TEMPORAL"), 0.1f);
 +        params.frameIndex = frameIndex++;
 +        params.prevViewProj = slot.prevViewProj;
@@ -15544,6 +15947,21 @@ index 0000000..b07afb8
 +            return;
 +        }
 +
++        // Same scene already traced this present with the same camera: composite that result again.
++        static const bool noReuse = getenv("WCW_RT_NO_REUSE") != nullptr;
++        if (!noReuse && (slot.tracedPresent == lastPresentId) && (memcmp(&slot.tracedViewProj, &viewProj, sizeof(viewProj)) == 0) &&
++            (memcmp(slot.tracedRect, traceRect, sizeof(traceRect)) == 0) && (slot.tracedMeshes == uint32_t(meshes.size())))
++        {
++            compositeSet->setTexture(0, slot.output.get(), RenderTextureLayout::SHADER_READ);
++            reusedTraces++;
++            return;
++        }
++
++        slot.tracedPresent = lastPresentId;
++        slot.tracedViewProj = viewProj;
++        memcpy(slot.tracedRect, traceRect, sizeof(traceRect));
++        slot.tracedMeshes = uint32_t(meshes.size());
++
 +        params.traceOffset = { traceRect[0], traceRect[1] };
 +        params.receiverRadius = receiverRadius;
 +        void *paramsBytes = paramsBuffer->map();
@@ -15557,7 +15975,7 @@ index 0000000..b07afb8
 +        traceSet->setBuffer(2, worldPosBuffer, worldPosSize, &float4View);
 +        traceSet->setBuffer(3, faceIndicesBuffer, faceIndicesSize, &uintView);
 +        traceSet->setBuffer(4, meshStartsBuffer.get(), meshStartsBufferSize, &uintView);
-+        traceSet->setTexture(5, outputTexture.get(), RenderTextureLayout::GENERAL);
++        traceSet->setTexture(5, slot.output.get(), RenderTextureLayout::GENERAL);
 +        traceSet->setTexture(6, currentTexture.get(), RenderTextureLayout::GENERAL);
 +        const RenderBufferStructuredView rdpTileView(sizeof(interop::RDPTile));
 +        const RenderBufferStructuredView gpuTileView(sizeof(interop::GPUTile));
@@ -15566,11 +15984,11 @@ index 0000000..b07afb8
 +        traceSet->setBuffer(8, (gpuTilesBuffer != nullptr) ? gpuTilesBuffer : meshTilesBuffer.get(), 0, &gpuTileView);
 +        traceSet->setBuffer(9, (texCoordBuffer != nullptr) ? texCoordBuffer : meshTilesBuffer.get(), 0, &float2View);
 +        traceSet->setBuffer(10, meshTilesBuffer.get(), meshTilesBufferSize, &uintView);
-+        compositeSet->setTexture(0, outputTexture.get(), RenderTextureLayout::SHADER_READ);
++        compositeSet->setTexture(0, slot.output.get(), RenderTextureLayout::SHADER_READ);
 +
 +        // Trace.
 +        worker->commandList->barriers(RenderBarrierStage::COMPUTE, {
-+            RenderTextureBarrier(outputTexture.get(), RenderTextureLayout::GENERAL),
++            RenderTextureBarrier(slot.output.get(), RenderTextureLayout::GENERAL),
 +            RenderTextureBarrier(currentTexture.get(), RenderTextureLayout::GENERAL)
 +        });
 +        if (timingPool != nullptr) {
@@ -15609,12 +16027,12 @@ index 0000000..b07afb8
 +            resolveSet->setTexture(1, currentTexture.get(), RenderTextureLayout::SHADER_READ);
 +            resolveSet->setTexture(2, historyIn, RenderTextureLayout::SHADER_READ);
 +            resolveSet->setTexture(3, historyOut, RenderTextureLayout::GENERAL);
-+            resolveSet->setTexture(4, outputTexture.get(), RenderTextureLayout::GENERAL);
++            resolveSet->setTexture(4, slot.output.get(), RenderTextureLayout::GENERAL);
 +            worker->commandList->barriers(RenderBarrierStage::COMPUTE, {
 +                RenderTextureBarrier(currentTexture.get(), RenderTextureLayout::SHADER_READ),
 +                RenderTextureBarrier(historyIn, RenderTextureLayout::SHADER_READ),
 +                RenderTextureBarrier(historyOut, RenderTextureLayout::GENERAL),
-+                RenderTextureBarrier(outputTexture.get(), RenderTextureLayout::GENERAL)
++                RenderTextureBarrier(slot.output.get(), RenderTextureLayout::GENERAL)
 +            });
 +
 +            worker->commandList->setPipeline(resolvePipeline.get());
@@ -15632,7 +16050,7 @@ index 0000000..b07afb8
 +            timingWritten |= (1u << StampResolveEnd);
 +        }
 +
-+        worker->commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(outputTexture.get(), RenderTextureLayout::SHADER_READ));
++        worker->commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(slot.output.get(), RenderTextureLayout::SHADER_READ));
 +    }
 +
 +    void WcwRaytracer::recordComposite(RenderWorker *worker) {
@@ -15643,8 +16061,16 @@ index 0000000..b07afb8
 +        // Composite only the traced rect (inside its margin), in color target pixels.
 +        const float invScale = float(outputWidth) / float(traceWidth);
 +        const RenderViewport fullViewport(0.0f, 0.0f, float(outputWidth), float(outputHeight));
-+        const RenderRect fullRect(int32_t((traceRect[0] + 1) * invScale), int32_t((traceRect[1] + 1) * invScale),
++        RenderRect fullRect(int32_t((traceRect[0] + 1) * invScale), int32_t((traceRect[1] + 1) * invScale),
 +            std::min(int32_t((traceRect[2] - 1) * invScale), int32_t(outputWidth)), std::min(int32_t((traceRect[3] - 1) * invScale), int32_t(outputHeight)));
++
++        // WCW_RT_SPLIT: composite only the right half of the screen (before/after comparisons).
++        if (splitScreen()) {
++            fullRect.left = std::max(fullRect.left, int32_t(outputWidth / 2));
++            if (fullRect.left >= fullRect.right) {
++                return;
++            }
++        }
 +        worker->commandList->setPipeline(compositePipeline.get());
 +        worker->commandList->setGraphicsPipelineLayout(compositeLayout.get());
 +        interop::WcwRtCompositeCB compositeCB;
@@ -15699,9 +16125,10 @@ index 0000000..b07afb8
 +        fullScreenSum += timingFullScreen ? 1 : 0;
 +        timingWritten = 0;
 +        if (++count == 300) {
-+            fprintf(stderr, "[wcw rt gpu] per traced workload avg: build=%.3f trace=%.3f resolve=%.3f composite=%.3f ms, build->composite span=%.3f (max %.3f) ms; %llu meshes (%llu alpha-tested), %llu tris, %llu trace px of %u lines, %llu full-screen (300 workloads)\n",
++            fprintf(stderr, "[wcw rt gpu] per traced workload avg: build=%.3f trace=%.3f resolve=%.3f composite=%.3f ms, build->composite span=%.3f (max %.3f) ms; %llu meshes (%llu alpha-tested), %llu tris, %llu trace px of %u lines, %llu full-screen, %u traces reused (300 workloads)\n",
 +                sums[0] / count, sums[1] / count, sums[2] / count, sums[3] / count, sums[4] / count, maxTotal,
-+                (unsigned long long)(meshSum / count), (unsigned long long)(alphaSum / count), (unsigned long long)(triangleSum / count), (unsigned long long)(pixelSum / count), timingTraceHeight, (unsigned long long)fullScreenSum);
++                (unsigned long long)(meshSum / count), (unsigned long long)(alphaSum / count), (unsigned long long)(triangleSum / count), (unsigned long long)(pixelSum / count), timingTraceHeight, (unsigned long long)fullScreenSum, reusedTraces);
++            reusedTraces = 0;
 +            memset(sums, 0, sizeof(sums));
 +            maxTotal = 0.0;
 +            triangleSum = meshSum = alphaSum = pixelSum = fullScreenSum = 0;
@@ -15711,10 +16138,10 @@ index 0000000..b07afb8
 +};
 diff --git a/src/render/rt64_wcw_raytracer.h b/src/render/rt64_wcw_raytracer.h
 new file mode 100644
-index 0000000..110ddc1
+index 0000000..a44a76d
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.h
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,281 @@
 +//
 +// RT64
 +//
@@ -15723,6 +16150,11 @@ index 0000000..110ddc1
 +
 +#include <atomic>
 +#include <memory>
++#include <array>
++#include <cfloat>
++#include <deque>
++#include <string>
++#include <unordered_map>
 +#include <vector>
 +
 +#include "common/rt64_common.h"
@@ -15749,6 +16181,8 @@ index 0000000..110ddc1
 +        RenderShaderFormat shaderFormat = RenderShaderFormat::UNKNOWN;
 +        bool supported = false;
 +        uint32_t mode = WCW_RT_MODE_SHADOW;
++        // WCW_RT_MODE (startup); the presets file's "debugMode" overrides it while present.
++        uint32_t envMode = WCW_RT_MODE_SHADOW;
 +        bool wasActive = false;
 +
 +        // Scene gathered for the current workload.
@@ -15808,6 +16242,14 @@ index 0000000..110ddc1
 +            uint32_t historyHeight = 0;
 +            bool historyValid = false;
 +            hlslpp::float4x4 prevViewProj;
++
++            // This slot's trace output, and what it was traced for: AKI games render some frames
++            // twice (two framebuffers, same camera), and the second pass reuses the first trace.
++            std::unique_ptr<RenderTexture> output;
++            uint64_t tracedPresent = UINT64_MAX;
++            hlslpp::float4x4 tracedViewProj;
++            uint32_t tracedRect[4] = {};
++            uint32_t tracedMeshes = 0;
 +        };
 +
 +        Slot slots[MaxSlots];
@@ -15838,6 +16280,7 @@ index 0000000..110ddc1
 +        std::unique_ptr<RenderTexture> outputTexture;
 +        std::unique_ptr<RenderTexture> currentTexture;
 +        uint32_t frameIndex = 0;
++        uint32_t reusedTraces = 0;
 +        std::unique_ptr<RenderDescriptorSet> resolveSet;
 +        std::unique_ptr<RenderPipelineLayout> resolveLayout;
 +        std::unique_ptr<RenderPipeline> resolvePipeline;
@@ -15872,6 +16315,75 @@ index 0000000..110ddc1
 +        uint32_t timingTraceHeight = 0;
 +        bool timingFullScreen = false;
 +
++        // Per-venue light presets: a JSON file (WCW_RT_LIGHTS_FILE, default assets/rt_lights.json,
++        // relative to the working directory) with a "default" preset and a "venues" list. A venue
++        // is recognized by the textures of the world geometry (its "match" list of texture hashes,
++        // most of which must have been drawn in the last VenueWindow presents). The file is
++        // reloaded when it changes, so presets can be tuned while the game runs. WCW_RT_VENUE_LOG=1
++        // prints the current scene's stable world textures to build a match list from.
++        struct LightPreset {
++            std::string name;
++            std::vector<uint64_t> match;
++            // The match textures no other venue lists (scored instead of match when not empty).
++            std::vector<uint64_t> uniqueMatch;
++            // Lights' center (receiver center on X/Z, key light height on Y).
++            float center[3] = { 0.0f, 460.0f, 0.0f };
++            // Generated rig: a key light at the center plus "fills" lights at center +- spread
++            // on X/Z; or an explicit "lights" list (xyz + relative weight) replacing it.
++            float spread = 200.0f;
++            uint32_t fills = 4;
++            float keyWeight = 0.5f;
++            std::vector<std::array<float, 4>> lights;
++            float size = 20.0f;
++            float radius = 750.0f;
++            float clearance = 0.0f;
++            float falloff = 0.0f;
++            // "glows": [[x, y, z, intensity, range], ...] (offsets from the anchor like lights).
++            std::vector<std::array<float, 5>> glows;
++            // "anchor": "scene": center and explicit lights are offsets from the drawn world
++            // geometry's center on X/Z and its floor (lowest point) on Y, so one preset fits rooms
++            // placed anywhere in the world (backstage zones).
++            bool anchorScene = false;
++            float shadow = 0.6f;
++            float characterShadow = 0.35f;
++        };
++
++        static const uint32_t VenueWindow = 60;
++        LightPreset defaultPreset;
++        // "room": fallback for unmatched small scenes (backstage rooms, whatever the scene's extent
++        // on X/Z is at most maxExtent): "count" ceiling lights along the room's long axis at
++        // "height" (fraction of floor to ceiling), with falloff from their spacing. Other fields as
++        // in any preset (shadow, size, ...).
++        bool roomEnabled = false;
++        bool roomActive = false;
++        float roomMaxExtent = 3000.0f;
++        uint32_t roomCount = 3;
++        float roomHeight = 0.85f;
++        LightPreset roomPreset;
++        void updateRoomPreset();
++        std::vector<LightPreset> venuePresets;
++        int activeVenue = -1;
++        int candidateVenue = -1;
++        uint32_t candidateFrames = 0;
++        std::string presetsPath;
++        int64_t presetsStamp = INT64_MIN;
++        uint32_t presentCount = 0;
++        std::unordered_map<uint64_t, uint32_t> frameTextureTris;
++        std::deque<std::vector<uint64_t>> textureHistory;
++        std::unordered_map<uint64_t, uint32_t> textureCounts;
++        std::unordered_map<uint64_t, uint32_t> textureMaxTris;
++        // World bounds of this present's non-character geometry, and of the last finished present.
++        float presentMin[3] = { FLT_MAX, FLT_MAX, FLT_MAX };
++        float presentMax[3] = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
++        float sceneMin[3] = {};
++        float sceneMax[3] = {};
++        bool sceneBoundsValid = false;
++        // The preset's light origin: zero, or the scene anchor.
++        void presetOrigin(const LightPreset &preset, float origin[3]) const;
++        void loadPresets(bool force);
++        void finishPresent();
++        const LightPreset &activePreset() const;
++
 +        // Runtime settings from the frontend's graphics menu. Quality: 0 Performance (half-res,
 +        // 1 sample per light, 1 AO ray), 1 Balanced (half-res, 2/2), 2 Quality (full-res, 2/2).
 +        // WCW_RT forces it on; WCW_RT_SCALE / WCW_RT_SAMPLES / WCW_RT_AO_SAMPLES override quality.
@@ -15889,16 +16401,20 @@ index 0000000..110ddc1
 +        bool wantsScene() const;
 +        // Shadow mode drops the game's blob shadows (WCW_RT_KEEP_BLOBS=1 keeps them).
 +        bool replacesBlobShadows() const;
++        // WCW_RT_SPLIT: ray tracing only on the right half of the screen (before/after comparisons).
++        static bool splitScreen();
 +        void beginScene(const hlslpp::float4x4 &view, const hlslpp::float4x4 &proj, const RenderViewport &viewport,
 +            const RenderBuffer *worldPosBuffer, uint64_t worldPosSize, const RenderBuffer *faceIndicesBuffer, uint64_t faceIndicesSize,
 +            const RenderBuffer *rdpTilesBuffer, const RenderBuffer *gpuTilesBuffer, const RenderBuffer *texCoordBuffer);
 +        // culled: the draw has N64 face culling on, so primary rays skip its back faces.
 +        // character: a wrestler draw, shadowed with the weaker character strength.
 +        // alphaTest: rays skip the draw's transparent texels (tileIndex, uvCorrection: its texture).
++        // textureHash: the draw's first texture (0 if none), a venue fingerprint for the light presets.
 +        void addMesh(uint32_t faceIndicesStart, uint32_t triangleCount, uint32_t vertexCount, bool culled, bool character,
-+            bool alphaTest, uint32_t tileIndex, bool uvCorrection);
++            bool alphaTest, uint32_t tileIndex, bool uvCorrection, uint64_t textureHash);
 +        // Grows the screen bounds with a world-space triangle (3 xyz positions) of a gathered draw.
-+        void extendBounds(const float *positions);
++        // character: a wrestler triangle (left out of the scene bounds the light anchor uses).
++        void extendBounds(const float *positions, bool character);
 +        void recordBuild(RenderWorker *worker);
 +        // textureSet: the framebuffer renderer's bindless texture cache set (alpha tests).
 +        void recordTrace(RenderWorker *worker, RenderTarget *colorTarget, RenderDescriptorSet *textureSet);
@@ -15975,10 +16491,10 @@ index 0000000..334836e
 +}
 diff --git a/src/shaders/WcwRtResolveCS.hlsl b/src/shaders/WcwRtResolveCS.hlsl
 new file mode 100644
-index 0000000..7a32b71
+index 0000000..9705742
 --- /dev/null
 +++ b/src/shaders/WcwRtResolveCS.hlsl
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,91 @@
 +//
 +// RT64
 +//
@@ -16006,7 +16522,7 @@ index 0000000..7a32b71
 +    const float2 current = gCurrent[pixel];
 +    if (current.y <= 0.0f) {
 +        gHistoryOut[pixel] = 1.0f;
-+        gOutput[pixel] = float4(1.0f, 1.0f, 1.0f, 0.0f);
++        gOutput[pixel] = float4(0.5f, 0.5f, 0.5f, 0.0f);
 +        return;
 +    }
 +
@@ -16065,14 +16581,17 @@ index 0000000..7a32b71
 +    }
 +
 +    gHistoryOut[pixel] = result;
-+    gOutput[pixel] = float4(result, result, result, 1.0f);
++    // Stored at half scale: the composite's 2x multiply blend (dst * src * 2) applies factors up
++    // to 2, so glows can brighten.
++    const float encoded = min(result, 2.0f) * 0.5f;
++    gOutput[pixel] = float4(encoded, encoded, encoded, 1.0f);
 +}
 diff --git a/src/shaders/WcwRtTraceCS.hlsl b/src/shaders/WcwRtTraceCS.hlsl
 new file mode 100644
-index 0000000..3e04335
+index 0000000..eb80ab1
 --- /dev/null
 +++ b/src/shaders/WcwRtTraceCS.hlsl
-@@ -0,0 +1,359 @@
+@@ -0,0 +1,441 @@
 +//
 +// RT64
 +//
@@ -16211,6 +16730,42 @@ index 0000000..3e04335
 +    return (len > 1e-8f) ? (n / len) : float3(0.0f, 1.0f, 0.0f);
 +}
 +
++// Brightening from the preset's glows at a hit point (0 = none).
++float glowLight(float3 hitPos, float3 normal) {
++    float glow = 0.0f;
++    const uint count = min(gParams.glowCount, WCW_RT_MAX_GLOWS);
++    for (uint g = 0; g < count; g++) {
++        const float3 toGlow = gParams.glows[g].xyz - hitPos;
++        const float dist = length(toGlow);
++        const float range = gParams.glows[g].w;
++        const float facing = dot(normal, toGlow) / max(dist, 1e-3f);
++        if ((dist >= range) || (facing <= 0.0f)) {
++            continue;
++        }
++
++        const float t = dist / range;
++        const float atten = (1.0f - t * t) * (1.0f - t * t);
++        RayDesc glowRay;
++        glowRay.Origin = hitPos + normal * 0.5f;
++        glowRay.Direction = toGlow / dist;
++        glowRay.TMin = 0.5f;
++        glowRay.TMax = max(dist - gParams.lightClearance, 0.6f);
++        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
++        q.TraceRayInline(gScene, RAY_FLAG_NONE, 0xFF, glowRay);
++        while (q.Proceed()) {
++            if (candidateIsSolid(q.CandidateInstanceID(), q.CandidateGeometryIndex(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics())) {
++                q.CommitNonOpaqueTriangleHit();
++            }
++        }
++
++        if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {
++            glow += gParams.glowIntensity[g] * atten * facing;
++        }
++    }
++
++    return glow;
++}
++
 +[numthreads(8, 8, 1)]
 +void CSMain(uint2 dispatchPixel : SV_DispatchThreadID) {
 +    const uint2 pixel = dispatchPixel + gParams.traceOffset;
@@ -16286,6 +16841,32 @@ index 0000000..3e04335
 +    }
 +
 +    const float3 hitPos = ray.Origin + ray.Direction * hitT;
++    if (gParams.mode == WCW_RT_MODE_LIGHT_MAP) {
++        float4 color = float4(0.0f, 0.0f, 0.0f, 0.0f);
++        const float2 grid = abs(frac(hitPos.xz / 100.0f + 0.5f) - 0.5f) * 100.0f;
++        if (min(grid.x, grid.y) < 2.0f) {
++            color = float4(1.0f, 1.0f, 1.0f, 0.5f);
++        }
++
++        const float2 rel = hitPos.xz - gParams.lightPosition.xz;
++        if (abs(rel.y) < 4.0f) {
++            color = float4(1.0f, 0.2f, 0.2f, 0.9f);
++        }
++        else if (abs(rel.x) < 4.0f) {
++            color = float4(0.2f, 0.4f, 1.0f, 0.9f);
++        }
++
++        const uint count = min(gParams.lightListCount, WCW_RT_MAX_LIGHTS);
++        for (uint l = 0; l < count; l++) {
++            if (length(hitPos.xz - gParams.lights[l].xz) < 25.0f) {
++                color = float4(1.0f, 0.0f, 0.0f, 1.0f);
++            }
++        }
++
++        gOutput[pixel] = color;
++        return;
++    }
++
 +    if (gParams.mode == WCW_RT_MODE_HIT_POSITION) {
 +        // R/B: 50-unit X/Z grid; G: height in 0..300.
 +        const float2 grid = step(0.5f, frac(hitPos.xz / 50.0f));
@@ -16321,29 +16902,41 @@ index 0000000..3e04335
 +    if (resolvedMode() && (gParams.receiverRadius > 0.0f)) {
 +        const float receiverDist = length(hitPos.xz - gParams.lightPosition.xz);
 +        if (receiverDist >= gParams.receiverRadius) {
-+            gCurrent[pixel] = float2(1.0f, hitT);
++            gCurrent[pixel] = float2(1.0f + glowLight(hitPos, normal), hitT);
 +            return;
 +        }
 +
 +        receiverFade = smoothstep(gParams.receiverRadius * 0.85f, gParams.receiverRadius, receiverDist);
 +    }
 +
-+    const float2 lightOffsets[5] = { float2(0.0f, 0.0f), float2(-1.0f, -1.0f), float2(1.0f, -1.0f), float2(-1.0f, 1.0f), float2(1.0f, 1.0f) };
-+    const uint fillCount = min(gParams.lightCount, 4);
-+    const float keyWeight = (fillCount > 0) ? gParams.keyWeight : 1.0f;
-+    const float fillWeight = (fillCount > 0) ? (1.0f - keyWeight) / float(fillCount) : 0.0f;
++    const uint lightCount = min(gParams.lightListCount, WCW_RT_MAX_LIGHTS);
++    float lightWeights[WCW_RT_MAX_LIGHTS];
++    float weightSum = 0.0f;
++    for (uint w = 0; w < lightCount; w++) {
++        float lw = gParams.lights[w].w;
++        if (gParams.lightFalloff > 0.0f) {
++            const float d = length(gParams.lights[w].xyz - hitPos) / gParams.lightFalloff;
++            lw /= 1.0f + d * d;
++        }
++
++        lightWeights[w] = lw;
++        weightSum += lw;
++    }
++
 +    float lit = 0.0f;
 +    int occluderId = -1;
-+    const uint samples = max(gParams.samplesPerLight, 1);
-+    for (uint i = 0; i < (fillCount + 1) * samples; i++) {
++    // Heavier lights cast proportionally darker shadows, so their sampling noise shows more:
++    // each light gets samples in proportion to its preset weight (key light 2 -> twice the rays).
++    uint i = 0;
++    for (uint l = 0; l < lightCount; l++)
++    for (uint s = 0, samples = max(gParams.samplesPerLight, 1) * uint(clamp(round(gParams.lights[l].w), 1.0f, 4.0f)); s < samples; s++, i++) {
 +        // Area light: jittered samples on the light's panel (soft penumbrae, refined over
 +        // frames by the resolve pass).
-+        const uint l = i / samples;
 +        const uint seed = gParams.frameIndex * 64 + i * 2;
 +        const float2 jitter = float2(noise(pixel, seed), noise(pixel + uint2(37, 113), seed + 1)) - 0.5f;
-+        const float2 offset = lightOffsets[l] * gParams.lightSpread + jitter * gParams.lightSize;
-+        const float weight = ((l == 0) ? keyWeight : fillWeight) / float(samples);
-+        const float3 lightPos = gParams.lightPosition.xyz + float3(offset.x, 0.0f, offset.y);
++        const float2 offset = jitter * gParams.lightSize;
++        const float weight = lightWeights[l] / max(weightSum, 1e-6f) / float(samples);
++        const float3 lightPos = gParams.lights[l].xyz + float3(offset.x, 0.0f, offset.y);
 +        const float3 toLight = lightPos - hitPos;
 +        const float lightDist = length(toLight);
 +
@@ -16358,7 +16951,11 @@ index 0000000..3e04335
 +        shadowRay.Origin = hitPos + normal * 0.5f;
 +        shadowRay.Direction = toLight / lightDist;
 +        shadowRay.TMin = 0.5f;
-+        shadowRay.TMax = lightDist;
++        shadowRay.TMax = lightDist - gParams.lightClearance;
++        if (shadowRay.TMax <= shadowRay.TMin) {
++            lit += weight;
++            continue;
++        }
 +
 +        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> shadow;
 +        shadow.TraceRayInline(gScene, RAY_FLAG_NONE, 0xFF, shadowRay);
@@ -16430,14 +17027,18 @@ index 0000000..3e04335
 +
 +    factor = lerp(factor, 1.0f, receiverFade);
 +
++    if (resolvedMode() && (gParams.mode == WCW_RT_MODE_SHADOW)) {
++        factor *= 1.0f + glowLight(hitPos, normal);
++    }
++
 +    gCurrent[pixel] = float2(factor, hitT);
 +}
 diff --git a/src/shared/rt64_wcw_rt.h b/src/shared/rt64_wcw_rt.h
 new file mode 100644
-index 0000000..3d98eca
+index 0000000..c07bd98
 --- /dev/null
 +++ b/src/shared/rt64_wcw_rt.h
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,105 @@
 +//
 +// RT64
 +//
@@ -16456,6 +17057,12 @@ index 0000000..3d98eca
 +#define WCW_RT_MODE_HIT_POSITION 5
 +#define WCW_RT_MODE_SHADOW_DISTANCE 6
 +#define WCW_RT_MODE_AO 7
++// Light placement view: red dots under the lights, a 100-unit world grid, and the lights'
++// center lines (X red, Z blue) on every surface. Also set by "debugMode": 8 in the presets file.
++#define WCW_RT_MODE_LIGHT_MAP 8
++
++#define WCW_RT_MAX_LIGHTS 8
++#define WCW_RT_MAX_GLOWS 4
 +
 +// Bit 31 of a mesh index start: N64 face culling is on for that draw.
 +#define WCW_RT_MESH_CULLED 0x80000000u
@@ -16510,6 +17117,23 @@ index 0000000..3d98eca
 +        // Only the screen rect covered by this workload's geometry is traced (trace pixels).
 +        uint2 traceOffset;
 +        float receiverRadius;
++        // The lights (xyz, weight; weights sum to 1), from the venue's light preset.
++        uint lightListCount;
++        // Shadow rays stop this far short of the light, so geometry right around a light (a
++        // titantron the light sits behind) doesn't block it.
++        float lightClearance;
++        // Distance falloff of the lights' weights (0 = off): each light counts with
++        // 1 / (1 + (distance / lightFalloff)^2), so the nearest lights dominate a pixel's shadow.
++        float lightFalloff;
++        float4 lights[WCW_RT_MAX_LIGHTS];
++        // Glows: lights that brighten the surfaces facing them (xyz, range; intensity separately),
++        // ray traced so blockers still shade them. The shadow output is then a factor up to 2.
++        uint glowCount;
++        float glowPadding0;
++        float glowPadding1;
++        float glowPadding2;
++        float4 glows[WCW_RT_MAX_GLOWS];
++        float4 glowIntensity;
 +    };
 +
 +    struct WcwRtCompositeCB {
