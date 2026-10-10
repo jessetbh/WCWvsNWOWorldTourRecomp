@@ -9,6 +9,42 @@ the relevant section at the time, so it reads as a layered status document, not 
 diary. For current contributor instructions see the root CLAUDE.md and BUILDING.md.
 
 ---
+# 2026-10-10 — HDR output (scRGB) + adaptive CRT phosphor mask (plume/rt64/RecompFrontend `wcw`)
+
+Graphics → **HDR** (Off/On, next launch; the description says whether HDR started) and
+**HDR Brightness** (50–150%). Paper white = Windows' "SDR content brightness" for the display
+(`DISPLAYCONFIG_SDR_WHITE_LEVEL`) × HDR Brightness, so 100% matches the desktop. Test overrides:
+`WCW_HDR=1|0|force` (force = scRGB even with Windows HDR off), `WCW_HDR_PAPER=<nits>`,
+`WCW_HDR_MASK=<0..1>`.
+
+**Design.** plume gained `RenderSwapChainDesc::colorSpace` + `getColorSpace()` (D3D12
+`SetColorSpace1` after `CheckColorSpaceSupport`, re-applied after `ResizeBuffers`; Vulkan
+`VK_EXT_swapchain_colorspace` with every surface-format entry considered). RT64 `HdrOutput` picks an
+R16G16B16A16_FLOAT scRGB swap chain when enabled and `IDXGIOutput6` reports Windows HDR on, falling
+back to the 8-bit SDR chain otherwise. Everything that draws to it converts sRGB → linear × paper
+white / 80: VI blit (HDR pipeline variants), CRT filter (presets draw into a float stage target,
+then `VideoInterfacePS` `HDR_COMPOSE`), menus (RmlUi always renders offscreen in sRGB with HDR and
+`InterfaceHdrPS` composites, un-premultiplying first — UI blending stays in sRGB).
+
+**Verified** by forcing scRGB at 80 nits (scale 1.0) on an SDR desktop: VI, CRT and launcher UI
+frames match SDR (mean diff 0.2 / 0.1 / 0.0 out of 255). `WCW_PRESENT_LUM` reads half floats back
+(converted to sRGB for BMPs) and logs mean/max nits per frame.
+
+**Adaptive phosphor mask.** A full-strength mask passes ~1/3 of the light; Megatron-style HDR
+presets need DisplayHDR 600–1000. On the owner's 456-nit panel a full mask measured 40% dimmer
+than the SDR preset. So in HDR the preset's own mask strength is raised as far as the headroom
+(peak / paper white) allows and the compose pass multiplies the light back: never dimmer than SDR,
+full strength from ~3x headroom. With the beam simulator on, mask and beam split the headroom
+(sqrt each); the beam's linear input is scaled down (`INPUT_SCALE` in the AKI beam variant) so it
+runs at GAIN_VS_BLUR 1.0 without losing brightness.
+
+**Licensing.** Sony Megatron has no license (none in its files, libretro/slang-shaders or the
+author's repos) → not bundled; the adaptive mask on guest-advanced (GPL-2.0+) stands in for it.
+
+**Gotchas.** Beam pacing: on Vulkan, timer pacing can fall behind when the swap chain itself
+blocks on vsync → it now falls back to vblank waits for good. The shell used for edits collapses
+`\\` in heredocs — write edit scripts to files.
+
 # 2026-10-10 — CRT filter + beam simulator (experimental, rt64/RecompFrontend `wcw-crt`, games `exp/crt`)
 
 Optional CRT presentation for all six games: Graphics → CRT Filter (Off/On), CRT Signal

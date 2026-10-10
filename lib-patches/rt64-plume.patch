@@ -1,8 +1,63 @@
 diff --git a/plume_d3d12.cpp b/plume_d3d12.cpp
-index 8c239f4..527178a 100644
+index 8c239f4..3f3447f 100644
 --- a/plume_d3d12.cpp
 +++ b/plume_d3d12.cpp
-@@ -2312,7 +2312,11 @@ namespace plume {
+@@ -1358,6 +1358,7 @@ namespace plume {
+ 
+         d3d = static_cast<IDXGISwapChain3 *>(swapChain1);
+         d3d->SetMaximumFrameLatency(desc.maxFrameLatency);
++        applyColorSpace();
+         waitableObject = d3d->GetFrameLatencyWaitableObject();
+ 
+         textures.resize(desc.textureCount);
+@@ -1424,6 +1425,7 @@ namespace plume {
+             return false;
+         }
+ 
++        applyColorSpace();
+         setTextures();
+         return true;
+     }
+@@ -1492,6 +1494,38 @@ namespace plume {
+         return (d3d == nullptr) || (width == 0) || (height == 0);
+     }
+ 
++    // [wcw hdr] Applies the requested color space, falling back to sRGB when the output can't present it.
++    void D3D12SwapChain::applyColorSpace() {
++        DXGI_COLOR_SPACE_TYPE dxgiColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
++        switch (desc.colorSpace) {
++        case RenderSwapChainColorSpace::SCRGB_LINEAR:
++            dxgiColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
++            break;
++        case RenderSwapChainColorSpace::HDR10_ST2084:
++            dxgiColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
++            break;
++        default:
++            break;
++        }
++
++        colorSpace = RenderSwapChainColorSpace::SRGB_NONLINEAR;
++        if (desc.colorSpace == RenderSwapChainColorSpace::SRGB_NONLINEAR) {
++            return;
++        }
++
++        UINT support = 0;
++        if (SUCCEEDED(d3d->CheckColorSpaceSupport(dxgiColorSpace, &support)) && ((support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) != 0) && SUCCEEDED(d3d->SetColorSpace1(dxgiColorSpace))) {
++            colorSpace = desc.colorSpace;
++        }
++        else {
++            fprintf(stderr, "[plume] Swap chain color space %d is not supported by the output; presenting as sRGB.\n", int(desc.colorSpace));
++        }
++    }
++
++    RenderSwapChainColorSpace D3D12SwapChain::getColorSpace() const {
++        return colorSpace;
++    }
++
+     uint32_t D3D12SwapChain::getRefreshRate() const {
+         return 0;
+     }
+@@ -2312,7 +2346,11 @@ namespace plume {
  
          const D3D12_TEXTURE_COPY_LOCATION copyDstLocation = toD3D12(dstLocation);
          const D3D12_TEXTURE_COPY_LOCATION copySrcLocation = toD3D12(srcLocation);
@@ -15,7 +70,7 @@ index 8c239f4..527178a 100644
          d3d->CopyTextureRegion(&copyDstLocation, dstX, dstY, dstZ, &copySrcLocation, (srcBox != nullptr) ? &copyBox : nullptr);
          resetSamplePositions();
      }
-@@ -3648,9 +3652,11 @@ namespace plume {
+@@ -3648,9 +3686,11 @@ namespace plume {
          HRESULT res;
          UINT adapterIndex = 0;
          IDXGIAdapter1 *adapterOption = nullptr;
@@ -27,7 +82,7 @@ index 8c239f4..527178a 100644
  
              // Ignore remote or software adapters.
              if (adapterDesc.Flags & (DXGI_ADAPTER_FLAG_REMOTE | DXGI_ADAPTER_FLAG_SOFTWARE)) {
-@@ -3660,6 +3666,7 @@ namespace plume {
+@@ -3660,6 +3700,7 @@ namespace plume {
  
              ID3D12Device8 *deviceOption = nullptr;
              res = D3D12CreateDevice(adapterOption, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&deviceOption));
@@ -35,7 +90,7 @@ index 8c239f4..527178a 100644
              if (FAILED(res)) {
                  adapterOption->Release();
                  continue;
-@@ -4176,6 +4183,7 @@ namespace plume {
+@@ -4176,6 +4217,7 @@ namespace plume {
      // D3D12Interface
  
      D3D12Interface::D3D12Interface() {
@@ -43,7 +98,7 @@ index 8c239f4..527178a 100644
          // Create DXGI Factory.
          UINT dxgiFactoryFlags = 0;
  
-@@ -4192,7 +4200,9 @@ namespace plume {
+@@ -4192,7 +4234,9 @@ namespace plume {
          }
  #   endif
  
@@ -54,7 +109,7 @@ index 8c239f4..527178a 100644
          if (FAILED(res)) {
              fprintf(stderr, "CreateDXGIFactory2 failed with error code 0x%lX.\n", res);
              return;
-@@ -4223,6 +4233,7 @@ namespace plume {
+@@ -4223,6 +4267,7 @@ namespace plume {
  
              adapterOption->Release();
          }
@@ -62,3 +117,180 @@ index 8c239f4..527178a 100644
      }
  
      D3D12Interface::~D3D12Interface() {
+diff --git a/plume_d3d12.h b/plume_d3d12.h
+index 4827452..5628e36 100644
+--- a/plume_d3d12.h
++++ b/plume_d3d12.h
+@@ -111,6 +111,7 @@ namespace plume {
+         uint32_t refreshRate = 0;
+         bool vsyncEnabled = true;
+         UINT swapChainFlags = 0;
++        RenderSwapChainColorSpace colorSpace = RenderSwapChainColorSpace::SRGB_NONLINEAR;
+ 
+         D3D12SwapChain(D3D12CommandQueue *commandQueue, const RenderSwapChainDesc &desc);
+         ~D3D12SwapChain() override;
+@@ -128,6 +129,8 @@ namespace plume {
+         RenderWindow getWindow() const override;
+         bool isEmpty() const override;
+         uint32_t getRefreshRate() const override;
++        RenderSwapChainColorSpace getColorSpace() const override;
++        void applyColorSpace();
+         void getWindowSize(uint32_t &dstWidth, uint32_t &dstHeight) const;
+         void setTextures();
+     };
+diff --git a/plume_metal.cpp b/plume_metal.cpp
+index a5f30a3..08da721 100644
+--- a/plume_metal.cpp
++++ b/plume_metal.cpp
+@@ -2087,6 +2087,10 @@ namespace plume {
+         return layer == nullptr || width == 0 || height == 0;
+     }
+ 
++    RenderSwapChainColorSpace MetalSwapChain::getColorSpace() const {
++        return RenderSwapChainColorSpace::SRGB_NONLINEAR;
++    }
++
+     uint32_t MetalSwapChain::getRefreshRate() const {
+         return windowWrapper->getRefreshRate();
+     }
+diff --git a/plume_metal.h b/plume_metal.h
+index 8de188d..76e4e71 100644
+--- a/plume_metal.h
++++ b/plume_metal.h
+@@ -266,6 +266,7 @@ namespace plume {
+         RenderWindow getWindow() const override;
+         bool isEmpty() const override;
+         uint32_t getRefreshRate() const override;
++        RenderSwapChainColorSpace getColorSpace() const override;
+         void getWindowSize(uint32_t &dstWidth, uint32_t &dstHeight) const;
+     };
+ 
+diff --git a/plume_render_interface.h b/plume_render_interface.h
+index 2048557..ff368af 100644
+--- a/plume_render_interface.h
++++ b/plume_render_interface.h
+@@ -103,6 +103,9 @@ namespace plume {
+ 
+         // Only valid if displayTiming is enabled in capabilities.
+         virtual uint32_t getRefreshRate() const = 0;
++
++        // [wcw hdr] The color space actually in use (the requested one or SRGB_NONLINEAR).
++        virtual RenderSwapChainColorSpace getColorSpace() const = 0;
+     };
+ 
+     struct RenderFramebuffer {
+diff --git a/plume_render_interface_types.h b/plume_render_interface_types.h
+index 9dcfedf..2f1332e 100644
+--- a/plume_render_interface_types.h
++++ b/plume_render_interface_types.h
+@@ -1139,11 +1139,23 @@ namespace plume {
+         bool allowOnlyBuffers = false;
+     };
+ 
++    // [wcw hdr] Color space the swap chain presents in. SCRGB_LINEAR expects a float format
++    // (R16G16B16A16_FLOAT, linear, 1.0 = 80 nits); HDR10_ST2084 expects a 10-bit PQ-encoded format.
++    enum class RenderSwapChainColorSpace {
++        SRGB_NONLINEAR,
++        SCRGB_LINEAR,
++        HDR10_ST2084
++    };
++
+     struct RenderSwapChainDesc {
+         RenderWindow renderWindow = {};
+         RenderFormat format = RenderFormat::UNKNOWN;
+         uint32_t textureCount = 0;
+ 
++        // [wcw hdr] Requested color space; falls back to SRGB_NONLINEAR when the display path doesn't
++        // support it (see RenderSwapChain::getColorSpace).
++        RenderSwapChainColorSpace colorSpace = RenderSwapChainColorSpace::SRGB_NONLINEAR;
++
+         // The capability for presentWait must be supported by the RenderDevice.
+         bool enablePresentWait = false;
+         uint32_t maxFrameLatency = 0;
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+index 2800022..8c5871c 100644
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -62,6 +62,8 @@ namespace plume {
+     };
+ 
+     static const std::unordered_set<std::string> OptionalInstanceExtensions = {
++        // [wcw hdr] Exposes the HDR (extended sRGB linear, HDR10) surface color spaces.
++        VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME,
+ #   if defined(__APPLE__)
+         // Tells the system Vulkan loader to enumerate portability drivers, if supported.
+         VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME,
+@@ -2200,7 +2202,6 @@ namespace plume {
+         for (uint32_t i = 0; i < surfaceFormatCount; i++) {
+             if (surfaceFormats[i].format == requestedFormat) {
+                 compatibleSurfaceFormats.emplace_back(surfaceFormats[i]);
+-                break;
+             }
+         }
+ 
+@@ -2209,8 +2210,34 @@ namespace plume {
+             return;
+         }
+ 
++        // [wcw hdr] Prefer the requested HDR color space (listed only with VK_EXT_swapchain_colorspace).
++        VkColorSpaceKHR requestedColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
++        if (desc.colorSpace == RenderSwapChainColorSpace::SCRGB_LINEAR) {
++            requestedColorSpace = VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT;
++        }
++        else if (desc.colorSpace == RenderSwapChainColorSpace::HDR10_ST2084) {
++            requestedColorSpace = VK_COLOR_SPACE_HDR10_ST2084_EXT;
++        }
++
++        colorSpace = RenderSwapChainColorSpace::SRGB_NONLINEAR;
++        for (const VkSurfaceFormatKHR &surfaceFormat : compatibleSurfaceFormats) {
++            if (surfaceFormat.colorSpace == requestedColorSpace) {
++                pickedSurfaceFormat = surfaceFormat;
++                colorSpace = desc.colorSpace;
++                break;
++            }
++        }
++
++        if ((pickedSurfaceFormat.format == VK_FORMAT_UNDEFINED) && (desc.colorSpace != RenderSwapChainColorSpace::SRGB_NONLINEAR)) {
++            fprintf(stderr, "[plume] Swap chain color space %d is not supported by the surface; presenting as sRGB.\n", int(desc.colorSpace));
++        }
++
+         // Pick the preferred color space, if not available, pick whatever first shows up on the list.
+         for (const VkSurfaceFormatKHR &surfaceFormat : compatibleSurfaceFormats) {
++            if (pickedSurfaceFormat.format != VK_FORMAT_UNDEFINED) {
++                break;
++            }
++
+             if (surfaceFormat.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+                 pickedSurfaceFormat = surfaceFormat;
+                 break;
+@@ -2440,6 +2467,10 @@ namespace plume {
+         return (vk == VK_NULL_HANDLE) || (width == 0) || (height == 0);
+     }
+ 
++    RenderSwapChainColorSpace VulkanSwapChain::getColorSpace() const {
++        return colorSpace;
++    }
++
+     uint32_t VulkanSwapChain::getRefreshRate() const {
+         VkRefreshCycleDurationGOOGLE refreshCycle = {};
+         VkResult res = vkGetRefreshCycleDurationGOOGLE(commandQueue->device->vk, vk, &refreshCycle);
+diff --git a/plume_vulkan.h b/plume_vulkan.h
+index 0a1edbe..91800bb 100644
+--- a/plume_vulkan.h
++++ b/plume_vulkan.h
+@@ -234,6 +234,7 @@ namespace plume {
+         uint32_t height = 0;
+         VkSwapchainCreateInfoKHR createInfo = {};
+         VkSurfaceFormatKHR pickedSurfaceFormat = {};
++        RenderSwapChainColorSpace colorSpace = RenderSwapChainColorSpace::SRGB_NONLINEAR;
+         VkPresentModeKHR createdPresentMode = VK_PRESENT_MODE_FIFO_KHR;
+         VkPresentModeKHR requiredPresentMode = VK_PRESENT_MODE_FIFO_KHR;
+         VkCompositeAlphaFlagBitsKHR pickedAlphaFlag = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+@@ -258,6 +259,7 @@ namespace plume {
+         RenderWindow getWindow() const override;
+         bool isEmpty() const override;
+         uint32_t getRefreshRate() const override;
++        RenderSwapChainColorSpace getColorSpace() const override;
+         void getWindowSize(uint32_t &dstWidth, uint32_t &dstHeight) const;
+         void releaseSwapChain();
+         void releaseImageViews();
