@@ -115,7 +115,9 @@ jobs:
           Copy-Item cmake-build/WCWRecompiled.exe package/
           Copy-Item -Recurse cmake-build/assets package/assets
           Copy-Item cmake-build/recompcontrollerdb.txt package/
-          Copy-Item cmake-build/SDL2.dll, cmake-build/dxil.dll, cmake-build/dxcompiler.dll package/
+          Copy-Item cmake-build/SDL2.dll, cmake-build/dxil.dll, cmake-build/dxcompiler.dll, cmake-build/librashader.dll package/
+          # CRT filter presets/shaders (+ crt/NOTICE.md, the third-party licenses)
+          Copy-Item -Recurse cmake-build/crt package/crt
           Copy-Item COPYING package/
           Copy-Item .github/release-readme.txt package/README.txt
           # App-local VC++ runtime: the exe and the dxc DLLs import MSVCP140/VCRUNTIME140/
