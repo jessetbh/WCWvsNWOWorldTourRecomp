@@ -28,10 +28,12 @@ extern "C" void recomp_exit(uint8_t* rdram, recomp_context* ctx) {
     ultramodern::quit();
 }
 
-// Aspect ratio the game should build its 3D projection with (widescreen patch,
-// patches/widescreen.c). Same semantics as BMHero's: Original → the game's own ratio
-// unchanged; Expand → the window's ratio, never below the original (RT64's Expand
-// aspect mode then gives full-width perspective projections the wide viewport).
+// Aspect ratio a patch could build its 3D projection with. Same semantics as BMHero's:
+// Original → the game's own ratio unchanged; Expand → the window's ratio, never below the
+// original. WCW itself no longer uses it: RT64's Expand mode already widens the camera's
+// full-width perspective projection (and stretches its viewport), so a game-side widening
+// on top doubled it (issue #2: geometry squeezed by 4/3 / aspect, 0.57x at 21:9). Kept for
+// mods (syms.ld 0x8F000084).
 extern "C" void recomp_get_target_aspect_ratio(uint8_t* rdram, recomp_context* ctx) {
     float original = _arg<0, float>(rdram, ctx);
     const ultramodern::renderer::GraphicsConfig& config = ultramodern::renderer::get_graphics_config();

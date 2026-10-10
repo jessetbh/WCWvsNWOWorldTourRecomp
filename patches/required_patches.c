@@ -13,5 +13,6 @@
  *
  * (The two pipeline-verification patches that used to live here — func_80000644 and
  * func_80013BF0/sqrtf, each with a one-shot stdout marker — were removed once the
- * first real patch landed: patches/widescreen.c, verified in-game 2026-07-05.)
+ * first real patch landed: patches/widescreen.c, verified in-game 2026-07-05; removed 2026-10-10 because
+ * RT64's Expand mode widens the projection itself — issue #2.)
  */
