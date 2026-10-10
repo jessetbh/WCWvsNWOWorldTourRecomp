@@ -426,6 +426,12 @@ int main(int argc, char** argv) {
     // Set before anything that resolves the app folder (logging below, config path later).
     recompui::programconfig::set_program_name("WCW vs. nWo World Tour: Recompiled");
     recompui::programconfig::set_program_id(u8"WCWRecompiled");
+    // [wcw hfr] 60fps frame interpolation: the camera multiply is inline per object, so RT64 derives object matrices itself; buffers are cleared a frame early.
+    recompui::programconfig::FrameInterpolation frame_interpolation{};
+    frame_interpolation.smooth_rate = 60;
+    frame_interpolation.hookless_objects = true;
+    frame_interpolation.prime_generated_frames = true;
+    recompui::programconfig::set_frame_interpolation(frame_interpolation);
 
 #ifdef _WIN32
     wcw_setup_logging(show_console);
