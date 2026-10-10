@@ -67,6 +67,10 @@ static WcwGfx* wcw_rt_emit_camera(WcwGfx* gfx) {
         }
     }
 
+    // Mods rebuild the camera matrix after func_800016F8 (AkiMods' camera), so the view is
+    // derived from it on the host (src/game/recomp_api.cpp): view = D_80042C80 x P^-1.
+    recomp_wcw_rt_camera_view(view, proj);
+
     gfx[0].w0 = WCW_RT64_HOOK_MAGIC;
     gfx[0].w1 = (WCW_RT64_HOOK_OP_ENABLE << 28) | WCW_RT64_EXTENDED_OPCODE;
     gfx[1].w0 = (WCW_RT64_EXTENDED_OPCODE << 24) | WCW_G_EX_SETVIEWMATRIXFLOAT_V1;
