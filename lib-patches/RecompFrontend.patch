@@ -1,3 +1,22 @@
+diff --git a/recompinput/include/recompinput/input_state.h b/recompinput/include/recompinput/input_state.h
+index 1961e29..e7a76a3 100644
+--- a/recompinput/include/recompinput/input_state.h
++++ b/recompinput/include/recompinput/input_state.h
+@@ -40,6 +40,14 @@ namespace recompinput {
+     void get_right_analog(int controller_num, float* x, float* y);
+     void apply_joystick_deadzone(float x_in, float y_in, float* x_out, float* y_out);
+     void set_right_analog_suppressed(bool suppressed);
++    // [wcw freecam] For mods that take over the keyboard and mouse (AkiMods camera):
++    // keyboard bindings stop reaching the game; the cursor is locked to the window (relative
++    // mouse) while game input is enabled; raw mouse motion and wheel, unscaled and only while
++    // game input is enabled, are accumulated until taken.
++    void set_keyboard_suppressed(bool suppressed);
++    void set_mouse_capture_requested(bool requested);
++    bool mouse_capture_requested();
++    void take_raw_mouse_motion(float* delta_x, float* delta_y, int32_t* wheel);
+     bool game_input_disabled();
+     bool all_input_disabled();
+     ControllerState &get_controller_state(SDL_JoystickID joystick_id);
 diff --git a/recompinput/include/recompinput/players.h b/recompinput/include/recompinput/players.h
 index 6c59b61..cad2b5e 100644
 --- a/recompinput/include/recompinput/players.h
@@ -20,7 +39,7 @@ index 6c59b61..cad2b5e 100644
  
      namespace playerassignment {
 diff --git a/recompinput/src/input_events.cpp b/recompinput/src/input_events.cpp
-index c76a1dc..39febba 100644
+index c76a1dc..71ff174 100644
 --- a/recompinput/src/input_events.cpp
 +++ b/recompinput/src/input_events.cpp
 @@ -2,6 +2,7 @@
@@ -52,6 +71,95 @@ index c76a1dc..39febba 100644
          recompinput::remove_controller_state(controller_event->which);
      }
      break;
+@@ -256,7 +265,8 @@ void handle_events() {
+         bool has_mouse_sensitivity = recompui::config::general::has_mouse_sensitivity_option();
+ 
+         // Lock the cursor if all three conditions are true: mouse aiming is enabled, game input is not disabled, and the game has been started. 
+-        bool cursor_locked = (has_mouse_sensitivity && recompui::config::general::get_mouse_sensitivity() != 0) && !recompinput::game_input_disabled() && ultramodern::is_game_started();
++        // [wcw freecam] A mod can also ask for the cursor lock (mouse-driven camera).
++        bool cursor_locked = ((has_mouse_sensitivity && recompui::config::general::get_mouse_sensitivity() != 0) || recompinput::mouse_capture_requested()) && !recompinput::game_input_disabled() && ultramodern::is_game_started();
+ 
+         // Hide the cursor based on its enable state, but override visibility to false if the cursor is locked.
+         bool cursor_visible = recompui::get_cursor_visible();
+diff --git a/recompinput/src/input_state.cpp b/recompinput/src/input_state.cpp
+index 03ed871..3948a52 100644
+--- a/recompinput/src/input_state.cpp
++++ b/recompinput/src/input_state.cpp
+@@ -159,6 +159,11 @@ bool controller_button_state(int controller_num, int32_t input_id) {
+ }
+ 
+ static std::atomic_bool right_analog_suppressed = false;
++// [wcw freecam]
++static std::atomic_bool keyboard_suppressed = false;
++static std::atomic_bool mouse_capture = false;
++static float raw_mouse_delta[2] = { 0.0f, 0.0f };
++static int32_t raw_mouse_wheel = 0;
+ 
+ float controller_axis_state(int controller_num, int32_t input_id, bool allow_suppression) {
+     if (abs(input_id) - 1 < SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_MAX) {
+@@ -218,6 +223,9 @@ bool recompinput::should_override_keystate(SDL_Scancode key, SDL_Keymod mod) {
+ float recompinput::get_input_analog(int controller_num, const InputField& field) {
+     switch (field.input_type) {
+     case InputType::Keyboard:
++        if (keyboard_suppressed.load()) {
++            return 0.0f;
++        }
+         if (InputState.keys && field.input_id >= 0 && field.input_id < InputState.numkeys) {
+             if (should_override_keystate(static_cast<SDL_Scancode>(field.input_id), InputState.keymod)) {
+                 return 0.0f;
+@@ -248,6 +256,9 @@ float recompinput::get_input_analog(int controller_num, const std::span<const In
+ bool recompinput::get_input_digital(int controller_num, const InputField& field) {
+     switch (field.input_type) {
+     case InputType::Keyboard:
++        if (keyboard_suppressed.load()) {
++            return false;
++        }
+         if (InputState.keys && field.input_id >= 0 && field.input_id < InputState.numkeys) {
+             if (should_override_keystate(static_cast<SDL_Scancode>(field.input_id), InputState.keymod)) {
+                 return false;
+@@ -358,6 +369,28 @@ void recompinput::get_right_analog(int controller_num, float* x, float* y) {
+     apply_joystick_deadzone(x_val, y_val, x, y);
+ }
+ 
++void recompinput::set_keyboard_suppressed(bool suppressed) {
++    keyboard_suppressed.store(suppressed);
++}
++
++void recompinput::set_mouse_capture_requested(bool requested) {
++    mouse_capture.store(requested);
++}
++
++bool recompinput::mouse_capture_requested() {
++    return mouse_capture.load();
++}
++
++void recompinput::take_raw_mouse_motion(float* delta_x, float* delta_y, int32_t* wheel) {
++    std::lock_guard lock{ InputState.pending_input_mutex };
++    *delta_x = raw_mouse_delta[0];
++    *delta_y = raw_mouse_delta[1];
++    *wheel = raw_mouse_wheel;
++    raw_mouse_delta[0] = 0.0f;
++    raw_mouse_delta[1] = 0.0f;
++    raw_mouse_wheel = 0;
++}
++
+ void recompinput::set_right_analog_suppressed(bool suppressed) {
+     right_analog_suppressed.store(suppressed);
+ }
+@@ -410,7 +443,13 @@ void recompinput::add_mouse_deltas(float delta_x, float delta_y) {
+     std::lock_guard lock{ InputState.pending_input_mutex };
+     InputState.pending_mouse_delta[0] += delta_x;
+     InputState.pending_mouse_delta[1] += delta_y;
++    raw_mouse_delta[0] += delta_x;
++    raw_mouse_delta[1] += delta_y;
+ }
+ void recompinput::add_mouse_wheel_delta(int32_t delta) {
+     InputState.mouse_wheel_pos.fetch_add(delta);
++    if (!recompinput::game_input_disabled()) {
++        std::lock_guard lock{ InputState.pending_input_mutex };
++        raw_mouse_wheel += delta;
++    }
+ }
 diff --git a/recompinput/src/players.cpp b/recompinput/src/players.cpp
 index 08cb3f3..45cfcf0 100644
 --- a/recompinput/src/players.cpp
