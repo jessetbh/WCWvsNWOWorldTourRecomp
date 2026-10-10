@@ -22,6 +22,9 @@ void recomp_puts(const char* data, u32 size);
 // Returns the aspect ratio to render 3D at: `original` when the user's Aspect Ratio
 // setting is Original, else the window's ratio (never below `original`).
 f32 recomp_get_target_aspect_ratio(f32 original);
+// Overwrites the 4x4 float `view` with the camera matrix (D_80042C80) x inverse(`proj`),
+// so view x proj matches the matrix the game draws with even when a mod rebuilt it.
+void recomp_wcw_rt_camera_view(f32* view, const f32* proj);
 
 // Project-wide patch declarations for WCW vs. nWo World Tour: Recompiled.
 // Add shared extern declarations for game functions/data you patch here.

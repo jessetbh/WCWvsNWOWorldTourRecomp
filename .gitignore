@@ -75,6 +75,7 @@ Thumbs.db
 
 # Agent instructions + planning docs — local-only, never publish
 CLAUDE.md
+AGENTS.md
 docs/*-plan.md
 
 # Claude Code local (per-machine) settings
@@ -97,3 +98,8 @@ local-config.cmake
 /controls.json*
 /mods.json*
 /sound.json*
+
+# Diagnostic run output (stderr/stdout captures, WCW_*_LOG csv dumps)
+*.err.log
+*.out.log
+wcw_*_log.csv

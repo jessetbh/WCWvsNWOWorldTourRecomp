@@ -170,7 +170,11 @@ python tools\gen_symbols.py --overlays --data                    # -> WCWSyms/*.
 
 `tools\recompile.ps1` wraps gen_symbols + N64Recomp for the fast loop
 (`tools\env.ps1` provides its MinGW/python environment; see the env-var overrides
-at the top of that script for machine-specific paths).
+at the top of that script for machine-specific paths). After recompiling, run
+`python tools\fix_jraddend.py`: it repairs jump tables whose index N64Recomp
+const-folded to 0 (loop-induction-pointer-indexed tables collapse to case 0; ported
+from No Mercy, where it made championship wins record as losses). The current output
+has no such sites, so it guards future regenerations.
 
 ## 9. Changing anything under `lib/`
 
