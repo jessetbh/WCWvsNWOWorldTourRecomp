@@ -98,3 +98,8 @@ local-config.cmake
 /controls.json*
 /mods.json*
 /sound.json*
+
+# Diagnostic run output (stderr/stdout captures, WCW_*_LOG csv dumps)
+*.err.log
+*.out.log
+wcw_*_log.csv
