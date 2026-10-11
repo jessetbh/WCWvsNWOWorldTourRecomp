@@ -243,10 +243,10 @@ index f555048..a9de81e 100644
      }
 diff --git a/src/common/rt64_wcw_logic.cpp b/src/common/rt64_wcw_logic.cpp
 new file mode 100644
-index 0000000..e07cef4
+index 0000000..9a31da9
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.cpp
-@@ -0,0 +1,256 @@
+@@ -0,0 +1,307 @@
 +//
 +// RT64
 +//
@@ -261,15 +261,18 @@ index 0000000..e07cef4
 +        return (frameCounter >= builtFrame) && ((frameCounter - builtFrame) <= ShadowCasterStaleFrames);
 +    }
 +
-+    AoSettings aoSettings(uint32_t level, uint32_t quality) {
++    AoSettings aoLookSettings(AoLevel level, uint32_t samples) {
 +        AoSettings settings;
-+        const uint32_t baseSamples = (quality == 0) ? 1u : 2u;
-+        switch (AoLevel(std::min(level, uint32_t(AoLevel::Strong)))) {
++        if (samples == 0) {
++            return settings;
++        }
++
++        switch (level) {
 +        // Radii are in AKI world units (a ring is several hundred across, a wrestler about 150 tall). Wrestlers
 +        // are mostly convex, so their occlusion lives in creases and contacts: the gain brings those out, and
 +        // a shorter character radius keeps a limb from darkening the whole torso next to it.
 +        case AoLevel::Subtle:
-+            settings.samples = baseSamples;
++            settings.samples = samples;
 +            settings.strength = 0.45f;
 +            settings.characterStrength = 0.4f;
 +            settings.radius = 45.0f;
@@ -278,7 +281,7 @@ index 0000000..e07cef4
 +            settings.characterGain = 1.5f;
 +            break;
 +        case AoLevel::Strong:
-+            settings.samples = baseSamples * 2;
++            settings.samples = samples;
 +            settings.strength = 0.6f;
 +            settings.characterStrength = 0.6f;
 +            settings.radius = 60.0f;
@@ -292,6 +295,54 @@ index 0000000..e07cef4
 +        }
 +
 +        return settings;
++    }
++
++    RtPreset rtPreset(uint32_t quality) {
++        RtPreset preset;
++        switch (RtQuality(std::min(quality, uint32_t(RtQuality::Ultra)))) {
++        case RtQuality::Performance:
++            preset.scale = 0.5f;
++            preset.maxLines = 720.0f;
++            preset.samplesPerLight = 1;
++            break;
++        case RtQuality::Balanced:
++            preset.scale = 0.5f;
++            preset.maxLines = 1080.0f;
++            preset.samplesPerLight = 2;
++            preset.ao = AoLevel::Subtle;
++            preset.aoSamples = 2;
++            break;
++        case RtQuality::Quality:
++            // The full look: Strong AO. With 4 rays and the separate AO cleanup it reads clean (before that cleanup,
++            // Strong mottled the mat next to the wrestlers).
++            preset.samplesPerLight = 2;
++            preset.ao = AoLevel::Strong;
++            preset.aoSamples = 4;
++            break;
++        case RtQuality::Ultra:
++        default:
++            // Quality's look, cleaner: twice its shadow rays and AO rays.
++            preset.samplesPerLight = 4;
++            preset.ao = AoLevel::Strong;
++            preset.aoSamples = 8;
++            break;
++        }
++
++        return preset;
++    }
++
++    float rtTraceScale(const RtPreset &preset, uint32_t targetHeight) {
++        float scale = preset.scale;
++        if ((preset.maxLines > 0.0f) && (targetHeight > 0)) {
++            scale = std::min(scale, preset.maxLines / float(targetHeight));
++        }
++
++        return scale;
++    }
++
++    AoSettings aoSettings(uint32_t quality) {
++        const RtPreset preset = rtPreset(quality);
++        return aoLookSettings(preset.ao, preset.aoSamples);
 +    }
 +
 +    bool aoCycleOn(uint64_t unixMs, uint64_t periodMs) {
@@ -505,10 +556,10 @@ index 0000000..e07cef4
 +};
 diff --git a/src/common/rt64_wcw_logic.h b/src/common/rt64_wcw_logic.h
 new file mode 100644
-index 0000000..c8410bb
+index 0000000..1a4a251
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.h
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,201 @@
 +//
 +// RT64
 +//
@@ -535,9 +586,20 @@ index 0000000..c8410bb
 +    // Whether a scene last built on game frame builtFrame still casts shadows on game frame frameCounter.
 +    bool shadowCasterFresh(uint64_t frameCounter, uint64_t builtFrame);
 +
++    // Ray tracing quality presets
++
++    // The menu's Ray Tracing Quality levels.
++    enum class RtQuality : uint32_t {
++        Performance = 0,
++        Balanced = 1,
++        Quality = 2,
++        Ultra = 3
++    };
++
 +    // Ray-traced ambient occlusion
 +
-+    // The menu's Ambient Occlusion levels.
++    // The AO looks. There is no AO menu: each quality level picks one (RtPreset::ao): none on Performance, Subtle on
++    // Balanced, Strong on Quality and Ultra.
 +    enum class AoLevel : uint32_t {
 +        Off = 0,
 +        Subtle = 1,
@@ -562,9 +624,32 @@ index 0000000..c8410bb
 +    // screen recording can be labelled from its own start time. Even periods are on.
 +    bool aoCycleOn(uint64_t unixMs, uint64_t periodMs);
 +
-+    // The AO parameters for a menu level at a ray tracing quality (0 Performance, 1 Balanced, 2 Quality). Higher
-+    // quality only adds samples; the look (strengths, radii) depends on the level alone.
-+    AoSettings aoSettings(uint32_t level, uint32_t quality);
++    // The AO parameters for a look with this many rays per pixel per frame. The look (strengths, radii, gains)
++    // depends on the level alone; Off traces no rays whatever the count.
++    AoSettings aoLookSettings(AoLevel level, uint32_t samples);
++
++    // What a Ray Tracing Quality level traces. Performance and Balanced trace at reduced resolution (soft,
++    // temporally resolved shadows don't need every pixel), capped at maxLines so 4K targets don't multiply the
++    // rays; Quality and Ultra trace every pixel. Higher levels add rays, and the AO look comes with the level.
++    struct RtPreset {
++        // Trace resolution relative to the color target, before the line cap.
++        float scale = 1.0f;
++        // Cap on the trace height in lines (0 = none).
++        float maxLines = 0.0f;
++        // Jittered shadow rays per light per pixel per frame (the key light gets more by its weight).
++        uint32_t samplesPerLight = 1;
++        AoLevel ao = AoLevel::Off;
++        uint32_t aoSamples = 0;
++    };
++
++    // The preset for a quality level; levels past Ultra clamp to Ultra.
++    RtPreset rtPreset(uint32_t quality);
++
++    // The trace resolution relative to a color target targetHeight lines tall.
++    float rtTraceScale(const RtPreset &preset, uint32_t targetHeight);
++
++    // The AO parameters for a quality level.
++    AoSettings aoSettings(uint32_t quality);
 +
 +    // The resolve pass's cleanup of the traced shadow and AO terms, which it filters and accumulates separately.
 +    // Shadows have real edges (a wrestler's outline on the mat), so they get a tight spatial filter and react
@@ -18102,10 +18187,10 @@ index 8a3782a..0789a75 100644
 \ No newline at end of file
 diff --git a/src/render/rt64_wcw_raytracer.cpp b/src/render/rt64_wcw_raytracer.cpp
 new file mode 100644
-index 0000000..ca0bb37
+index 0000000..4cbf951
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.cpp
-@@ -0,0 +1,1194 @@
+@@ -0,0 +1,1187 @@
 +//
 +// RT64
 +//
@@ -18151,12 +18236,10 @@ index 0000000..ca0bb37
 +
 +    static std::atomic<bool> wcwRtUserEnabled = false;
 +    static std::atomic<uint32_t> wcwRtUserQuality = 1;
-+    static std::atomic<uint32_t> wcwRtUserAo = uint32_t(WcwLogic::AoLevel::Subtle);
 +
-+    void WcwRaytracer::setUserSettings(bool enabled, uint32_t quality, uint32_t aoLevel) {
++    void WcwRaytracer::setUserSettings(bool enabled, uint32_t quality) {
 +        wcwRtUserEnabled = enabled;
-+        wcwRtUserQuality = std::min(quality, 2u);
-+        wcwRtUserAo = std::min(aoLevel, uint32_t(WcwLogic::AoLevel::Strong));
++        wcwRtUserQuality = std::min(quality, uint32_t(WcwLogic::RtQuality::Ultra));
 +    }
 +
 +    bool WcwRaytracer::active() {
@@ -18904,17 +18987,12 @@ index 0000000..ca0bb37
 +        // Output texture at the color target's resolution.
 +        // Quality preset (or env overrides) for this frame.
 +        const uint32_t quality = userQuality();
-+        // Soft, temporally resolved shadows don't need the full internal resolution: the presets
-+        // also cap the trace height (Performance 720 lines, Balanced 1080), so 4K+ targets don't
-+        // multiply the ray count. WCW_RT_MAX_LINES overrides the cap, WCW_RT_SCALE the whole scale.
-+        const float presetLines = envFloat(getenv("WCW_RT_MAX_LINES"), (quality == 0) ? 720.0f : ((quality == 1) ? 1080.0f : 0.0f));
-+        float presetScale = (quality >= 2) ? 1.0f : 0.5f;
-+        if ((presetLines > 0.0f) && (colorTarget->height > 0)) {
-+            presetScale = std::min(presetScale, presetLines / float(colorTarget->height));
-+        }
-+
-+        const float frameScale = std::clamp(envFloat(getenv("WCW_RT_SCALE"), presetScale), 0.1f, 1.0f);
-+        const uint32_t presetSamples = (quality == 0) ? 1u : 2u;
++        // The level's trace resolution and ray counts (WcwLogic::rtPreset). WCW_RT_MAX_LINES overrides the line cap,
++        // WCW_RT_SCALE the whole scale.
++        WcwLogic::RtPreset qualityPreset = WcwLogic::rtPreset(quality);
++        qualityPreset.maxLines = envFloat(getenv("WCW_RT_MAX_LINES"), qualityPreset.maxLines);
++        const float frameScale = std::clamp(envFloat(getenv("WCW_RT_SCALE"), WcwLogic::rtTraceScale(qualityPreset, colorTarget->height)), 0.1f, 1.0f);
++        const uint32_t presetSamples = qualityPreset.samplesPerLight;
 +
 +        // Re-enabled after being off: the histories are stale.
 +        if (!wasActive) {
@@ -19049,8 +19127,8 @@ index 0000000..ca0bb37
 +        params.prevViewProj = slot.prevViewProj;
 +        params.historyValid = slot.historyValid ? 1 : 0;
 +        params.samplesPerLight = std::max(uint32_t(envFloat(getenv("WCW_RT_SAMPLES"), float(presetSamples))), 1u);
-+        // Ambient occlusion: the menu level's settings (WcwLogic::aoSettings), each overridable from the environment.
-+        const WcwLogic::AoSettings ao = WcwLogic::aoSettings(wcwRtUserAo.load(), quality);
++        // Ambient occlusion: the quality level's look and rays (WcwLogic::aoSettings), each overridable from the environment.
++        const WcwLogic::AoSettings ao = WcwLogic::aoSettings(quality);
 +        params.aoSamples = uint32_t(envFloat(getenv("WCW_RT_AO_SAMPLES"), float(ao.samples)));
 +        params.aoRadius = envFloat(getenv("WCW_RT_AO_RADIUS"), ao.radius);
 +        params.aoStrength = envFloat(getenv("WCW_RT_AO"), ao.strength);
@@ -19302,7 +19380,7 @@ index 0000000..ca0bb37
 +};
 diff --git a/src/render/rt64_wcw_raytracer.h b/src/render/rt64_wcw_raytracer.h
 new file mode 100644
-index 0000000..e919a62
+index 0000000..40d0b0b
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.h
 @@ -0,0 +1,289 @@
@@ -19553,11 +19631,11 @@ index 0000000..e919a62
 +        void finishPresent();
 +        const LightPreset &activePreset() const;
 +
-+        // Runtime settings from the frontend's graphics menu. Quality: 0 Performance (half-res,
-+        // 1 sample per light, 1 AO ray), 1 Balanced (half-res, 2/2), 2 Quality (full-res, 2/2).
-+        // WCW_RT forces it on; WCW_RT_SCALE / WCW_RT_SAMPLES / WCW_RT_AO_SAMPLES override quality.
-+        // aoLevel: the Ambient Occlusion option (WcwLogic::AoLevel: 0 Off, 1 Subtle, 2 Strong).
-+        static void setUserSettings(bool enabled, uint32_t quality, uint32_t aoLevel = 1);
++        // Runtime settings from the frontend's graphics menu. Quality (WcwLogic::RtQuality / rtPreset): 0 Performance
++        // (reduced resolution, 1 shadow ray per light, no AO), 1 Balanced (reduced resolution, 2, Subtle AO), 2 Quality
++        // (full resolution, 2, Subtle AO), 3 Ultra (full resolution, 4, Strong AO with 8 rays). WCW_RT forces it on;
++        // WCW_RT_SCALE / WCW_RT_SAMPLES / WCW_RT_AO_SAMPLES and the WCW_RT_AO* look overrides override the level.
++        static void setUserSettings(bool enabled, uint32_t quality);
 +        // True when ray tracing should run this frame (WCW_RT or the menu option). The camera
 +        // hand-off in rt64_rsp.cpp follows it, so Off keeps the original rendering.
 +        static bool active();
@@ -20557,10 +20635,10 @@ index 0000000..36670ff
 +#endif
 diff --git a/tests/wcw/rt64_wcw_logic_tests.cpp b/tests/wcw/rt64_wcw_logic_tests.cpp
 new file mode 100644
-index 0000000..2edab68
+index 0000000..3b89512
 --- /dev/null
 +++ b/tests/wcw/rt64_wcw_logic_tests.cpp
-@@ -0,0 +1,440 @@
+@@ -0,0 +1,484 @@
 +//
 +// RT64
 +//
@@ -20603,31 +20681,43 @@ index 0000000..2edab68
 +// Ray-traced ambient occlusion
 +
 +TEST_CASE("ao: Off traces no occlusion rays") {
-+    for (uint32_t quality = 0; quality <= 2; quality++) {
-+        const AoSettings off = aoSettings(uint32_t(AoLevel::Off), quality);
++    for (uint32_t samples : { 0u, 2u, 8u }) {
++        const AoSettings off = aoLookSettings(AoLevel::Off, samples);
 +        CHECK_EQ(off.samples, 0u);
 +        CHECK_EQ(off.strength, 0.0f);
 +        CHECK_EQ(off.characterStrength, 0.0f);
 +    }
++
++    CHECK_EQ(aoLookSettings(AoLevel::Subtle, 0).samples, 0u);
 +}
 +
-+TEST_CASE("ao: Strong is stronger, reaches further and samples more than Subtle") {
-+    for (uint32_t quality = 0; quality <= 2; quality++) {
-+        const AoSettings subtle = aoSettings(uint32_t(AoLevel::Subtle), quality);
-+        const AoSettings strong = aoSettings(uint32_t(AoLevel::Strong), quality);
-+        CHECK(subtle.samples > 0);
-+        CHECK(strong.samples > subtle.samples);
-+        CHECK(strong.strength > subtle.strength);
-+        CHECK(strong.characterStrength > subtle.characterStrength);
-+        CHECK(strong.radius > subtle.radius);
-+        CHECK(strong.characterRadius >= subtle.characterRadius);
-+        CHECK((strong.strength <= 1.0f) && (strong.characterStrength <= 1.0f));
++TEST_CASE("ao: Strong is stronger and reaches further than Subtle") {
++    const AoSettings subtle = aoLookSettings(AoLevel::Subtle, 2);
++    const AoSettings strong = aoLookSettings(AoLevel::Strong, 2);
++    CHECK(strong.strength > subtle.strength);
++    CHECK(strong.characterStrength > subtle.characterStrength);
++    CHECK(strong.radius > subtle.radius);
++    CHECK(strong.characterRadius >= subtle.characterRadius);
++    CHECK(strong.gain > subtle.gain);
++    CHECK((strong.strength <= 1.0f) && (strong.characterStrength <= 1.0f));
++}
++
++TEST_CASE("ao: the ray count doesn't change the look") {
++    for (AoLevel level : { AoLevel::Subtle, AoLevel::Strong }) {
++        const AoSettings few = aoLookSettings(level, 1);
++        const AoSettings many = aoLookSettings(level, 8);
++        CHECK_EQ(few.samples, 1u);
++        CHECK_EQ(many.samples, 8u);
++        CHECK_EQ(few.strength, many.strength);
++        CHECK_EQ(few.radius, many.radius);
++        CHECK_EQ(few.characterRadius, many.characterRadius);
++        CHECK_EQ(few.gain, many.gain);
 +    }
 +}
 +
 +TEST_CASE("ao: wrestlers aren't halved any more (the old 0.5x left their AO invisible)") {
-+    for (uint32_t level = 1; level <= 2; level++) {
-+        const AoSettings settings = aoSettings(level, 1);
++    for (AoLevel level : { AoLevel::Subtle, AoLevel::Strong }) {
++        const AoSettings settings = aoLookSettings(level, 2);
 +        CHECK(settings.characterStrength >= 0.8f * settings.strength);
 +        CHECK(settings.characterRadius > 0.0f);
 +        CHECK(settings.characterRadius <= settings.radius);
@@ -20637,30 +20727,24 @@ index 0000000..2edab68
 +TEST_CASE("ao: reach suits the AKI world scale and contrast stays below the blotchy range") {
 +    // A 25-40 unit reach only caught surfaces that almost touch (rings are several hundred units across);
 +    // a gain of 3 turned sampling noise into dark blotches on the wrestlers.
-+    for (uint32_t level = 1; level <= 2; level++) {
-+        const AoSettings settings = aoSettings(level, 1);
++    for (AoLevel level : { AoLevel::Subtle, AoLevel::Strong }) {
++        const AoSettings settings = aoLookSettings(level, 2);
 +        CHECK(settings.radius >= 40.0f);
 +        CHECK((settings.gain >= 1.0f) && (settings.gain <= 2.5f));
 +    }
-+
-+    CHECK(aoSettings(uint32_t(AoLevel::Strong), 1).gain > aoSettings(uint32_t(AoLevel::Subtle), 1).gain);
 +}
 +
 +TEST_CASE("ao: wrestlers stay below the muddy range at the normal camera distance") {
 +    // Owner review of a CPU match: wrestler strength 0.85 with gain 2.5 and a 45-unit reach darkened whole bodies
 +    // instead of creases, and an 80-unit world reach left grime along the ring edges. Keep the AO in creases and
 +    // contacts: moderate strength and gain, short reach.
-+    for (uint32_t level = 1; level <= 2; level++) {
-+        const AoSettings settings = aoSettings(level, 1);
++    for (AoLevel level : { AoLevel::Subtle, AoLevel::Strong }) {
++        const AoSettings settings = aoLookSettings(level, 2);
 +        CHECK(settings.characterStrength <= 0.65f);
 +        CHECK(settings.characterGain <= 2.0f);
 +        CHECK(settings.characterRadius <= 35.0f);
 +        CHECK(settings.radius <= 65.0f);
 +    }
-+
-+    const AoSettings subtle = aoSettings(uint32_t(AoLevel::Subtle), 1);
-+    const AoSettings strong = aoSettings(uint32_t(AoLevel::Strong), 1);
-+    CHECK(subtle.characterGain < strong.characterGain);
 +}
 +
 +TEST_CASE("ao cycle: alternates every period on wall-clock boundaries, on first") {
@@ -20672,19 +20756,57 @@ index 0000000..2edab68
 +    CHECK(aoCycleOn(123456789, 0));
 +}
 +
-+TEST_CASE("ao: quality only changes the sample count") {
-+    for (uint32_t level = 1; level <= 2; level++) {
-+        const AoSettings performance = aoSettings(level, 0);
-+        const AoSettings quality = aoSettings(level, 2);
-+        CHECK(quality.samples >= performance.samples);
-+        CHECK_EQ(quality.strength, performance.strength);
-+        CHECK_EQ(quality.radius, performance.radius);
-+        CHECK_EQ(quality.characterRadius, performance.characterRadius);
++// Ray tracing quality presets (the AO menu was folded into them)
++
++TEST_CASE("quality: AO comes with the level (none on Performance, Subtle on Balanced, Strong on Quality and Ultra)") {
++    CHECK_EQ(aoSettings(uint32_t(RtQuality::Performance)).samples, 0u);
++    const AoSettings balanced = aoSettings(uint32_t(RtQuality::Balanced));
++    const AoSettings quality = aoSettings(uint32_t(RtQuality::Quality));
++    const AoSettings ultra = aoSettings(uint32_t(RtQuality::Ultra));
++    CHECK(balanced.samples > 0);
++    CHECK_EQ(balanced.strength, aoLookSettings(AoLevel::Subtle, 2).strength);
++    CHECK_EQ(quality.strength, aoLookSettings(AoLevel::Strong, 2).strength);
++    CHECK_EQ(ultra.strength, quality.strength);
++}
++
++TEST_CASE("quality: Strong AO always gets at least 4 rays (at 2 it mottles)") {
++    for (uint32_t q = 0; q <= uint32_t(RtQuality::Ultra); q++) {
++        if (rtPreset(q).ao == AoLevel::Strong) {
++            CHECK(rtPreset(q).aoSamples >= 4);
++        }
 +    }
 +}
 +
-+TEST_CASE("ao: out-of-range levels clamp to Strong") {
-+    CHECK_EQ(aoSettings(7, 1).samples, aoSettings(uint32_t(AoLevel::Strong), 1).samples);
++TEST_CASE("quality: each level traces at least as many rays as the one below") {
++    for (uint32_t q = 1; q <= uint32_t(RtQuality::Ultra); q++) {
++        const RtPreset lower = rtPreset(q - 1);
++        const RtPreset higher = rtPreset(q);
++        CHECK(higher.samplesPerLight >= lower.samplesPerLight);
++        CHECK(higher.aoSamples >= lower.aoSamples);
++        CHECK(rtTraceScale(higher, 2160) >= rtTraceScale(lower, 2160));
++    }
++}
++
++TEST_CASE("quality: Ultra traces every pixel with more rays than Quality") {
++    const RtPreset quality = rtPreset(uint32_t(RtQuality::Quality));
++    const RtPreset ultra = rtPreset(uint32_t(RtQuality::Ultra));
++    CHECK_EQ(rtTraceScale(ultra, 2160), 1.0f);
++    CHECK(ultra.samplesPerLight > quality.samplesPerLight);
++    CHECK(ultra.aoSamples > quality.aoSamples);
++}
++
++TEST_CASE("quality: trace resolution at 1080p and 4K") {
++    // Performance caps at 720 lines and Balanced at 1080, both at most half resolution; Quality and Ultra are full.
++    CHECK_NEAR(rtTraceScale(rtPreset(0), 1080), 0.5f, 1e-6f);
++    CHECK_NEAR(rtTraceScale(rtPreset(1), 1080), 0.5f, 1e-6f);
++    CHECK_NEAR(rtTraceScale(rtPreset(0), 2160), 720.0f / 2160.0f, 1e-6f);
++    CHECK_NEAR(rtTraceScale(rtPreset(1), 2160), 0.5f, 1e-6f);
++    CHECK_EQ(rtTraceScale(rtPreset(2), 2160), 1.0f);
++}
++
++TEST_CASE("quality: out-of-range levels clamp to Ultra") {
++    CHECK_EQ(rtPreset(9).samplesPerLight, rtPreset(uint32_t(RtQuality::Ultra)).samplesPerLight);
++    CHECK_EQ(aoSettings(9).samples, aoSettings(uint32_t(RtQuality::Ultra)).samples);
 +}
 +
 +// Resolve: separate shadow and AO cleanup
