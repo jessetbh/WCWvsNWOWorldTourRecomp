@@ -243,10 +243,10 @@ index f555048..a9de81e 100644
      }
 diff --git a/src/common/rt64_wcw_logic.cpp b/src/common/rt64_wcw_logic.cpp
 new file mode 100644
-index 0000000..9a31da9
+index 0000000..ce04c2f
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.cpp
-@@ -0,0 +1,307 @@
+@@ -0,0 +1,319 @@
 +//
 +// RT64
 +//
@@ -351,6 +351,18 @@ index 0000000..9a31da9
 +
 +    DenoiseSettings denoiseSettings() {
 +        return DenoiseSettings();
++    }
++
++    std::array<float, 3> normalizedLightColor(float r, float g, float b) {
++        r = std::max(r, 0.0f);
++        g = std::max(g, 0.0f);
++        b = std::max(b, 0.0f);
++        const float luminance = 0.2126f * r + 0.7152f * g + 0.0722f * b;
++        if (!(luminance > 1e-4f)) {
++            return { 1.0f, 1.0f, 1.0f };
++        }
++
++        return { std::min(r / luminance, MaxLightChannel), std::min(g / luminance, MaxLightChannel), std::min(b / luminance, MaxLightChannel) };
 +    }
 +
 +    std::vector<float> blueNoiseTile(uint32_t size) {
@@ -556,10 +568,10 @@ index 0000000..9a31da9
 +};
 diff --git a/src/common/rt64_wcw_logic.h b/src/common/rt64_wcw_logic.h
 new file mode 100644
-index 0000000..1a4a251
+index 0000000..2cc79fa
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.h
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,211 @@
 +//
 +// RT64
 +//
@@ -571,6 +583,7 @@ index 0000000..1a4a251
 +#include <mutex>
 +#include <unordered_map>
 +#include <vector>
++#include <array>
 +
 +// [wcw] Decision logic for frame interpolation, present pacing, the CRT beam simulator and ray-traced shadows, kept
 +// free of renderer state so it can be unit tested (tests/wcw). The renderer calls these functions; a change to any
@@ -667,6 +680,15 @@ index 0000000..1a4a251
 +    constexpr uint32_t DenoiseMaxRadius = 4;
 +
 +    DenoiseSettings denoiseSettings();
++
++    // Colored light
++
++    // A preset light's RGB scaled to unit luminance (Rec. 709 weights), so a color tints the light without changing
++    // how bright it is: white stays white, a warm [1, 0.9, 0.75] becomes slightly red-heavy at the same brightness.
++    // Channels are capped at MaxLightChannel so a saturated color can't blow out one channel; black, negative or
++    // missing colors fall back to white.
++    constexpr float MaxLightChannel = 2.0f;
++    std::array<float, 3> normalizedLightColor(float r, float g, float b);
 +
 +    // Blue noise for the ray tracer's random samples (soft shadow jitter, AO directions): a size x size tile
 +    // (size a power of two) built with void-and-cluster (Ulichney 1993) on a torus, so it tiles seamlessly.
@@ -18187,10 +18209,10 @@ index 8a3782a..0789a75 100644
 \ No newline at end of file
 diff --git a/src/render/rt64_wcw_raytracer.cpp b/src/render/rt64_wcw_raytracer.cpp
 new file mode 100644
-index 0000000..4cbf951
+index 0000000..511bfdb
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.cpp
-@@ -0,0 +1,1187 @@
+@@ -0,0 +1,1232 @@
 +//
 +// RT64
 +//
@@ -18291,6 +18313,7 @@ index 0000000..4cbf951
 +        traceBuilder.addStructuredBuffer(10);
 +        traceBuilder.addStructuredBuffer(11);
 +        traceBuilder.addStructuredBuffer(12);
++        traceBuilder.addReadWriteTexture(13);
 +        traceBuilder.end();
 +        traceSet = traceBuilder.create(device);
 +
@@ -18313,6 +18336,7 @@ index 0000000..4cbf951
 +        resolveBuilder.addTexture(2);
 +        resolveBuilder.addReadWriteTexture(3);
 +        resolveBuilder.addReadWriteTexture(4);
++        resolveBuilder.addTexture(5);
 +        resolveBuilder.end();
 +        resolveSet = resolveBuilder.create(device);
 +
@@ -18392,10 +18416,23 @@ index 0000000..4cbf951
 +        p.radius = j.value("radius", p.radius);
 +        p.clearance = j.value("clearance", p.clearance);
 +        p.falloff = j.value("falloff", p.falloff);
++        auto readColor = [&](const char *key, std::array<float, 3> fallback) {
++            if (j.contains(key) && (j[key].size() >= 3)) {
++                return std::array<float, 3>{ j[key][0].get<float>(), j[key][1].get<float>(), j[key][2].get<float>() };
++            }
++
++            return fallback;
++        };
++
++        p.color = readColor("color", p.color);
++        p.keyColor = readColor("keyColor", p.color);
++        p.fillColor = readColor("fillColor", p.color);
 +        if (j.contains("glows")) {
 +            p.glows.clear();
++            p.glowColors.clear();
 +            for (const auto &g : j["glows"]) {
 +                p.glows.push_back({ g[0].get<float>(), g[1].get<float>(), g[2].get<float>(), g[3].get<float>(), g[4].get<float>() });
++                p.glowColors.push_back((g.size() >= 8) ? std::array<float, 3>{ g[5].get<float>(), g[6].get<float>(), g[7].get<float>() } : std::array<float, 3>{ 1.0f, 1.0f, 1.0f });
 +            }
 +        }
 +        p.shadow = j.value("shadow", p.shadow);
@@ -18403,8 +18440,10 @@ index 0000000..4cbf951
 +        p.anchorScene = (j.value("anchor", std::string(p.anchorScene ? "scene" : "world")) == "scene");
 +        if (j.contains("lights")) {
 +            p.lights.clear();
++            p.lightColors.clear();
 +            for (const auto &l : j["lights"]) {
 +                p.lights.push_back({ l[0].get<float>(), l[1].get<float>(), l[2].get<float>(), (l.size() > 3) ? l[3].get<float>() : 1.0f });
++                p.lightColors.push_back((l.size() >= 7) ? std::array<float, 3>{ l[4].get<float>(), l[5].get<float>(), l[6].get<float>() } : p.color);
 +            }
 +        }
 +
@@ -18619,6 +18658,7 @@ index 0000000..4cbf951
 +        const float shortCenter = alongX ? (sceneMin[2] + sceneMax[2]) * 0.5f : (sceneMin[0] + sceneMax[0]) * 0.5f;
 +        const float height = sceneMin[1] + (sceneMax[1] - sceneMin[1]) * roomHeight;
 +        roomPreset.lights.clear();
++        roomPreset.lightColors.clear();
 +        for (uint32_t i = 0; i < roomCount; i++) {
 +            const float along = longMin + longLen * (float(i) + 0.5f) / float(roomCount);
 +            roomPreset.lights.push_back(alongX ? std::array<float, 4>{ along, height, shortCenter, 1.0f } : std::array<float, 4>{ shortCenter, height, along, 1.0f });
@@ -19012,6 +19052,7 @@ index 0000000..4cbf951
 +            traceHeight = std::max(uint32_t(std::ceil(outputHeight * traceScale)), 1u);
 +            outputTexture = device->createTexture(RenderTextureDesc::Texture2D(traceWidth, traceHeight, 1, RenderFormat::R16G16B16A16_FLOAT, RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS));
 +            currentTexture = device->createTexture(RenderTextureDesc::Texture2D(traceWidth, traceHeight, 1, RenderFormat::R32G32B32A32_FLOAT, RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS));
++            currentAoTexture = device->createTexture(RenderTextureDesc::Texture2D(traceWidth, traceHeight, 1, RenderFormat::R16_FLOAT, RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS));
 +        }
 +
 +        Slot &slot = slots[currentSlot];
@@ -19019,7 +19060,7 @@ index 0000000..4cbf951
 +            slot.historyWidth = traceWidth;
 +            slot.historyHeight = traceHeight;
 +            for (auto &history : slot.history) {
-+                history = device->createTexture(RenderTextureDesc::Texture2D(traceWidth, traceHeight, 1, RenderFormat::R16G16_FLOAT, RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS));
++                history = device->createTexture(RenderTextureDesc::Texture2D(traceWidth, traceHeight, 1, RenderFormat::R16G16B16A16_FLOAT, RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS));
 +            }
 +
 +            slot.output = device->createTexture(RenderTextureDesc::Texture2D(traceWidth, traceHeight, 1, RenderFormat::R16G16B16A16_FLOAT, RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS));
@@ -19091,12 +19132,30 @@ index 0000000..4cbf951
 +        params.lightClearance = std::max(preset.clearance, 0.0f);
 +        params.lightFalloff = std::max(envFloat(getenv("WCW_RT_FALLOFF"), preset.falloff), 0.0f);
 +        params.glowCount = 0;
++        // Colored light (WcwLogic::normalizedLightColor): white unless the preset says otherwise.
++        for (uint32_t c = 0; c < WCW_RT_MAX_LIGHTS; c++) {
++            params.lightColors[c] = { 1.0f, 1.0f, 1.0f, 0.0f };
++        }
++
++        for (uint32_t c = 0; c < WCW_RT_MAX_GLOWS; c++) {
++            params.glowColors[c] = { 1.0f, 1.0f, 1.0f, 0.0f };
++        }
++
++        auto setLightColor = [&](uint32_t index, const std::array<float, 3> &rgb) {
++            const std::array<float, 3> n = WcwLogic::normalizedLightColor(rgb[0], rgb[1], rgb[2]);
++            params.lightColors[index] = { n[0], n[1], n[2], 0.0f };
++        };
++
++        params.colorSplit = (envFloat(getenv("WCW_RT_COLOR_SPLIT"), 0.0f) != 0.0f) ? 1u : 0u;
 +        params.glowPadding0 = params.glowPadding1 = params.glowPadding2 = 0.0f;
 +        params.glowIntensity = { 0.0f, 0.0f, 0.0f, 0.0f };
 +        for (const auto &g : preset.glows) {
 +            if (params.glowCount < WCW_RT_MAX_GLOWS) {
 +                params.glows[params.glowCount] = { origin[0] + g[0], origin[1] + g[1], origin[2] + g[2], std::max(g[4], 1.0f) };
 +                params.glowIntensity[params.glowCount] = g[3];
++                const size_t glowIndex = size_t(&g - preset.glows.data());
++                const std::array<float, 3> glowColor = (glowIndex < preset.glowColors.size()) ? preset.glowColors[glowIndex] : std::array<float, 3>{ 1.0f, 1.0f, 1.0f };
++                params.glowColors[params.glowCount] = { std::max(glowColor[0], 0.0f), std::max(glowColor[1], 0.0f), std::max(glowColor[2], 0.0f), 0.0f };
 +                params.glowCount++;
 +            }
 +        }
@@ -19108,6 +19167,8 @@ index 0000000..4cbf951
 +
 +            for (const auto &l : preset.lights) {
 +                if (params.lightListCount < WCW_RT_MAX_LIGHTS) {
++                    const size_t lightIndex = size_t(&l - preset.lights.data());
++                    setLightColor(params.lightListCount, (lightIndex < preset.lightColors.size()) ? preset.lightColors[lightIndex] : preset.color);
 +                    params.lights[params.lightListCount++] = { origin[0] + l[0], origin[1] + l[1], origin[2] + l[2], l[3] / std::max(weightSum, 1e-6f) };
 +                }
 +            }
@@ -19117,8 +19178,10 @@ index 0000000..4cbf951
 +            const uint32_t fills = params.lightCount;
 +            const float keyWeight = (fills > 0) ? params.keyWeight : 1.0f;
 +            const float fillWeight = (fills > 0) ? (1.0f - keyWeight) / float(fills) : 0.0f;
++            setLightColor(params.lightListCount, preset.keyColor);
 +            params.lights[params.lightListCount++] = { centerX, centerY, centerZ, keyWeight };
 +            for (uint32_t f = 0; f < fills; f++) {
++                setLightColor(params.lightListCount, preset.fillColor);
 +                params.lights[params.lightListCount++] = { centerX + offsets[f][0] * params.lightSpread, centerY, centerZ + offsets[f][1] * params.lightSpread, fillWeight };
 +            }
 +        }
@@ -19216,6 +19279,7 @@ index 0000000..4cbf951
 +        traceSet->setBuffer(4, meshStartsBuffer.get(), meshStartsBufferSize, &uintView);
 +        traceSet->setTexture(5, slot.output.get(), RenderTextureLayout::GENERAL);
 +        traceSet->setTexture(6, currentTexture.get(), RenderTextureLayout::GENERAL);
++        traceSet->setTexture(13, currentAoTexture.get(), RenderTextureLayout::GENERAL);
 +        const RenderBufferStructuredView rdpTileView(sizeof(interop::RDPTile));
 +        const RenderBufferStructuredView gpuTileView(sizeof(interop::GPUTile));
 +        const RenderBufferStructuredView float2View(sizeof(float) * 2);
@@ -19231,7 +19295,8 @@ index 0000000..4cbf951
 +        // Trace.
 +        worker->commandList->barriers(RenderBarrierStage::COMPUTE, {
 +            RenderTextureBarrier(slot.output.get(), RenderTextureLayout::GENERAL),
-+            RenderTextureBarrier(currentTexture.get(), RenderTextureLayout::GENERAL)
++            RenderTextureBarrier(currentTexture.get(), RenderTextureLayout::GENERAL),
++            RenderTextureBarrier(currentAoTexture.get(), RenderTextureLayout::GENERAL)
 +        });
 +        if (timingPool != nullptr) {
 +            worker->commandList->writeTimestamp(timingPool.get(), StampTraceBegin);
@@ -19267,11 +19332,13 @@ index 0000000..4cbf951
 +            RenderTexture *historyOut = slot.history[slot.historyIndex ^ 1].get();
 +            resolveSet->setBuffer(0, paramsBuffer.get(), alignUp(sizeof(interop::WcwRtParams), 256));
 +            resolveSet->setTexture(1, currentTexture.get(), RenderTextureLayout::SHADER_READ);
++            resolveSet->setTexture(5, currentAoTexture.get(), RenderTextureLayout::SHADER_READ);
 +            resolveSet->setTexture(2, historyIn, RenderTextureLayout::SHADER_READ);
 +            resolveSet->setTexture(3, historyOut, RenderTextureLayout::GENERAL);
 +            resolveSet->setTexture(4, slot.output.get(), RenderTextureLayout::GENERAL);
 +            worker->commandList->barriers(RenderBarrierStage::COMPUTE, {
 +                RenderTextureBarrier(currentTexture.get(), RenderTextureLayout::SHADER_READ),
++                RenderTextureBarrier(currentAoTexture.get(), RenderTextureLayout::SHADER_READ),
 +                RenderTextureBarrier(historyIn, RenderTextureLayout::SHADER_READ),
 +                RenderTextureBarrier(historyOut, RenderTextureLayout::GENERAL),
 +                RenderTextureBarrier(slot.output.get(), RenderTextureLayout::GENERAL)
@@ -19380,10 +19447,10 @@ index 0000000..4cbf951
 +};
 diff --git a/src/render/rt64_wcw_raytracer.h b/src/render/rt64_wcw_raytracer.h
 new file mode 100644
-index 0000000..40d0b0b
+index 0000000..156d931
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.h
-@@ -0,0 +1,289 @@
+@@ -0,0 +1,299 @@
 +//
 +// RT64
 +//
@@ -19526,6 +19593,8 @@ index 0000000..40d0b0b
 +        std::unique_ptr<RenderBuffer> blueNoiseBuffer;
 +        std::unique_ptr<RenderTexture> outputTexture;
 +        std::unique_ptr<RenderTexture> currentTexture;
++        // The traced AO term beside currentTexture's colored shadow term and hit distance.
++        std::unique_ptr<RenderTexture> currentAoTexture;
 +        uint32_t frameIndex = 0;
 +        uint32_t reusedTraces = 0;
 +        std::unique_ptr<RenderDescriptorSet> resolveSet;
@@ -19581,12 +19650,20 @@ index 0000000..40d0b0b
 +            uint32_t fills = 4;
 +            float keyWeight = 0.5f;
 +            std::vector<std::array<float, 4>> lights;
++            // Colored light: "color" is every light's RGB by default (white); the generated rig's key and fills can
++            // differ ("keyColor", "fillColor"), and an explicit light can carry its own as [x, y, z, weight, r, g, b].
++            std::array<float, 3> color = { 1.0f, 1.0f, 1.0f };
++            std::array<float, 3> keyColor = { 1.0f, 1.0f, 1.0f };
++            std::array<float, 3> fillColor = { 1.0f, 1.0f, 1.0f };
++            std::vector<std::array<float, 3>> lightColors;
 +            float size = 20.0f;
 +            float radius = 750.0f;
 +            float clearance = 0.0f;
 +            float falloff = 0.0f;
-+            // "glows": [[x, y, z, intensity, range], ...] (offsets from the anchor like lights).
++            // "glows": [[x, y, z, intensity, range], ...] (offsets from the anchor like lights), optionally with
++            // [..., r, g, b] for a colored glow (white otherwise; not normalized, so the color scales the intensity).
 +            std::vector<std::array<float, 5>> glows;
++            std::vector<std::array<float, 3>> glowColors;
 +            // "anchor": "scene": center and explicit lights are offsets from the drawn world
 +            // geometry's center on X/Z and its floor (lowest point) on Y, so one preset fits rooms
 +            // placed anywhere in the world (backstage zones).
@@ -19760,10 +19837,10 @@ index 0000000..334836e
 +}
 diff --git a/src/shaders/WcwRtResolveCS.hlsl b/src/shaders/WcwRtResolveCS.hlsl
 new file mode 100644
-index 0000000..e017054
+index 0000000..a961cbd
 --- /dev/null
 +++ b/src/shaders/WcwRtResolveCS.hlsl
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,146 @@
 +//
 +// RT64
 +//
@@ -19777,34 +19854,44 @@ index 0000000..e017054
 +#include "shared/rt64_wcw_rt.h"
 +
 +ConstantBuffer<WcwRtParams> gParams : register(b0);
-+// (shadow factor, hit distance (0 = no hit), AO factor, unused) from the trace pass.
++// (shadow factor RGB, hit distance (0 = no hit)) and the AO factor from the trace pass.
 +Texture2D<float4> gCurrent : register(t1);
-+// (shadow, AO) history. With WCW_RT_DENOISE_SPLIT's old path, x holds the combined factor and y is 1.
-+Texture2D<float2> gHistoryIn : register(t2);
-+RWTexture2D<float2> gHistoryOut : register(u3);
++Texture2D<float> gCurrentAo : register(t5);
++// (shadow RGB, AO) history. With WCW_RT_DENOISE_SPLIT's old path, rgb holds the combined factor and a is 1.
++Texture2D<float4> gHistoryIn : register(t2);
++RWTexture2D<float4> gHistoryOut : register(u3);
 +RWTexture2D<float4> gOutput : register(u4);
 +
-+// A depth-aware tent filter's running sums for one term.
++// A depth-aware tent filter's running sums for one term (RGB for the colored shadow term, x only for AO).
 +struct FilterSums {
-+    float sum;
-+    float sqSum;
++    float3 sum;
++    float3 sqSum;
 +    float weight;
 +};
 +
-+void accumulate(inout FilterSums sums, float value, float weight) {
++void accumulate(inout FilterSums sums, float3 value, float weight) {
 +    sums.sum += value * weight;
 +    sums.sqSum += value * value * weight;
 +    sums.weight += weight;
 +}
 +
-+// Mean, and the history clip range around it: mean +- 1.25 standard deviations + 0.04. A min/max clamp of one
-+// or two noisy samples is so tight it rejects the history every frame and the term shimmers; the spread bound
-+// still drops history when the shadow or occlusion really moves (a wrestler steps away).
-+float3 meanAndRange(FilterSums sums) {
-+    const float mean = sums.sum / max(sums.weight, 1e-4f);
-+    const float variance = max(sums.sqSum / max(sums.weight, 1e-4f) - mean * mean, 0.0f);
-+    const float spread = 1.25f * sqrt(variance) + 0.04f;
-+    return float3(mean, mean - spread, mean + spread);
++// Mean, and the history clip range around it: mean +- 1.25 standard deviations + 0.04, per channel. A min/max
++// clamp of one or two noisy samples is so tight it rejects the history every frame and the term shimmers; the
++// spread bound still drops history when the shadow or occlusion really moves (a wrestler steps away).
++struct FilterStats {
++    float3 mean;
++    float3 low;
++    float3 high;
++};
++
++FilterStats meanAndRange(FilterSums sums) {
++    FilterStats stats;
++    stats.mean = sums.sum / max(sums.weight, 1e-4f);
++    const float3 variance = max(sums.sqSum / max(sums.weight, 1e-4f) - stats.mean * stats.mean, 0.0f);
++    const float3 spread = 1.25f * sqrt(variance) + 0.04f;
++    stats.low = stats.mean - spread;
++    stats.high = stats.mean + spread;
++    return stats;
 +}
 +
 +[numthreads(8, 8, 1)]
@@ -19815,8 +19902,8 @@ index 0000000..e017054
 +    }
 +
 +    const float4 current = gCurrent[pixel];
-+    if (current.y <= 0.0f) {
-+        gHistoryOut[pixel] = float2(1.0f, 1.0f);
++    if (current.w <= 0.0f) {
++        gHistoryOut[pixel] = float4(1.0f, 1.0f, 1.0f, 1.0f);
 +        gOutput[pixel] = float4(0.5f, 0.5f, 0.5f, 0.0f);
 +        return;
 +    }
@@ -19832,8 +19919,8 @@ index 0000000..e017054
 +    // this frame hold another workload's values and are skipped.
 +    const int2 rectMin = int2(gParams.traceOffset);
 +    const int2 rectMax = int2(min(gParams.traceEnd, gParams.resolution)) - 1;
-+    FilterSums shadowSums = { 0.0f, 0.0f, 0.0f };
-+    FilterSums aoSums = { 0.0f, 0.0f, 0.0f };
++    FilterSums shadowSums = { float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f), 0.0f };
++    FilterSums aoSums = { float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f), 0.0f };
 +    for (int y = -radius; y <= radius; y++) {
 +        for (int x = -radius; x <= radius; x++) {
 +            const int2 neighbor = int2(pixel) + int2(x, y);
@@ -19842,25 +19929,29 @@ index 0000000..e017054
 +            }
 +
 +            const float4 sample = gCurrent[neighbor];
-+            if (sample.y <= 0.0f) {
++            if (sample.w <= 0.0f) {
 +                continue;
 +            }
 +
-+            const float depth = exp(-abs(sample.y - current.y) / max(current.y * 0.01f, 0.5f));
++            const float sampleAo = gCurrentAo[neighbor];
++            const float depth = exp(-abs(sample.w - current.w) / max(current.w * 0.01f, 0.5f));
 +            if ((abs(x) <= shadowRadius) && (abs(y) <= shadowRadius)) {
 +                const float spatial = float(shadowRadius + 1 - abs(x)) * float(shadowRadius + 1 - abs(y));
-+                accumulate(shadowSums, combined ? (sample.x * sample.z) : sample.x, spatial * depth);
++                accumulate(shadowSums, combined ? (sample.rgb * sampleAo) : sample.rgb, spatial * depth);
 +            }
 +
 +            if ((abs(x) <= aoRadius) && (abs(y) <= aoRadius)) {
 +                const float spatial = float(aoRadius + 1 - abs(x)) * float(aoRadius + 1 - abs(y));
-+                accumulate(aoSums, sample.z, spatial * depth);
++                accumulate(aoSums, float3(sampleAo, 0.0f, 0.0f), spatial * depth);
 +            }
 +        }
 +    }
 +
-+    const float3 shadowStats = meanAndRange(shadowSums);
-+    const float3 aoStats = combined ? float3(1.0f, 1.0f, 1.0f) : meanAndRange(aoSums);
++    const FilterStats shadowStats = meanAndRange(shadowSums);
++    FilterStats aoStats = meanAndRange(aoSums);
++    if (combined) {
++        aoStats.mean = aoStats.low = aoStats.high = float3(1.0f, 1.0f, 1.0f);
++    }
 +
 +    // Same primary ray as the trace pass, so the hit distance gives the world position.
 +    const float2 local = ((float2(pixel) + 0.5f) / gParams.traceScale - gParams.viewport.xy) / gParams.viewport.zw;
@@ -19869,9 +19960,10 @@ index 0000000..e017054
 +    const float4 farPoint = mul(gParams.invViewProj, float4(ndc, 1.0f, 1.0f));
 +    const float3 rayStart = nearPoint.xyz / nearPoint.w;
 +    const float3 rayDir = normalize(farPoint.xyz / farPoint.w - rayStart);
-+    const float3 worldPos = rayStart + rayDir * current.y;
++    const float3 worldPos = rayStart + rayDir * current.w;
 +
-+    float2 result = float2(shadowStats.x, aoStats.x);
++    float3 shadowResult = shadowStats.mean;
++    float aoResult = aoStats.mean.x;
 +    if (gParams.historyValid != 0) {
 +        const float4 prevClip = mul(gParams.prevViewProj, float4(worldPos, 1.0f));
 +        if (prevClip.w > 0.0f) {
@@ -19879,28 +19971,28 @@ index 0000000..e017054
 +            const float2 prevLocal = float2(prevNdc.x * 0.5f + 0.5f, 0.5f - prevNdc.y * 0.5f);
 +            const float2 prevPixel = (gParams.viewport.xy + prevLocal * gParams.viewport.zw) * gParams.traceScale;
 +            if (all(prevPixel >= 0.0f) && all(prevPixel < float2(gParams.resolution))) {
-+                const float2 history = gHistoryIn[int2(prevPixel)];
++                const float4 history = gHistoryIn[int2(prevPixel)];
 +                const float shadowAlpha = combined ? gParams.temporalAlpha : gParams.shadowTemporalAlpha;
-+                result.x = lerp(clamp(history.x, shadowStats.y, shadowStats.z), shadowStats.x, shadowAlpha);
++                shadowResult = lerp(clamp(history.rgb, shadowStats.low, shadowStats.high), shadowStats.mean, shadowAlpha);
 +                if (!combined) {
-+                    result.y = lerp(clamp(history.y, aoStats.y, aoStats.z), aoStats.x, gParams.aoTemporalAlpha);
++                    aoResult = lerp(clamp(history.a, aoStats.low.x, aoStats.high.x), aoStats.mean.x, gParams.aoTemporalAlpha);
 +                }
 +            }
 +        }
 +    }
 +
-+    gHistoryOut[pixel] = result;
++    gHistoryOut[pixel] = float4(shadowResult, aoResult);
 +    // Stored at half scale: the composite's 2x multiply blend (dst * src * 2) applies factors up
 +    // to 2, so glows can brighten.
-+    const float encoded = min(result.x * result.y, 2.0f) * 0.5f;
-+    gOutput[pixel] = float4(encoded, encoded, encoded, 1.0f);
++    const float3 encoded = min(shadowResult * aoResult, 2.0f) * 0.5f;
++    gOutput[pixel] = float4(encoded, 1.0f);
 +}
 diff --git a/src/shaders/WcwRtTraceCS.hlsl b/src/shaders/WcwRtTraceCS.hlsl
 new file mode 100644
-index 0000000..ed8f3e2
+index 0000000..a2c5c50
 --- /dev/null
 +++ b/src/shaders/WcwRtTraceCS.hlsl
-@@ -0,0 +1,556 @@
+@@ -0,0 +1,569 @@
 +//
 +// RT64
 +//
@@ -19921,9 +20013,11 @@ index 0000000..ed8f3e2
 +StructuredBuffer<uint> gFaceIndices : register(t3);
 +StructuredBuffer<uint> gMeshIndexStarts : register(t4);
 +RWTexture2D<float4> gOutput : register(u5);
-+// Shadow mode: (shadow factor, primary hit distance (0 = no hit), AO factor, unused) for the resolve pass, which
-+// filters the shadow and AO terms separately. The shadow factor includes the glows (up to 2).
++// Shadow mode: (shadow factor RGB, primary hit distance (0 = no hit)) for the resolve pass, which filters the shadow
++// and AO terms separately. The shadow factor is colored by the lights and includes the glows (up to 2).
 +RWTexture2D<float4> gCurrent : register(u6);
++// Shadow mode: the AO factor, beside gCurrent.
++RWTexture2D<float> gCurrentAo : register(u13);
 +StructuredBuffer<RDPTile> gRDPTiles : register(t7);
 +StructuredBuffer<GPUTile> gGPUTiles : register(t8);
 +StructuredBuffer<float2> gTexCoords : register(t9);
@@ -20034,7 +20128,8 @@ index 0000000..ed8f3e2
 +
 +void writeNoHit(uint2 pixel) {
 +    if (resolvedMode()) {
-+        gCurrent[pixel] = float4(1.0f, 0.0f, 1.0f, 0.0f);
++        gCurrent[pixel] = float4(1.0f, 1.0f, 1.0f, 0.0f);
++        gCurrentAo[pixel] = 1.0f;
 +    }
 +    else {
 +        gOutput[pixel] = float4(1.0f, 1.0f, 1.0f, 0.0f);
@@ -20119,9 +20214,14 @@ index 0000000..ed8f3e2
 +    return lifted;
 +}
 +
-+// Brightening from the preset's glows at a hit point (0 = none).
-+float glowLight(float3 hitPos, float3 normal) {
-+    float glow = 0.0f;
++// A light's or glow's color at this pixel: white on the left half with WCW_RT_COLOR_SPLIT.
++bool whiteLight(uint2 pixel) {
++    return (gParams.colorSplit != 0) && (pixel.x < (gParams.resolution.x / 2));
++}
++
++// Brightening from the preset's glows at a hit point (0 = none), in each glow's color.
++float3 glowLight(float3 hitPos, float3 normal, uint2 pixel) {
++    float3 glow = float3(0.0f, 0.0f, 0.0f);
 +    const uint count = min(gParams.glowCount, WCW_RT_MAX_GLOWS);
 +    for (uint g = 0; g < count; g++) {
 +        const float3 toGlow = gParams.glows[g].xyz - hitPos;
@@ -20148,7 +20248,8 @@ index 0000000..ed8f3e2
 +        }
 +
 +        if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {
-+            glow += gParams.glowIntensity[g] * atten * facing;
++            const float3 color = whiteLight(pixel) ? float3(1.0f, 1.0f, 1.0f) : gParams.glowColors[g].rgb;
++            glow += color * (gParams.glowIntensity[g] * atten * facing);
 +        }
 +    }
 +
@@ -20291,7 +20392,8 @@ index 0000000..ed8f3e2
 +    if (resolvedMode() && (gParams.receiverRadius > 0.0f)) {
 +        const float receiverDist = length(hitPos.xz - gParams.lightPosition.xz);
 +        if (receiverDist >= gParams.receiverRadius) {
-+            gCurrent[pixel] = float4(1.0f + glowLight(hitPos, normal), hitT, 1.0f, 0.0f);
++            gCurrent[pixel] = float4(1.0f + glowLight(hitPos, normal, pixel), hitT);
++            gCurrentAo[pixel] = 1.0f;
 +            return;
 +        }
 +
@@ -20317,7 +20419,8 @@ index 0000000..ed8f3e2
 +    const float3 shadeNormal = smoothShadow ? smoothNormal(primary.CommittedGeometryIndex(), primary.CommittedPrimitiveIndex(), primary.CommittedTriangleBarycentrics(), normal) : normal;
 +    const float3 shadowStart = smoothShadow ? shadowOrigin(primary.CommittedGeometryIndex(), primary.CommittedPrimitiveIndex(), primary.CommittedTriangleBarycentrics(), hitPos, normal) : hitPos;
 +
-+    float lit = 0.0f;
++    // Light reaching the pixel, in the lights' colors (white lights: the visible fraction of the total weight).
++    float3 lit = float3(0.0f, 0.0f, 0.0f);
 +    int occluderId = -1;
 +    // Heavier lights cast proportionally darker shadows, so their sampling noise shows more:
 +    // each light gets samples in proportion to its preset weight (key light 2 -> twice the rays).
@@ -20328,7 +20431,7 @@ index 0000000..ed8f3e2
 +        // frames by the resolve pass).
 +        const float2 jitter = float2(sampleNoise(pixel, i * 2, uint2(0, 0)), sampleNoise(pixel, i * 2 + 1, uint2(37, 113))) - 0.5f;
 +        const float2 offset = jitter * gParams.lightSize;
-+        const float weight = lightWeights[l] / max(weightSum, 1e-6f) / float(samples);
++        const float3 weight = (whiteLight(pixel) ? float3(1.0f, 1.0f, 1.0f) : gParams.lightColors[l].rgb) * (lightWeights[l] / max(weightSum, 1e-6f) / float(samples));
 +        const float3 lightPos = gParams.lights[l].xyz + float3(offset.x, 0.0f, offset.y);
 +        const float3 toLight = lightPos - shadowStart;
 +        const float lightDist = length(toLight);
@@ -20384,9 +20487,10 @@ index 0000000..ed8f3e2
 +
 +    const bool characterReceiver = (gMeshIndexStarts[primary.CommittedGeometryIndex()] & WCW_RT_MESH_CHARACTER) != 0;
 +    const float strength = characterReceiver ? gParams.characterShadowStrength : gParams.shadowStrength;
-+    float factor = 1.0f - strength * (1.0f - lit);
++    // Unlit share (1 - strength) plus the light that arrives, so white lights give 1 - strength * (1 - visible).
++    float3 factor = (1.0f - strength) + strength * lit;
 +    if (gParams.mode == WCW_RT_MODE_SHADOW_RAW) {
-+        gOutput[pixel] = float4(factor, factor, factor, 1.0f);
++        gOutput[pixel] = float4(factor, 1.0f);
 +        return;
 +    }
 +
@@ -20445,17 +20549,18 @@ index 0000000..ed8f3e2
 +
 +    // AO-only view: the shadow term stays open.
 +    if (gParams.mode == WCW_RT_MODE_AO) {
-+        factor = 1.0f;
++        factor = float3(1.0f, 1.0f, 1.0f);
 +    }
 +
-+    factor = lerp(factor, 1.0f, receiverFade);
++    factor = lerp(factor, float3(1.0f, 1.0f, 1.0f), receiverFade);
 +    ao = lerp(ao, 1.0f, receiverFade);
 +
 +    if (resolvedMode() && (gParams.mode == WCW_RT_MODE_SHADOW)) {
-+        factor *= 1.0f + glowLight(hitPos, normal);
++        factor *= 1.0f + glowLight(hitPos, normal, pixel);
 +    }
 +
-+    gCurrent[pixel] = float4(factor, hitT, ao, 0.0f);
++    gCurrent[pixel] = float4(factor, hitT);
++    gCurrentAo[pixel] = ao;
 +}
 diff --git a/src/shared/rt64_video_interface.h b/src/shared/rt64_video_interface.h
 index b51cf09..19048ae 100644
@@ -20473,10 +20578,10 @@ index b51cf09..19048ae 100644
  };
 diff --git a/src/shared/rt64_wcw_rt.h b/src/shared/rt64_wcw_rt.h
 new file mode 100644
-index 0000000..36670ff
+index 0000000..41171ec
 --- /dev/null
 +++ b/src/shared/rt64_wcw_rt.h
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,162 @@
 +//
 +// RT64
 +//
@@ -20582,6 +20687,10 @@ index 0000000..36670ff
 +        float glowPadding2;
 +        float4 glows[WCW_RT_MAX_GLOWS];
 +        float4 glowIntensity;
++        // Colored light: each light's and glow's RGB. Lights are normalized to unit luminance
++        // (WcwLogic::normalizedLightColor), so a color tints without changing the brightness; white = no tint.
++        float4 lightColors[WCW_RT_MAX_LIGHTS];
++        float4 glowColors[WCW_RT_MAX_GLOWS];
 +        float aoCharacterStrength;
 +        float aoCharacterRadius;
 +        // 1: lit draws use their interpolated vertex normals for the AO hemisphere (WCW_RT_AO_SMOOTH=0 turns it off).
@@ -20623,6 +20732,8 @@ index 0000000..36670ff
 +        uint denoiseSplit;
 +        // End of the traced rect (exclusive, trace pixels): the resolve filter doesn't read past it.
 +        uint2 traceEnd;
++        // WCW_RT_COLOR_SPLIT=1: white lights and glows on the left half of the screen (same-moment comparisons).
++        uint colorSplit;
 +    };
 +
 +    struct WcwRtCompositeCB {
@@ -20635,10 +20746,10 @@ index 0000000..36670ff
 +#endif
 diff --git a/tests/wcw/rt64_wcw_logic_tests.cpp b/tests/wcw/rt64_wcw_logic_tests.cpp
 new file mode 100644
-index 0000000..3b89512
+index 0000000..cd29e24
 --- /dev/null
 +++ b/tests/wcw/rt64_wcw_logic_tests.cpp
-@@ -0,0 +1,484 @@
+@@ -0,0 +1,518 @@
 +//
 +// RT64
 +//
@@ -20822,6 +20933,40 @@ index 0000000..3b89512
 +    const DenoiseSettings d = denoiseSettings();
 +    CHECK(d.aoAlpha <= d.shadowAlpha);
 +    CHECK(d.aoAlpha > 0.0f && d.shadowAlpha < 1.0f);
++}
++
++// Colored light
++
++static float luminance(const std::array<float, 3> &c) {
++    return 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2];
++}
++
++TEST_CASE("light color: white stays white (presets without colors look exactly as before)") {
++    const std::array<float, 3> white = normalizedLightColor(1.0f, 1.0f, 1.0f);
++    CHECK_NEAR(white[0], 1.0f, 1e-5f);
++    CHECK_NEAR(white[1], 1.0f, 1e-5f);
++    CHECK_NEAR(white[2], 1.0f, 1e-5f);
++    const std::array<float, 3> grey = normalizedLightColor(0.3f, 0.3f, 0.3f);
++    CHECK_NEAR(grey[0], 1.0f, 1e-5f);
++}
++
++TEST_CASE("light color: a tint keeps the light's brightness") {
++    const std::array<float, 3> warm = normalizedLightColor(1.0f, 0.9f, 0.75f);
++    CHECK_NEAR(luminance(warm), 1.0f, 1e-4f);
++    CHECK(warm[0] > warm[1] && warm[1] > warm[2]);
++    const std::array<float, 3> cool = normalizedLightColor(0.8f, 0.9f, 1.0f);
++    CHECK_NEAR(luminance(cool), 1.0f, 1e-4f);
++    CHECK(cool[2] > cool[0]);
++}
++
++TEST_CASE("light color: saturated colors are capped, black falls back to white") {
++    const std::array<float, 3> red = normalizedLightColor(1.0f, 0.0f, 0.0f);
++    CHECK(red[0] <= MaxLightChannel);
++    CHECK_EQ(red[1], 0.0f);
++    const std::array<float, 3> black = normalizedLightColor(0.0f, 0.0f, 0.0f);
++    CHECK_EQ(black[0], 1.0f);
++    const std::array<float, 3> negative = normalizedLightColor(-1.0f, -1.0f, -1.0f);
++    CHECK_EQ(negative[2], 1.0f);
 +}
 +
 +// Blue noise (ray tracer sample jitter)
