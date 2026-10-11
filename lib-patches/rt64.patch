@@ -243,10 +243,10 @@ index f555048..a9de81e 100644
      }
 diff --git a/src/common/rt64_wcw_logic.cpp b/src/common/rt64_wcw_logic.cpp
 new file mode 100644
-index 0000000..f49c894
+index 0000000..044400f
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.cpp
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,148 @@
 +//
 +// RT64
 +//
@@ -258,6 +258,43 @@ index 0000000..f49c894
 +namespace RT64::WcwLogic {
 +    bool shadowCasterFresh(uint64_t frameCounter, uint64_t builtFrame) {
 +        return (frameCounter >= builtFrame) && ((frameCounter - builtFrame) <= ShadowCasterStaleFrames);
++    }
++
++    AoSettings aoSettings(uint32_t level, uint32_t quality) {
++        AoSettings settings;
++        const uint32_t baseSamples = (quality == 0) ? 1u : 2u;
++        switch (AoLevel(std::min(level, uint32_t(AoLevel::Strong)))) {
++        // Radii are in AKI world units (a ring is several hundred across, a wrestler about 150 tall). Wrestlers
++        // are mostly convex, so their occlusion lives in creases and contacts: the gain brings those out, and
++        // a shorter character radius keeps a limb from darkening the whole torso next to it.
++        case AoLevel::Subtle:
++            settings.samples = baseSamples;
++            settings.strength = 0.45f;
++            settings.characterStrength = 0.4f;
++            settings.radius = 45.0f;
++            settings.characterRadius = 25.0f;
++            settings.gain = 1.5f;
++            settings.characterGain = 1.5f;
++            break;
++        case AoLevel::Strong:
++            settings.samples = baseSamples * 2;
++            settings.strength = 0.6f;
++            settings.characterStrength = 0.6f;
++            settings.radius = 60.0f;
++            settings.characterRadius = 30.0f;
++            settings.gain = 1.75f;
++            settings.characterGain = 1.75f;
++            break;
++        case AoLevel::Off:
++        default:
++            break;
++        }
++
++        return settings;
++    }
++
++    bool aoCycleOn(uint64_t unixMs, uint64_t periodMs) {
++        return (periodMs == 0) || (((unixMs / periodMs) % 2) == 0);
 +    }
 +
 +    BeamDecision decideBeam(uint32_t displayRefreshRate, bool vsync, bool interpolating, uint32_t contentRate) {
@@ -360,10 +397,10 @@ index 0000000..f49c894
 +};
 diff --git a/src/common/rt64_wcw_logic.h b/src/common/rt64_wcw_logic.h
 new file mode 100644
-index 0000000..0799aab
+index 0000000..c6cd7a4
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.h
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,141 @@
 +//
 +// RT64
 +//
@@ -388,6 +425,37 @@ index 0000000..0799aab
 +
 +    // Whether a scene last built on game frame builtFrame still casts shadows on game frame frameCounter.
 +    bool shadowCasterFresh(uint64_t frameCounter, uint64_t builtFrame);
++
++    // Ray-traced ambient occlusion
++
++    // The menu's Ambient Occlusion levels.
++    enum class AoLevel : uint32_t {
++        Off = 0,
++        Subtle = 1,
++        Strong = 2
++    };
++
++    struct AoSettings {
++        // Cosine-weighted occlusion rays per pixel per frame (0 = no AO).
++        uint32_t samples = 0;
++        // How much a fully occluded pixel darkens, on the world and on characters (wrestlers).
++        float strength = 0.0f;
++        float characterStrength = 0.0f;
++        // Ray length: occluders further away don't count, nearer ones count more (1 - (t / radius)^2).
++        float radius = 0.0f;
++        float characterRadius = 0.0f;
++        // Contrast: the occluded fraction is multiplied by this (clamped to 1) before darkening.
++        float gain = 1.0f;
++        float characterGain = 1.0f;
++    };
++
++    // WCW_RT_AO_CYCLE: AO on for periodMs, off for periodMs, repeating, phased to wall-clock time (Unix ms) so a
++    // screen recording can be labelled from its own start time. Even periods are on.
++    bool aoCycleOn(uint64_t unixMs, uint64_t periodMs);
++
++    // The AO parameters for a menu level at a ray tracing quality (0 Performance, 1 Balanced, 2 Quality). Higher
++    // quality only adds samples; the look (strengths, radii) depends on the level alone.
++    AoSettings aoSettings(uint32_t level, uint32_t quality);
 +
 +    // CRT beam simulator
 +
@@ -16777,7 +16845,7 @@ index 0000000..9f63d18
 +    };
 +};
 diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
-index 9fae0d4..50943e4 100644
+index 9fae0d4..d899e08 100644
 --- a/src/render/rt64_framebuffer_renderer.cpp
 +++ b/src/render/rt64_framebuffer_renderer.cpp
 @@ -4,6 +4,8 @@
@@ -17008,7 +17076,7 @@ index 9fae0d4..50943e4 100644
          const float aspectRatioScale = adjustRatio ? (p.aspectRatioTarget / p.aspectRatioSource) : 1.0f;
          InstanceDrawCall instanceDrawCall;
          interop::RenderIndices renderIndices;
-@@ -1506,6 +1652,33 @@ namespace RT64 {
+@@ -1506,6 +1652,34 @@ namespace RT64 {
                  viewportClip = convertViewportRect(viewport.rect(viewportClipRatios), p.resolutionScale, p.fbWidth, projInvRatioScale, extOriginPercentage, 0.0f, viewportOrigin, viewportOrigin);
              }
  
@@ -17035,14 +17103,15 @@ index 9fae0d4..50943e4 100644
 +                const RenderViewport wcwViewport = convertViewportRect(drawData.rspViewports[proj.transformsIndex].rect(unitClipRatios), p.resolutionScale, p.fbWidth,
 +                    projInvRatioScale, extOriginPercentage, 0.0f, viewportOrigin, viewportOrigin);
 +                wcwRaytracer->beginScene(wcwView, wcwProj, wcwViewport,
-+                    worldPosRes, outputBuffers.worldPosBuffer.allocatedSize, indexRes, uint64_t(indexCount) * IndexStride,
++                    worldPosRes, outputBuffers.worldPosBuffer.allocatedSize, outputBuffers.worldNormBuffer.buffer.get(), outputBuffers.worldNormBuffer.allocatedSize,
++                    indexRes, uint64_t(indexCount) * IndexStride,
 +                    drawBuffers.rdpTilesBuffer.get(), drawBuffers.gpuTilesBuffer.get(), tcRes);
 +            }
 +
              for (uint32_t d = 0; (d < proj.gameCallCount) && (globalCallIndex < p.maxGameCall); d++) {
                  const GameCall &call = proj.gameCalls[d];
                  renderIndices.instanceIndex = call.callDesc.callIndex;
-@@ -1607,6 +1780,8 @@ namespace RT64 {
+@@ -1607,6 +1781,8 @@ namespace RT64 {
                      {
                          triangles.shaderDesc = call.shaderDesc;
  
@@ -17051,7 +17120,7 @@ index 9fae0d4..50943e4 100644
                          RasterShader *gpuShader = p.ubershadersOnly ? nullptr : p.rasterShaderCache->getGPUShader(call.shaderDesc);
                          if (gpuShader != nullptr) {
                              triangles.pipeline = gpuShader->pipeline.get();
-@@ -1618,6 +1793,12 @@ namespace RT64 {
+@@ -1618,6 +1794,12 @@ namespace RT64 {
                                  !copyMode && call.shaderDesc.otherMode.zUpd(),
                                  (call.shaderDesc.otherMode.cvgDst() == CVG_DST_WRAP) || (call.shaderDesc.otherMode.cvgDst() == CVG_DST_SAVE));
                          }
@@ -17064,7 +17133,7 @@ index 9fae0d4..50943e4 100644
                          
                          triangles.faceCount = call.callDesc.triangleCount;
                          triangles.vertexTestZ = (vertexTestZCallIndex >= 0);
-@@ -1676,6 +1857,104 @@ namespace RT64 {
+@@ -1676,6 +1858,105 @@ namespace RT64 {
                              break;
                          }
  
@@ -17121,8 +17190,9 @@ index 9fae0d4..50943e4 100644
 +                                wcwTextureHash = wcwTile.tileCopyUsed ? 0 : wcwTile.tmemHashOrID;
 +                            }
 +
++                            const bool wcwLit = (call.callDesc.geometryMode & G_LIGHTING) != 0;
 +                            wcwRaytracer->addMesh(call.meshDesc.faceIndicesStart, call.callDesc.triangleCount, std::min(wcwMaxVertex + 1, vertexCount), call.shaderDesc.flags.culling, wcwCharacter,
-+                                wcwAlphaTest, call.callDesc.tileIndex, wcwUvCorrection, wcwTextureHash);
++                                wcwLit, wcwAlphaTest, call.callDesc.tileIndex, wcwUvCorrection, wcwTextureHash);
 +
 +                            // WCW_RT_RAYTEST=<present>: CPU copy of the gathered triangles for a reference ray test.
 +                            static const int wcwRayTestAt = getenv("WCW_RT_RAYTEST") ? atoi(getenv("WCW_RT_RAYTEST")) : -1;
@@ -17169,7 +17239,7 @@ index 9fae0d4..50943e4 100644
                          triangles.scissor = convertFixedRect(call.callDesc.scissorRect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, int32_t(horizontalMisalignment), call.callDesc.scissorLeftOrigin, call.callDesc.scissorRightOrigin);
  
                          bool usesViewport = (proj.type == Projection::Type::Perspective) || (proj.type == Projection::Type::Orthographic);
-@@ -1746,12 +2025,42 @@ namespace RT64 {
+@@ -1746,12 +2027,42 @@ namespace RT64 {
                  else 
  #           endif
                  {
@@ -17898,10 +17968,10 @@ index 8a3782a..0789a75 100644
 \ No newline at end of file
 diff --git a/src/render/rt64_wcw_raytracer.cpp b/src/render/rt64_wcw_raytracer.cpp
 new file mode 100644
-index 0000000..30e96e3
+index 0000000..3080147
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.cpp
-@@ -0,0 +1,1141 @@
+@@ -0,0 +1,1164 @@
 +//
 +// RT64
 +//
@@ -17947,10 +18017,12 @@ index 0000000..30e96e3
 +
 +    static std::atomic<bool> wcwRtUserEnabled = false;
 +    static std::atomic<uint32_t> wcwRtUserQuality = 1;
++    static std::atomic<uint32_t> wcwRtUserAo = uint32_t(WcwLogic::AoLevel::Subtle);
 +
-+    void WcwRaytracer::setUserSettings(bool enabled, uint32_t quality) {
++    void WcwRaytracer::setUserSettings(bool enabled, uint32_t quality, uint32_t aoLevel) {
 +        wcwRtUserEnabled = enabled;
 +        wcwRtUserQuality = std::min(quality, 2u);
++        wcwRtUserAo = std::min(aoLevel, uint32_t(WcwLogic::AoLevel::Strong));
 +    }
 +
 +    bool WcwRaytracer::active() {
@@ -17985,7 +18057,8 @@ index 0000000..30e96e3
 +        }
 +
 +#   ifdef _WIN32
-+        // Trace pass: b0 params, t1 scene, t2 world positions, t3 face indices, t4 mesh index starts, u5 output.
++        // Trace pass: b0 params, t1 scene, t2 world positions, t3 face indices, t4 mesh index starts, u5 output,
++        // u6 current factors, t7-t10 tiles/texcoords/mesh tiles, t11 world normals.
 +        RenderDescriptorSetBuilder traceBuilder;
 +        traceBuilder.begin();
 +        traceBuilder.addConstantBuffer(0);
@@ -17999,6 +18072,7 @@ index 0000000..30e96e3
 +        traceBuilder.addStructuredBuffer(8);
 +        traceBuilder.addStructuredBuffer(9);
 +        traceBuilder.addStructuredBuffer(10);
++        traceBuilder.addStructuredBuffer(11);
 +        traceBuilder.end();
 +        traceSet = traceBuilder.create(device);
 +
@@ -18425,7 +18499,8 @@ index 0000000..30e96e3
 +    }
 +
 +    void WcwRaytracer::beginScene(const hlslpp::float4x4 &view, const hlslpp::float4x4 &proj, const RenderViewport &viewport,
-+        const RenderBuffer *worldPosBuffer, uint64_t worldPosSize, const RenderBuffer *faceIndicesBuffer, uint64_t faceIndicesSize,
++        const RenderBuffer *worldPosBuffer, uint64_t worldPosSize, const RenderBuffer *worldNormBuffer, uint64_t worldNormSize,
++        const RenderBuffer *faceIndicesBuffer, uint64_t faceIndicesSize,
 +        const RenderBuffer *rdpTilesBuffer, const RenderBuffer *gpuTilesBuffer, const RenderBuffer *texCoordBuffer)
 +    {
 +        boundsViewProj = hlslpp::mul(view, proj);
@@ -18456,11 +18531,13 @@ index 0000000..30e96e3
 +        this->viewport = viewport;
 +        this->worldPosBuffer = worldPosBuffer;
 +        this->worldPosSize = worldPosSize;
++        this->worldNormBuffer = worldNormBuffer;
++        this->worldNormSize = worldNormSize;
 +        this->faceIndicesBuffer = faceIndicesBuffer;
 +        this->faceIndicesSize = faceIndicesSize;
 +    }
 +
-+    void WcwRaytracer::addMesh(uint32_t faceIndicesStart, uint32_t triangleCount, uint32_t vertexCount, bool culled, bool character,
++    void WcwRaytracer::addMesh(uint32_t faceIndicesStart, uint32_t triangleCount, uint32_t vertexCount, bool culled, bool character, bool lit,
 +        bool alphaTest, uint32_t tileIndex, bool uvCorrection, uint64_t textureHash)
 +    {
 +        if ((textureHash != 0) && !character) {
@@ -18476,7 +18553,8 @@ index 0000000..30e96e3
 +
 +        // Culled draws are non-opaque so the trace shader sees their candidates; the top bits
 +        // carry the culled/character flags.
-+        meshIndexStarts.emplace_back(faceIndicesStart | (culled ? WCW_RT_MESH_CULLED : 0u) | (character ? WCW_RT_MESH_CHARACTER : 0u));
++        meshIndexStarts.emplace_back(faceIndicesStart | (culled ? WCW_RT_MESH_CULLED : 0u) | (character ? WCW_RT_MESH_CHARACTER : 0u) |
++            ((lit && (worldNormBuffer != nullptr)) ? WCW_RT_MESH_LIT : 0u));
 +        meshTiles.emplace_back((tileIndex & WCW_RT_TILE_INDEX_MASK) | (alphaTest ? WCW_RT_TILE_ALPHA_TEST : 0u) | (uvCorrection ? WCW_RT_TILE_UV_CORRECTION : 0u));
 +    }
 +
@@ -18829,9 +18907,23 @@ index 0000000..30e96e3
 +        params.prevViewProj = slot.prevViewProj;
 +        params.historyValid = slot.historyValid ? 1 : 0;
 +        params.samplesPerLight = std::max(uint32_t(envFloat(getenv("WCW_RT_SAMPLES"), float(presetSamples))), 1u);
-+        params.aoSamples = uint32_t(envFloat(getenv("WCW_RT_AO_SAMPLES"), float(presetSamples)));
-+        params.aoRadius = envFloat(getenv("WCW_RT_AO_RADIUS"), 25.0f);
-+        params.aoStrength = envFloat(getenv("WCW_RT_AO"), 0.5f);
++        // Ambient occlusion: the menu level's settings (WcwLogic::aoSettings), each overridable from the environment.
++        const WcwLogic::AoSettings ao = WcwLogic::aoSettings(wcwRtUserAo.load(), quality);
++        params.aoSamples = uint32_t(envFloat(getenv("WCW_RT_AO_SAMPLES"), float(ao.samples)));
++        params.aoRadius = envFloat(getenv("WCW_RT_AO_RADIUS"), ao.radius);
++        params.aoStrength = envFloat(getenv("WCW_RT_AO"), ao.strength);
++        params.aoCharacterRadius = envFloat(getenv("WCW_RT_AO_RADIUS_CHAR"), ao.characterRadius);
++        params.aoCharacterStrength = envFloat(getenv("WCW_RT_AO_CHAR"), ao.characterStrength);
++        params.aoSmoothNormals = (envFloat(getenv("WCW_RT_AO_SMOOTH"), 1.0f) != 0.0f) ? 1u : 0u;
++        params.aoGain = std::max(envFloat(getenv("WCW_RT_AO_GAIN"), ao.gain), 0.0f);
++        params.aoSplit = (envFloat(getenv("WCW_RT_AO_SPLIT"), 0.0f) != 0.0f) ? 1u : 0u;
++        params.filterRadius = uint32_t(std::clamp(envFloat(getenv("WCW_RT_FILTER_RADIUS"), 2.0f), 1.0f, 4.0f));
++        params.aoCharacterGain = std::max(envFloat(getenv("WCW_RT_AO_GAIN_CHAR"), ao.characterGain), 0.0f);
++        {
++            static const uint64_t aoCyclePeriodMs = uint64_t(std::max(envFloat(getenv("WCW_RT_AO_CYCLE"), 0.0f), 0.0f) * 1000.0f);
++            const uint64_t unixMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
++            params.aoCycleOff = WcwLogic::aoCycleOn(unixMs, aoCyclePeriodMs) ? 0u : 1u;
++        }
 +        params.traceScale = float(traceWidth) / float(outputWidth);
 +
 +        // Trace only this workload's screen footprint (plus a margin for the bilinear upsample
@@ -18891,6 +18983,7 @@ index 0000000..30e96e3
 +        traceSet->setBuffer(8, (gpuTilesBuffer != nullptr) ? gpuTilesBuffer : meshTilesBuffer.get(), 0, &gpuTileView);
 +        traceSet->setBuffer(9, (texCoordBuffer != nullptr) ? texCoordBuffer : meshTilesBuffer.get(), 0, &float2View);
 +        traceSet->setBuffer(10, meshTilesBuffer.get(), meshTilesBufferSize, &uintView);
++        traceSet->setBuffer(11, (worldNormBuffer != nullptr) ? worldNormBuffer : worldPosBuffer, (worldNormBuffer != nullptr) ? worldNormSize : worldPosSize, &float4View);
 +        compositeSet->setTexture(0, slot.output.get(), RenderTextureLayout::SHADER_READ);
 +
 +        // Trace.
@@ -19045,10 +19138,10 @@ index 0000000..30e96e3
 +};
 diff --git a/src/render/rt64_wcw_raytracer.h b/src/render/rt64_wcw_raytracer.h
 new file mode 100644
-index 0000000..38aa70b
+index 0000000..49249e9
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.h
-@@ -0,0 +1,282 @@
+@@ -0,0 +1,287 @@
 +//
 +// RT64
 +//
@@ -19097,6 +19190,8 @@ index 0000000..38aa70b
 +        std::vector<RenderBottomLevelASMesh> meshes;
 +        std::vector<uint32_t> meshIndexStarts;
 +        const RenderBuffer *worldPosBuffer = nullptr;
++        const RenderBuffer *worldNormBuffer = nullptr;
++        uint64_t worldNormSize = 0;
 +        const RenderBuffer *rdpTilesBuffer = nullptr;
 +        const RenderBuffer *gpuTilesBuffer = nullptr;
 +        const RenderBuffer *texCoordBuffer = nullptr;
@@ -19295,7 +19390,8 @@ index 0000000..38aa70b
 +        // Runtime settings from the frontend's graphics menu. Quality: 0 Performance (half-res,
 +        // 1 sample per light, 1 AO ray), 1 Balanced (half-res, 2/2), 2 Quality (full-res, 2/2).
 +        // WCW_RT forces it on; WCW_RT_SCALE / WCW_RT_SAMPLES / WCW_RT_AO_SAMPLES override quality.
-+        static void setUserSettings(bool enabled, uint32_t quality);
++        // aoLevel: the Ambient Occlusion option (WcwLogic::AoLevel: 0 Off, 1 Subtle, 2 Strong).
++        static void setUserSettings(bool enabled, uint32_t quality, uint32_t aoLevel = 1);
 +        // True when ray tracing should run this frame (WCW_RT or the menu option). The camera
 +        // hand-off in rt64_rsp.cpp follows it, so Off keeps the original rendering.
 +        static bool active();
@@ -19312,13 +19408,15 @@ index 0000000..38aa70b
 +        // WCW_RT_SPLIT: ray tracing only on the right half of the screen (before/after comparisons).
 +        static bool splitScreen();
 +        void beginScene(const hlslpp::float4x4 &view, const hlslpp::float4x4 &proj, const RenderViewport &viewport,
-+            const RenderBuffer *worldPosBuffer, uint64_t worldPosSize, const RenderBuffer *faceIndicesBuffer, uint64_t faceIndicesSize,
++            const RenderBuffer *worldPosBuffer, uint64_t worldPosSize, const RenderBuffer *worldNormBuffer, uint64_t worldNormSize,
++            const RenderBuffer *faceIndicesBuffer, uint64_t faceIndicesSize,
 +            const RenderBuffer *rdpTilesBuffer, const RenderBuffer *gpuTilesBuffer, const RenderBuffer *texCoordBuffer);
 +        // culled: the draw has N64 face culling on, so primary rays skip its back faces.
 +        // character: a wrestler draw, shadowed with the weaker character strength.
++        // lit: the draw uses N64 lighting (G_LIGHTING), so its vertices carry normals the AO can interpolate.
 +        // alphaTest: rays skip the draw's transparent texels (tileIndex, uvCorrection: its texture).
 +        // textureHash: the draw's first texture (0 if none), a venue fingerprint for the light presets.
-+        void addMesh(uint32_t faceIndicesStart, uint32_t triangleCount, uint32_t vertexCount, bool culled, bool character,
++        void addMesh(uint32_t faceIndicesStart, uint32_t triangleCount, uint32_t vertexCount, bool culled, bool character, bool lit,
 +            bool alphaTest, uint32_t tileIndex, bool uvCorrection, uint64_t textureHash);
 +        // Grows the screen bounds with a world-space triangle (3 xyz positions) of a gathered draw.
 +        // character: a wrestler triangle (left out of the scene bounds the light anchor uses).
@@ -19418,10 +19516,10 @@ index 0000000..334836e
 +}
 diff --git a/src/shaders/WcwRtResolveCS.hlsl b/src/shaders/WcwRtResolveCS.hlsl
 new file mode 100644
-index 0000000..9705742
+index 0000000..771e297
 --- /dev/null
 +++ b/src/shaders/WcwRtResolveCS.hlsl
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,92 @@
 +//
 +// RT64
 +//
@@ -19453,18 +19551,19 @@ index 0000000..9705742
 +        return;
 +    }
 +
-+    // Neighborhood range of this frame's samples (hit pixels only) and a depth-aware 3x3 tent
-+    // filter of them: neighbors on the same surface (similar hit distance) are averaged, so a
-+    // single jittered sample per light doesn't speckle penumbrae, while object edges stay sharp.
++    // Neighborhood range of this frame's samples (hit pixels only) and a depth-aware tent filter of
++    // them (filterRadius, 2 = 5x5): neighbors on the same surface (similar hit distance) are averaged,
++    // so a few jittered shadow and AO rays per pixel don't speckle, while object edges stay sharp.
++    const int radius = int(clamp(gParams.filterRadius, 1u, 4u));
 +    float filteredSum = 0.0f;
 +    float filteredSqSum = 0.0f;
 +    float weightSum = 0.0f;
-+    for (int y = -1; y <= 1; y++) {
-+        for (int x = -1; x <= 1; x++) {
++    for (int y = -radius; y <= radius; y++) {
++        for (int x = -radius; x <= radius; x++) {
 +            const int2 neighbor = clamp(int2(pixel) + int2(x, y), int2(0, 0), int2(gParams.resolution) - 1);
 +            const float2 sample = gCurrent[neighbor];
 +            if (sample.y > 0.0f) {
-+                const float spatial = ((x == 0) ? 2.0f : 1.0f) * ((y == 0) ? 2.0f : 1.0f);
++                const float spatial = float(radius + 1 - abs(x)) * float(radius + 1 - abs(y));
 +                const float depth = exp(-abs(sample.y - current.y) / max(current.y * 0.01f, 0.5f));
 +                filteredSum += sample.x * spatial * depth;
 +                filteredSqSum += sample.x * sample.x * spatial * depth;
@@ -19515,10 +19614,10 @@ index 0000000..9705742
 +}
 diff --git a/src/shaders/WcwRtTraceCS.hlsl b/src/shaders/WcwRtTraceCS.hlsl
 new file mode 100644
-index 0000000..eb80ab1
+index 0000000..7b4382a
 --- /dev/null
 +++ b/src/shaders/WcwRtTraceCS.hlsl
-@@ -0,0 +1,441 @@
+@@ -0,0 +1,481 @@
 +//
 +// RT64
 +//
@@ -19545,6 +19644,8 @@ index 0000000..eb80ab1
 +StructuredBuffer<GPUTile> gGPUTiles : register(t8);
 +StructuredBuffer<float2> gTexCoords : register(t9);
 +StructuredBuffer<uint> gMeshTiles : register(t10);
++// World-space vertex normals (zero for vertices without one); only meaningful on lit meshes (WCW_RT_MESH_LIT).
++StructuredBuffer<float4> gWorldNorm : register(t11);
 +// The framebuffer renderer's bindless RGBA texture cache.
 +Texture2D<float4> gTextures[8192] : register(t0, space1);
 +
@@ -19655,6 +19756,29 @@ index 0000000..eb80ab1
 +    const float3 n = cross(v1 - v0, v2 - v0);
 +    const float len = length(n);
 +    return (len > 1e-8f) ? (n / len) : float3(0.0f, 1.0f, 0.0f);
++}
++
++// The AO hemisphere's normal: on lit draws the vertex normals interpolated at the hit, so low-poly models
++// (wrestlers) get smooth occlusion instead of one value per facet; otherwise the face normal. faceNormal faces
++// the viewer; a smooth normal seen from behind is flipped to match.
++float3 aoNormal(uint geometryIndex, uint primitiveIndex, float2 barycentrics, float3 faceNormal) {
++    const uint meshStart = gMeshIndexStarts[geometryIndex];
++    if ((gParams.aoSmoothNormals == 0) || ((meshStart & WCW_RT_MESH_LIT) == 0)) {
++        return faceNormal;
++    }
++
++    const uint base = (meshStart & ~WCW_RT_MESH_FLAGS) + primitiveIndex * 3;
++    const float3 n0 = gWorldNorm[gFaceIndices[base + 0]].xyz;
++    const float3 n1 = gWorldNorm[gFaceIndices[base + 1]].xyz;
++    const float3 n2 = gWorldNorm[gFaceIndices[base + 2]].xyz;
++    const float3 n = n0 * (1.0f - barycentrics.x - barycentrics.y) + n1 * barycentrics.x + n2 * barycentrics.y;
++    const float len = length(n);
++    if (len < 1e-3f) {
++        return faceNormal;
++    }
++
++    const float3 smoothNormal = n / len;
++    return (dot(smoothNormal, faceNormal) < 0.0f) ? -smoothNormal : smoothNormal;
 +}
 +
 +// Brightening from the preset's glows at a hit point (0 = none).
@@ -19915,11 +20039,16 @@ index 0000000..eb80ab1
 +    const float strength = characterReceiver ? gParams.characterShadowStrength : gParams.shadowStrength;
 +    float factor = 1.0f - strength * (1.0f - lit);
 +
-+    // Contact shadows: short cosine-weighted hemisphere rays against all workloads' geometry.
-+    if (gParams.aoSamples > 0) {
-+        const float3 helper = (abs(normal.y) < 0.99f) ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
-+        const float3 tangent = normalize(cross(helper, normal));
-+        const float3 bitangent = cross(normal, tangent);
++    // Ambient occlusion: cosine-weighted hemisphere rays against all workloads' geometry, around the smooth
++    // normal on lit draws. Directions that dip below the flat triangle are mirrored back above it (no self-hits
++    // from the smoothing); a hit at distance t occludes by 1 - (t / radius)^2, so far hits fade in softly.
++    const bool aoSplitOff = (gParams.aoSplit != 0) && (pixel.x < (gParams.resolution.x / 2));
++    if ((gParams.aoSamples > 0) && !aoSplitOff && (gParams.aoCycleOff == 0)) {
++        const float3 hemisphere = aoNormal(primary.CommittedGeometryIndex(), primary.CommittedPrimitiveIndex(), primary.CommittedTriangleBarycentrics(), normal);
++        const float3 helper = (abs(hemisphere.y) < 0.99f) ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
++        const float3 tangent = normalize(cross(helper, hemisphere));
++        const float3 bitangent = cross(hemisphere, tangent);
++        const float aoRadius = characterReceiver ? gParams.aoCharacterRadius : gParams.aoRadius;
 +        float occluded = 0.0f;
 +        for (uint a = 0; a < gParams.aoSamples; a++) {
 +            const uint seed = gParams.frameIndex * 64 + 40 + a * 2;
@@ -19927,13 +20056,17 @@ index 0000000..eb80ab1
 +            const float v = noise(pixel + uint2(13, 97), seed + 1);
 +            const float r = sqrt(u);
 +            const float phi = 6.2831853f * v;
-+            const float3 dir = normalize(tangent * (r * cos(phi)) + bitangent * (r * sin(phi)) + normal * sqrt(max(1.0f - u, 0.0f)));
++            float3 dir = normalize(tangent * (r * cos(phi)) + bitangent * (r * sin(phi)) + hemisphere * sqrt(max(1.0f - u, 0.0f)));
++            const float below = dot(dir, normal);
++            if (below < 0.0f) {
++                dir = normalize(dir - 2.0f * below * normal);
++            }
 +
 +            RayDesc aoRay;
 +            aoRay.Origin = hitPos + normal * 0.5f;
 +            aoRay.Direction = dir;
 +            aoRay.TMin = 0.5f;
-+            aoRay.TMax = gParams.aoRadius;
++            aoRay.TMax = aoRadius;
 +            RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> ao;
 +            ao.TraceRayInline(gScene, RAY_FLAG_NONE, 0xFF, aoRay);
 +            while (ao.Proceed()) {
@@ -19943,12 +20076,18 @@ index 0000000..eb80ab1
 +            }
 +
 +            if (ao.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
-+                occluded += 1.0f;
++                const float reach = saturate(ao.CommittedRayT() / aoRadius);
++                occluded += 1.0f - reach * reach;
 +            }
 +        }
 +
-+        const float aoStrength = gParams.aoStrength * (characterReceiver ? 0.5f : 1.0f);
-+        const float aoFactor = 1.0f - aoStrength * (occluded / float(gParams.aoSamples));
++        const float aoStrength = characterReceiver ? gParams.aoCharacterStrength : gParams.aoStrength;
++        const float aoGain = characterReceiver ? gParams.aoCharacterGain : gParams.aoGain;
++        const float aoFactor = 1.0f - aoStrength * saturate(aoGain * occluded / float(gParams.aoSamples));
++        if (gParams.mode == WCW_RT_MODE_AO_RAW) {
++            gOutput[pixel] = float4(aoFactor, aoFactor, aoFactor, 1.0f);
++            return;
++        }
 +        factor = (gParams.mode == WCW_RT_MODE_AO) ? aoFactor : factor * aoFactor;
 +    }
 +
@@ -19976,10 +20115,10 @@ index b51cf09..19048ae 100644
  };
 diff --git a/src/shared/rt64_wcw_rt.h b/src/shared/rt64_wcw_rt.h
 new file mode 100644
-index 0000000..c07bd98
+index 0000000..6aa9709
 --- /dev/null
 +++ b/src/shared/rt64_wcw_rt.h
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,127 @@
 +//
 +// RT64
 +//
@@ -20001,6 +20140,8 @@ index 0000000..c07bd98
 +// Light placement view: red dots under the lights, a 100-unit world grid, and the lights'
 +// center lines (X red, Z blue) on every surface. Also set by "debugMode": 8 in the presets file.
 +#define WCW_RT_MODE_LIGHT_MAP 8
++// Raw ambient occlusion of this frame in grey, not filtered or composited (tuning the AO's look and noise).
++#define WCW_RT_MODE_AO_RAW 9
 +
 +#define WCW_RT_MAX_LIGHTS 8
 +#define WCW_RT_MAX_GLOWS 4
@@ -20009,7 +20150,9 @@ index 0000000..c07bd98
 +#define WCW_RT_MESH_CULLED 0x80000000u
 +// Bit 30: a character draw (AKI scales wrestler models, world geometry has unit scale).
 +#define WCW_RT_MESH_CHARACTER 0x40000000u
-+#define WCW_RT_MESH_FLAGS (WCW_RT_MESH_CULLED | WCW_RT_MESH_CHARACTER)
++// Bit 29: a lit draw (G_LIGHTING): its vertices carry real normals, which the AO interpolates.
++#define WCW_RT_MESH_LIT 0x20000000u
++#define WCW_RT_MESH_FLAGS (WCW_RT_MESH_CULLED | WCW_RT_MESH_CHARACTER | WCW_RT_MESH_LIT)
 +
 +// Per-mesh tile word: RDP/GPU tile index in the low bits, plus whether the draw alpha tests
 +// (rays skip its transparent texels) and whether its UVs get the non-perspective correction.
@@ -20047,8 +20190,9 @@ index 0000000..c07bd98
 +        uint historyValid;
 +        // Jittered shadow rays per light per pixel per frame.
 +        uint samplesPerLight;
-+        // Contact shadows: aoSamples short cosine-weighted rays of length aoRadius per pixel
-+        // per frame; occluded fraction darkens by aoStrength (halved on characters).
++        // Ambient occlusion: aoSamples cosine-weighted rays of length aoRadius per pixel per frame; a hit at
++        // distance t occludes by 1 - (t / radius)^2 and the occluded fraction darkens by aoStrength. Characters
++        // use aoCharacterStrength / aoCharacterRadius (below).
 +        uint aoSamples;
 +        float aoRadius;
 +        float aoStrength;
@@ -20075,6 +20219,23 @@ index 0000000..c07bd98
 +        float glowPadding2;
 +        float4 glows[WCW_RT_MAX_GLOWS];
 +        float4 glowIntensity;
++        float aoCharacterStrength;
++        float aoCharacterRadius;
++        // 1: lit draws use their interpolated vertex normals for the AO hemisphere (WCW_RT_AO_SMOOTH=0 turns it off).
++        uint aoSmoothNormals;
++        // Contrast: the occluded fraction is scaled by this (then clamped to 1) before darkening, so creases
++        // that block part of the hemisphere read clearly. Wrestlers are mostly convex: without it, AO only shows
++        // in the tightest corners.
++        float aoGain;
++        // WCW_RT_AO_SPLIT=1: no AO on the left half of the screen (same-moment before/after comparisons).
++        uint aoSplit;
++        // Resolve: radius of the depth-aware tent filter (2 = 5x5). Wider smooths AO and soft shadow grain;
++        // the depth weights keep object edges sharp. WCW_RT_FILTER_RADIUS overrides.
++        uint filterRadius;
++        // Contrast gain on characters (aoGain is the world's): wrestlers carry the AO the owner wants to see.
++        float aoCharacterGain;
++        // 1 while WCW_RT_AO_CYCLE has AO switched off (full-screen on/off comparisons over time).
++        uint aoCycleOff;
 +    };
 +
 +    struct WcwRtCompositeCB {
@@ -20087,10 +20248,10 @@ index 0000000..c07bd98
 +#endif
 diff --git a/tests/wcw/rt64_wcw_logic_tests.cpp b/tests/wcw/rt64_wcw_logic_tests.cpp
 new file mode 100644
-index 0000000..869000e
+index 0000000..08b6287
 --- /dev/null
 +++ b/tests/wcw/rt64_wcw_logic_tests.cpp
-@@ -0,0 +1,249 @@
+@@ -0,0 +1,336 @@
 +//
 +// RT64
 +//
@@ -20128,6 +20289,93 @@ index 0000000..869000e
 +            CHECK(shadowCasterFresh(frame, built));
 +        }
 +    }
++}
++
++// Ray-traced ambient occlusion
++
++TEST_CASE("ao: Off traces no occlusion rays") {
++    for (uint32_t quality = 0; quality <= 2; quality++) {
++        const AoSettings off = aoSettings(uint32_t(AoLevel::Off), quality);
++        CHECK_EQ(off.samples, 0u);
++        CHECK_EQ(off.strength, 0.0f);
++        CHECK_EQ(off.characterStrength, 0.0f);
++    }
++}
++
++TEST_CASE("ao: Strong is stronger, reaches further and samples more than Subtle") {
++    for (uint32_t quality = 0; quality <= 2; quality++) {
++        const AoSettings subtle = aoSettings(uint32_t(AoLevel::Subtle), quality);
++        const AoSettings strong = aoSettings(uint32_t(AoLevel::Strong), quality);
++        CHECK(subtle.samples > 0);
++        CHECK(strong.samples > subtle.samples);
++        CHECK(strong.strength > subtle.strength);
++        CHECK(strong.characterStrength > subtle.characterStrength);
++        CHECK(strong.radius > subtle.radius);
++        CHECK(strong.characterRadius >= subtle.characterRadius);
++        CHECK((strong.strength <= 1.0f) && (strong.characterStrength <= 1.0f));
++    }
++}
++
++TEST_CASE("ao: wrestlers aren't halved any more (the old 0.5x left their AO invisible)") {
++    for (uint32_t level = 1; level <= 2; level++) {
++        const AoSettings settings = aoSettings(level, 1);
++        CHECK(settings.characterStrength >= 0.8f * settings.strength);
++        CHECK(settings.characterRadius > 0.0f);
++        CHECK(settings.characterRadius <= settings.radius);
++    }
++}
++
++TEST_CASE("ao: reach suits the AKI world scale and contrast stays below the blotchy range") {
++    // A 25-40 unit reach only caught surfaces that almost touch (rings are several hundred units across);
++    // a gain of 3 turned sampling noise into dark blotches on the wrestlers.
++    for (uint32_t level = 1; level <= 2; level++) {
++        const AoSettings settings = aoSettings(level, 1);
++        CHECK(settings.radius >= 40.0f);
++        CHECK((settings.gain >= 1.0f) && (settings.gain <= 2.5f));
++    }
++
++    CHECK(aoSettings(uint32_t(AoLevel::Strong), 1).gain > aoSettings(uint32_t(AoLevel::Subtle), 1).gain);
++}
++
++TEST_CASE("ao: wrestlers stay below the muddy range at the normal camera distance") {
++    // Owner review of a CPU match: wrestler strength 0.85 with gain 2.5 and a 45-unit reach darkened whole bodies
++    // instead of creases, and an 80-unit world reach left grime along the ring edges. Keep the AO in creases and
++    // contacts: moderate strength and gain, short reach.
++    for (uint32_t level = 1; level <= 2; level++) {
++        const AoSettings settings = aoSettings(level, 1);
++        CHECK(settings.characterStrength <= 0.65f);
++        CHECK(settings.characterGain <= 2.0f);
++        CHECK(settings.characterRadius <= 35.0f);
++        CHECK(settings.radius <= 65.0f);
++    }
++
++    const AoSettings subtle = aoSettings(uint32_t(AoLevel::Subtle), 1);
++    const AoSettings strong = aoSettings(uint32_t(AoLevel::Strong), 1);
++    CHECK(subtle.characterGain < strong.characterGain);
++}
++
++TEST_CASE("ao cycle: alternates every period on wall-clock boundaries, on first") {
++    CHECK(aoCycleOn(0, 2000));
++    CHECK(aoCycleOn(1999, 2000));
++    CHECK(!aoCycleOn(2000, 2000));
++    CHECK(!aoCycleOn(3999, 2000));
++    CHECK(aoCycleOn(4000, 2000));
++    CHECK(aoCycleOn(123456789, 0));
++}
++
++TEST_CASE("ao: quality only changes the sample count") {
++    for (uint32_t level = 1; level <= 2; level++) {
++        const AoSettings performance = aoSettings(level, 0);
++        const AoSettings quality = aoSettings(level, 2);
++        CHECK(quality.samples >= performance.samples);
++        CHECK_EQ(quality.strength, performance.strength);
++        CHECK_EQ(quality.radius, performance.radius);
++        CHECK_EQ(quality.characterRadius, performance.characterRadius);
++    }
++}
++
++TEST_CASE("ao: out-of-range levels clamp to Strong") {
++    CHECK_EQ(aoSettings(7, 1).samples, aoSettings(uint32_t(AoLevel::Strong), 1).samples);
 +}
 +
 +// CRT beam simulator

@@ -312,16 +312,17 @@ index b9c5458..4c5926e 100644
 +    add_dependencies(recompui recompui_wcw_tests_run)
 +endif()
 diff --git a/recompui/include/recompui/config.h b/recompui/include/recompui/config.h
-index 38b84f5..4b057d0 100644
+index 38b84f5..d07d8d2 100644
 --- a/recompui/include/recompui/config.h
 +++ b/recompui/include/recompui/config.h
-@@ -61,11 +61,26 @@ namespace recompui {
+@@ -61,11 +61,27 @@ namespace recompui {
                  inline const std::string hpfb_option = "hpfb_option";
                  inline const std::string rr_manual_value = "rr_manual_value";
                  inline const std::string ds_option = "ds_option";
 +                // [wcw rt] Experimental hybrid ray tracing (RT64 WcwRaytracer).
 +                inline const std::string rt_option = "rt_option";
 +                inline const std::string rt_quality_option = "rt_quality_option";
++                inline const std::string rt_ao_option = "rt_ao_option";
 +                // [wcw crt] CRT presentation filter (RT64 CrtFilter).
 +                inline const std::string crt_filter_option = "crt_filter_option";
 +                inline const std::string crt_signal_option = "crt_signal_option";
@@ -515,7 +516,7 @@ index 0000000..80cf16b
 +    void apply_choice(ultramodern::renderer::RefreshRate &option, int &manual_value, uint32_t smooth_rate);
 +};
 diff --git a/recompui/src/config/ui_config_tab_graphics.cpp b/recompui/src/config/ui_config_tab_graphics.cpp
-index 4fdf81f..ea2c306 100644
+index 4fdf81f..7a8a2ee 100644
 --- a/recompui/src/config/ui_config_tab_graphics.cpp
 +++ b/recompui/src/config/ui_config_tab_graphics.cpp
 @@ -1,7 +1,12 @@
@@ -531,7 +532,7 @@ index 4fdf81f..ea2c306 100644
  
  static bool created_graphics_config = false;
  
-@@ -64,6 +69,96 @@ namespace recompui {
+@@ -64,6 +69,109 @@ namespace recompui {
          #endif
          };
  
@@ -550,6 +551,19 @@ index 4fdf81f..ea2c306 100644
 +        static EnumOptionVector ray_tracing_options = {
 +            {RayTracingOption::Off, "Off", "Off"},
 +            {RayTracingOption::On, "On", "On"},
++        };
++
++        // Matches RT64::WcwLogic::AoLevel.
++        enum class AmbientOcclusionOption {
++            Off = 0,
++            Subtle = 1,
++            Strong = 2
++        };
++
++        static EnumOptionVector ambient_occlusion_options = {
++            {AmbientOcclusionOption::Off, "Off", "Off"},
++            {AmbientOcclusionOption::Subtle, "Subtle", "Subtle"},
++            {AmbientOcclusionOption::Strong, "Strong", "Strong"},
 +        };
 +
 +        static EnumOptionVector ray_tracing_quality_options = {
@@ -628,7 +642,7 @@ index 4fdf81f..ea2c306 100644
          static EnumOptionVector aspect_ratio_options = {
              {ultramodern::renderer::AspectRatio::Original, "Original"},
              {ultramodern::renderer::AspectRatio::Expand, "Expand"},
-@@ -83,6 +178,28 @@ namespace recompui {
+@@ -83,6 +191,28 @@ namespace recompui {
              {ultramodern::renderer::RefreshRate::Manual, "Manual"},
          };
  
@@ -657,7 +671,7 @@ index 4fdf81f..ea2c306 100644
          static EnumOptionVector hpfb_options = {
              {ultramodern::renderer::HighPrecisionFramebuffer::Auto, "Auto"},
              {ultramodern::renderer::HighPrecisionFramebuffer::On, "On"},
-@@ -152,11 +269,12 @@ namespace recompui {
+@@ -152,11 +282,12 @@ namespace recompui {
          }
  
          static std::string get_framerate_text(uint32_t refresh_rate) {
@@ -671,7 +685,7 @@ index 4fdf81f..ea2c306 100644
                  "<br />"
                  "<br />"
                  "<recomp-color primary>Detected display refresh rate: " + std::to_string(refresh_rate) + "hz</recomp-color>";
-@@ -175,9 +293,30 @@ namespace recompui {
+@@ -175,9 +306,31 @@ namespace recompui {
              new_config.hpfb_option = get_graphics_enum_value<ultramodern::renderer::HighPrecisionFramebuffer>(graphics::options::hpfb_option);
              new_config.rr_manual_value = get_graphics_number_value<int>(graphics::options::rr_manual_value);
  
@@ -686,7 +700,8 @@ index 4fdf81f..ea2c306 100644
 +            // [wcw rt] Takes effect on the next frame (no renderer restart needed).
 +            RT64::WcwRaytracer::setUserSettings(
 +                get_graphics_enum_value<RayTracingOption>(graphics::options::rt_option) == RayTracingOption::On,
-+                uint32_t(get_graphics_enum_value<RayTracingQuality>(graphics::options::rt_quality_option)));
++                uint32_t(get_graphics_enum_value<RayTracingQuality>(graphics::options::rt_quality_option)),
++                uint32_t(get_graphics_enum_value<AmbientOcclusionOption>(graphics::options::rt_ao_option)));
 +
 +            // [wcw crt] Takes effect on the next frame; the first use of a preset compiles its shaders.
 +            RT64::CrtFilter::Settings crt_settings;
@@ -702,7 +717,7 @@ index 4fdf81f..ea2c306 100644
          }
  
          void graphics::update_msaa_supported(bool supported) {
-@@ -202,11 +341,47 @@ namespace recompui {
+@@ -202,11 +355,47 @@ namespace recompui {
              }
          }
  
@@ -752,7 +767,7 @@ index 4fdf81f..ea2c306 100644
          }
  
          void graphics::toggle_fullscreen() {
-@@ -299,12 +474,17 @@ namespace recompui {
+@@ -299,12 +488,17 @@ namespace recompui {
                  wm_default()
              );
  
@@ -774,7 +789,7 @@ index 4fdf81f..ea2c306 100644
              );
  
              config.add_number_option(
-@@ -314,12 +494,28 @@ namespace recompui {
+@@ -314,12 +508,28 @@ namespace recompui {
                  20.0, 240.0, 1.0, 0, false, 60.0
              );
              {
@@ -809,7 +824,7 @@ index 4fdf81f..ea2c306 100644
              }
  
              config.add_enum_option(
-@@ -359,6 +555,119 @@ namespace recompui {
+@@ -359,6 +569,134 @@ namespace recompui {
                  true
              );
  
@@ -918,9 +933,24 @@ index 4fdf81f..ea2c306 100644
 +                ray_tracing_quality_options,
 +                RayTracingQuality::Balanced
 +            );
++            config.add_enum_option(
++                graphics::options::rt_ao_option,
++                "Ambient Occlusion",
++                "Ray-traced ambient occlusion: soft shading where surfaces meet or crowd each other "
++                "(under arms and chins, between the legs, where wrestlers touch the mat and ropes). "
++                "<recomp-color primary>Subtle</recomp-color> keeps it light. <recomp-color primary>Strong</recomp-color> "
++                "makes it more visible and traces more rays.",
++                ambient_occlusion_options,
++                AmbientOcclusionOption::Subtle
++            );
 +            {
 +                config.add_option_hidden_dependency(
 +                    graphics::options::rt_quality_option,
++                    graphics::options::rt_option,
++                    RayTracingOption::Off
++                );
++                config.add_option_hidden_dependency(
++                    graphics::options::rt_ao_option,
 +                    graphics::options::rt_option,
 +                    RayTracingOption::Off
 +                );
