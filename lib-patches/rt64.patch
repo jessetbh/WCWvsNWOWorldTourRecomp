@@ -243,10 +243,10 @@ index f555048..a9de81e 100644
      }
 diff --git a/src/common/rt64_wcw_logic.cpp b/src/common/rt64_wcw_logic.cpp
 new file mode 100644
-index 0000000..044400f
+index 0000000..45c2c29
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.cpp
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,252 @@
 +//
 +// RT64
 +//
@@ -254,6 +254,7 @@ index 0000000..044400f
 +#include "rt64_wcw_logic.h"
 +
 +#include <algorithm>
++#include <cmath>
 +
 +namespace RT64::WcwLogic {
 +    bool shadowCasterFresh(uint64_t frameCounter, uint64_t builtFrame) {
@@ -295,6 +296,109 @@ index 0000000..044400f
 +
 +    bool aoCycleOn(uint64_t unixMs, uint64_t periodMs) {
 +        return (periodMs == 0) || (((unixMs / periodMs) % 2) == 0);
++    }
++
++    std::vector<float> blueNoiseTile(uint32_t size) {
++        const uint32_t count = size * size;
++        std::vector<float> values(count, 0.0f);
++        if ((size == 0) || ((size & (size - 1)) != 0)) {
++            return values;
++        }
++
++        // Toroidal Gaussian energy kernel (sigma 1.5), indexed by the offset between two cells.
++        const uint32_t mask = size - 1;
++        std::vector<float> kernel(count);
++        for (uint32_t y = 0; y < size; y++) {
++            for (uint32_t x = 0; x < size; x++) {
++                const float dx = float(std::min(x, size - x));
++                const float dy = float(std::min(y, size - y));
++                kernel[y * size + x] = std::exp(-(dx * dx + dy * dy) / (2.0f * 1.5f * 1.5f));
++            }
++        }
++
++        // energy[c] = sum of the kernel over every set cell, kept up to date as cells are set or cleared.
++        std::vector<uint8_t> set(count, 0);
++        std::vector<float> energy(count, 0.0f);
++        auto toggle = [&](uint32_t cell, float sign) {
++            set[cell] = (sign > 0.0f) ? 1 : 0;
++            const uint32_t cx = cell & mask, cy = cell / size;
++            for (uint32_t y = 0; y < size; y++) {
++                for (uint32_t x = 0; x < size; x++) {
++                    energy[y * size + x] += sign * kernel[((y - cy) & mask) * size + ((x - cx) & mask)];
++                }
++            }
++        };
++
++        // The densest set cell (tightest cluster) or the emptiest unset cell (largest void); ties go to the lowest index.
++        auto pick = [&](bool wantSet) {
++            uint32_t best = 0;
++            bool found = false;
++            for (uint32_t c = 0; c < count; c++) {
++                if ((set[c] != 0) != wantSet) {
++                    continue;
++                }
++
++                if (!found || (wantSet ? (energy[c] > energy[best]) : (energy[c] < energy[best]))) {
++                    best = c;
++                    found = true;
++                }
++            }
++
++            return best;
++        };
++
++        // Initial pattern: about 10% of the cells from a fixed LCG, then relaxed by moving the tightest cluster's
++        // cell into the largest void until that stops changing anything.
++        uint32_t lcg = 0x2545F491u;
++        const uint32_t initialCount = std::max(count / 10, 1u);
++        for (uint32_t placed = 0; placed < initialCount;) {
++            lcg = lcg * 1664525u + 1013904223u;
++            const uint32_t cell = (lcg >> 8) % count;
++            if (set[cell] == 0) {
++                toggle(cell, 1.0f);
++                placed++;
++            }
++        }
++
++        for (uint32_t i = 0; i < count; i++) {
++            const uint32_t cluster = pick(true);
++            toggle(cluster, -1.0f);
++            const uint32_t voidCell = pick(false);
++            if (voidCell == cluster) {
++                toggle(cluster, 1.0f);
++                break;
++            }
++
++            toggle(voidCell, 1.0f);
++        }
++
++        const std::vector<uint8_t> initialSet = set;
++        const std::vector<float> initialEnergy = energy;
++        std::vector<uint32_t> rank(count, 0);
++
++        // Phase 1: remove the tightest clusters one by one; the last cell removed gets rank 0.
++        for (uint32_t r = initialCount; r > 0; r--) {
++            const uint32_t cluster = pick(true);
++            toggle(cluster, -1.0f);
++            rank[cluster] = r - 1;
++        }
++
++        // Phases 2 and 3: from the initial pattern, fill the largest void until every cell is set. With a kernel
++        // that sums to the same total everywhere, the "tightest cluster of unset cells" of phase 3 is the same
++        // cell as the largest void, so one loop covers both.
++        set = initialSet;
++        energy = initialEnergy;
++        for (uint32_t r = initialCount; r < count; r++) {
++            const uint32_t voidCell = pick(false);
++            toggle(voidCell, 1.0f);
++            rank[voidCell] = r;
++        }
++
++        for (uint32_t c = 0; c < count; c++) {
++            values[c] = (float(rank[c]) + 0.5f) / float(count);
++        }
++
++        return values;
 +    }
 +
 +    BeamDecision decideBeam(uint32_t displayRefreshRate, bool vsync, bool interpolating, uint32_t contentRate) {
@@ -397,10 +501,10 @@ index 0000000..044400f
 +};
 diff --git a/src/common/rt64_wcw_logic.h b/src/common/rt64_wcw_logic.h
 new file mode 100644
-index 0000000..c6cd7a4
+index 0000000..4255bc4
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.h
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,150 @@
 +//
 +// RT64
 +//
@@ -411,6 +515,7 @@ index 0000000..c6cd7a4
 +#include <cstdint>
 +#include <mutex>
 +#include <unordered_map>
++#include <vector>
 +
 +// [wcw] Decision logic for frame interpolation, present pacing, the CRT beam simulator and ray-traced shadows, kept
 +// free of renderer state so it can be unit tested (tests/wcw). The renderer calls these functions; a change to any
@@ -456,6 +561,14 @@ index 0000000..c6cd7a4
 +    // The AO parameters for a menu level at a ray tracing quality (0 Performance, 1 Balanced, 2 Quality). Higher
 +    // quality only adds samples; the look (strengths, radii) depends on the level alone.
 +    AoSettings aoSettings(uint32_t level, uint32_t quality);
++
++    // Blue noise for the ray tracer's random samples (soft shadow jitter, AO directions): a size x size tile
++    // (size a power of two) built with void-and-cluster (Ulichney 1993) on a torus, so it tiles seamlessly.
++    // Returns the values in [0, 1), row-major: each rank appears once, as (rank + 0.5) / (size * size). Unlike
++    // white or interleaved gradient noise, neighbouring pixels get well-spread values, so the filtered result
++    // is fine even grain instead of blotches. Deterministic: the same size gives the same tile.
++    constexpr uint32_t BlueNoiseSize = 64;
++    std::vector<float> blueNoiseTile(uint32_t size);
 +
 +    // CRT beam simulator
 +
@@ -17968,10 +18081,10 @@ index 8a3782a..0789a75 100644
 \ No newline at end of file
 diff --git a/src/render/rt64_wcw_raytracer.cpp b/src/render/rt64_wcw_raytracer.cpp
 new file mode 100644
-index 0000000..3080147
+index 0000000..f9dde8d
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.cpp
-@@ -0,0 +1,1164 @@
+@@ -0,0 +1,1176 @@
 +//
 +// RT64
 +//
@@ -18073,6 +18186,7 @@ index 0000000..3080147
 +        traceBuilder.addStructuredBuffer(9);
 +        traceBuilder.addStructuredBuffer(10);
 +        traceBuilder.addStructuredBuffer(11);
++        traceBuilder.addStructuredBuffer(12);
 +        traceBuilder.end();
 +        traceSet = traceBuilder.create(device);
 +
@@ -18128,6 +18242,13 @@ index 0000000..3080147
 +        }
 +
 +        paramsBuffer = device->createBuffer(RenderBufferDesc::UploadBuffer(alignUp(sizeof(interop::WcwRtParams), 256), RenderBufferFlag::CONSTANT));
++
++        static_assert(WcwLogic::BlueNoiseSize == WCW_RT_BLUE_NOISE_SIZE, "the trace shader's blue noise tile size");
++        const std::vector<float> blueNoise = WcwLogic::blueNoiseTile(WcwLogic::BlueNoiseSize);
++        blueNoiseBuffer = device->createBuffer(RenderBufferDesc::UploadBuffer(blueNoise.size() * sizeof(float), RenderBufferFlag::STORAGE));
++        void *blueNoiseBytes = blueNoiseBuffer->map();
++        memcpy(blueNoiseBytes, blueNoise.data(), blueNoise.size() * sizeof(float));
++        blueNoiseBuffer->unmap();
 +    }
 +
 +    void WcwRaytracer::beginWorkload(uint64_t presentId) {
@@ -18919,6 +19040,8 @@ index 0000000..3080147
 +        params.aoSplit = (envFloat(getenv("WCW_RT_AO_SPLIT"), 0.0f) != 0.0f) ? 1u : 0u;
 +        params.filterRadius = uint32_t(std::clamp(envFloat(getenv("WCW_RT_FILTER_RADIUS"), 2.0f), 1.0f, 4.0f));
 +        params.aoCharacterGain = std::max(envFloat(getenv("WCW_RT_AO_GAIN_CHAR"), ao.characterGain), 0.0f);
++        params.noiseMode = (envFloat(getenv("WCW_RT_NOISE"), 1.0f) != 0.0f) ? 1u : 0u;
++        params.noiseSplit = (envFloat(getenv("WCW_RT_NOISE_SPLIT"), 0.0f) != 0.0f) ? 1u : 0u;
 +        {
 +            static const uint64_t aoCyclePeriodMs = uint64_t(std::max(envFloat(getenv("WCW_RT_AO_CYCLE"), 0.0f), 0.0f) * 1000.0f);
 +            const uint64_t unixMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
@@ -18984,6 +19107,8 @@ index 0000000..3080147
 +        traceSet->setBuffer(9, (texCoordBuffer != nullptr) ? texCoordBuffer : meshTilesBuffer.get(), 0, &float2View);
 +        traceSet->setBuffer(10, meshTilesBuffer.get(), meshTilesBufferSize, &uintView);
 +        traceSet->setBuffer(11, (worldNormBuffer != nullptr) ? worldNormBuffer : worldPosBuffer, (worldNormBuffer != nullptr) ? worldNormSize : worldPosSize, &float4View);
++        const RenderBufferStructuredView floatView(sizeof(float));
++        traceSet->setBuffer(12, blueNoiseBuffer.get(), WcwLogic::BlueNoiseSize * WcwLogic::BlueNoiseSize * sizeof(float), &floatView);
 +        compositeSet->setTexture(0, slot.output.get(), RenderTextureLayout::SHADER_READ);
 +
 +        // Trace.
@@ -19138,10 +19263,10 @@ index 0000000..3080147
 +};
 diff --git a/src/render/rt64_wcw_raytracer.h b/src/render/rt64_wcw_raytracer.h
 new file mode 100644
-index 0000000..49249e9
+index 0000000..e919a62
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.h
-@@ -0,0 +1,287 @@
+@@ -0,0 +1,289 @@
 +//
 +// RT64
 +//
@@ -19280,6 +19405,8 @@ index 0000000..49249e9
 +        std::unique_ptr<RenderBuffer> paramsBuffer;
 +        std::unique_ptr<RenderBuffer> meshStartsBuffer;
 +        uint64_t meshStartsBufferSize = 0;
++        // Blue noise tile for the trace's random samples (WcwLogic::blueNoiseTile), uploaded once.
++        std::unique_ptr<RenderBuffer> blueNoiseBuffer;
 +        std::unique_ptr<RenderTexture> outputTexture;
 +        std::unique_ptr<RenderTexture> currentTexture;
 +        uint32_t frameIndex = 0;
@@ -19614,10 +19741,10 @@ index 0000000..771e297
 +}
 diff --git a/src/shaders/WcwRtTraceCS.hlsl b/src/shaders/WcwRtTraceCS.hlsl
 new file mode 100644
-index 0000000..7b4382a
+index 0000000..b76a004
 --- /dev/null
 +++ b/src/shaders/WcwRtTraceCS.hlsl
-@@ -0,0 +1,481 @@
+@@ -0,0 +1,497 @@
 +//
 +// RT64
 +//
@@ -19646,6 +19773,8 @@ index 0000000..7b4382a
 +StructuredBuffer<uint> gMeshTiles : register(t10);
 +// World-space vertex normals (zero for vertices without one); only meaningful on lit meshes (WCW_RT_MESH_LIT).
 +StructuredBuffer<float4> gWorldNorm : register(t11);
++// Blue noise tile, WCW_RT_BLUE_NOISE_SIZE squared values in [0, 1), row-major.
++StructuredBuffer<float> gBlueNoise : register(t12);
 +// The framebuffer renderer's bindless RGBA texture cache.
 +Texture2D<float4> gTextures[8192] : register(t0, space1);
 +
@@ -19724,6 +19853,22 @@ index 0000000..7b4382a
 +float noise(uint2 pixel, uint seed) {
 +    const float2 p = float2(pixel) + float(seed) * 5.588238f;
 +    return frac(52.9829189f * frac(0.06711056f * p.x + 0.00583715f * p.y));
++}
++
++// Random sample `dim` of a pixel this frame, in [0, 1). Blue noise: every dimension reads the tile at its own
++// toroidal offset (R2 sequence), so dimensions are uncorrelated, and each frame rotates all values by the golden
++// ratio, so the temporal resolve averages well-spread values. The old interleaved gradient noise stays available
++// (WCW_RT_NOISE=0, or the left half with WCW_RT_NOISE_SPLIT=1); igOffset decorrelates its uses.
++float sampleNoise(uint2 pixel, uint dim, uint2 igOffset) {
++    const bool oldNoise = (gParams.noiseMode == 0) || ((gParams.noiseSplit != 0) && (pixel.x < (gParams.resolution.x / 2)));
++    if (oldNoise) {
++        return noise(pixel + igOffset, gParams.frameIndex * 64 + dim);
++    }
++
++    const uint size = WCW_RT_BLUE_NOISE_SIZE;
++    const uint2 shift = uint2(frac(float(dim) * 0.7548776662f) * float(size), frac(float(dim) * 0.5698402910f) * float(size));
++    const uint2 p = (pixel + shift) & (size - 1);
++    return frac(gBlueNoise[p.y * size + p.x] + float(gParams.frameIndex & 1023u) * 0.6180339887f);
 +}
 +
 +bool resolvedMode() {
@@ -19983,8 +20128,7 @@ index 0000000..7b4382a
 +    for (uint s = 0, samples = max(gParams.samplesPerLight, 1) * uint(clamp(round(gParams.lights[l].w), 1.0f, 4.0f)); s < samples; s++, i++) {
 +        // Area light: jittered samples on the light's panel (soft penumbrae, refined over
 +        // frames by the resolve pass).
-+        const uint seed = gParams.frameIndex * 64 + i * 2;
-+        const float2 jitter = float2(noise(pixel, seed), noise(pixel + uint2(37, 113), seed + 1)) - 0.5f;
++        const float2 jitter = float2(sampleNoise(pixel, i * 2, uint2(0, 0)), sampleNoise(pixel, i * 2 + 1, uint2(37, 113))) - 0.5f;
 +        const float2 offset = jitter * gParams.lightSize;
 +        const float weight = lightWeights[l] / max(weightSum, 1e-6f) / float(samples);
 +        const float3 lightPos = gParams.lights[l].xyz + float3(offset.x, 0.0f, offset.y);
@@ -20051,9 +20195,8 @@ index 0000000..7b4382a
 +        const float aoRadius = characterReceiver ? gParams.aoCharacterRadius : gParams.aoRadius;
 +        float occluded = 0.0f;
 +        for (uint a = 0; a < gParams.aoSamples; a++) {
-+            const uint seed = gParams.frameIndex * 64 + 40 + a * 2;
-+            const float u = noise(pixel + uint2(71, 29), seed);
-+            const float v = noise(pixel + uint2(13, 97), seed + 1);
++            const float u = sampleNoise(pixel, 40 + a * 2, uint2(71, 29));
++            const float v = sampleNoise(pixel, 41 + a * 2, uint2(13, 97));
 +            const float r = sqrt(u);
 +            const float phi = 6.2831853f * v;
 +            float3 dir = normalize(tangent * (r * cos(phi)) + bitangent * (r * sin(phi)) + hemisphere * sqrt(max(1.0f - u, 0.0f)));
@@ -20115,10 +20258,10 @@ index b51cf09..19048ae 100644
  };
 diff --git a/src/shared/rt64_wcw_rt.h b/src/shared/rt64_wcw_rt.h
 new file mode 100644
-index 0000000..6aa9709
+index 0000000..ef7a65f
 --- /dev/null
 +++ b/src/shared/rt64_wcw_rt.h
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,135 @@
 +//
 +// RT64
 +//
@@ -20142,6 +20285,9 @@ index 0000000..6aa9709
 +#define WCW_RT_MODE_LIGHT_MAP 8
 +// Raw ambient occlusion of this frame in grey, not filtered or composited (tuning the AO's look and noise).
 +#define WCW_RT_MODE_AO_RAW 9
++
++// Side of the blue noise tile the trace shader samples (WcwLogic::BlueNoiseSize; a power of two).
++#define WCW_RT_BLUE_NOISE_SIZE 64
 +
 +#define WCW_RT_MAX_LIGHTS 8
 +#define WCW_RT_MAX_GLOWS 4
@@ -20236,6 +20382,11 @@ index 0000000..6aa9709
 +        float aoCharacterGain;
 +        // 1 while WCW_RT_AO_CYCLE has AO switched off (full-screen on/off comparisons over time).
 +        uint aoCycleOff;
++        // Random samples (shadow jitter, AO directions): 1 = blue noise from the WCW_RT_BLUE_NOISE_SIZE tile, 0 = the
++        // old interleaved gradient noise (WCW_RT_NOISE=0).
++        uint noiseMode;
++        // WCW_RT_NOISE_SPLIT=1: the old noise on the left half of the screen (same-moment comparisons).
++        uint noiseSplit;
 +    };
 +
 +    struct WcwRtCompositeCB {
@@ -20248,10 +20399,10 @@ index 0000000..6aa9709
 +#endif
 diff --git a/tests/wcw/rt64_wcw_logic_tests.cpp b/tests/wcw/rt64_wcw_logic_tests.cpp
 new file mode 100644
-index 0000000..08b6287
+index 0000000..fa5b2ed
 --- /dev/null
 +++ b/tests/wcw/rt64_wcw_logic_tests.cpp
-@@ -0,0 +1,336 @@
+@@ -0,0 +1,425 @@
 +//
 +// RT64
 +//
@@ -20376,6 +20527,95 @@ index 0000000..08b6287
 +
 +TEST_CASE("ao: out-of-range levels clamp to Strong") {
 +    CHECK_EQ(aoSettings(7, 1).samples, aoSettings(uint32_t(AoLevel::Strong), 1).samples);
++}
++
++// Blue noise (ray tracer sample jitter)
++
++static const std::vector<float> &blueTile() {
++    static const std::vector<float> tile = blueNoiseTile(BlueNoiseSize);
++    return tile;
++}
++
++TEST_CASE("blue noise: every rank appears exactly once") {
++    const std::vector<float> &tile = blueTile();
++    const uint32_t count = BlueNoiseSize * BlueNoiseSize;
++    CHECK_EQ(tile.size(), size_t(count));
++    std::vector<int> seen(count, 0);
++    for (float v : tile) {
++        CHECK(v > 0.0f && v < 1.0f);
++        const int rank = int(std::lround(v * float(count) - 0.5f));
++        CHECK(rank >= 0 && rank < int(count));
++        if (rank >= 0 && rank < int(count)) {
++            seen[rank]++;
++        }
++    }
++
++    CHECK(std::all_of(seen.begin(), seen.end(), [](int n) { return n == 1; }));
++}
++
++TEST_CASE("blue noise: the same size always gives the same tile") {
++    CHECK(blueNoiseTile(BlueNoiseSize) == blueTile());
++}
++
++TEST_CASE("blue noise: sizes that aren't powers of two give an all-zero tile") {
++    const std::vector<float> tile = blueNoiseTile(48);
++    CHECK_EQ(tile.size(), size_t(48 * 48));
++    CHECK(std::all_of(tile.begin(), tile.end(), [](float v) { return v == 0.0f; }));
++}
++
++TEST_CASE("blue noise: 4x4 neighbourhoods average close to 0.5 (no low-frequency blotches)") {
++    // White noise: the mean of 16 uniform values has a standard deviation of about 0.072. Blotchy noise is what
++    // the old interleaved gradient noise turned into after filtering; blue noise keeps every block near 0.5.
++    const std::vector<float> &tile = blueTile();
++    double sumSq = 0.0, worst = 0.0;
++    int blocks = 0;
++    for (uint32_t by = 0; by < BlueNoiseSize; by += 4) {
++        for (uint32_t bx = 0; bx < BlueNoiseSize; bx += 4) {
++            double mean = 0.0;
++            for (uint32_t y = 0; y < 4; y++) {
++                for (uint32_t x = 0; x < 4; x++) {
++                    mean += tile[(by + y) * BlueNoiseSize + bx + x];
++                }
++            }
++
++            mean /= 16.0;
++            sumSq += (mean - 0.5) * (mean - 0.5);
++            worst = std::max(worst, std::abs(mean - 0.5));
++            blocks++;
++        }
++    }
++
++    CHECK(std::sqrt(sumSq / blocks) < 0.04);
++    CHECK(worst < 0.15);
++}
++
++TEST_CASE("blue noise: the lowest 10% of values never sit next to each other") {
++    // Any threshold of a blue noise tile is an evenly spread point set: at 10% density no two points touch,
++    // diagonals included, even across the tile's wrap-around edges.
++    const std::vector<float> &tile = blueTile();
++    const int n = int(BlueNoiseSize);
++    std::vector<std::pair<int, int>> points;
++    for (int y = 0; y < n; y++) {
++        for (int x = 0; x < n; x++) {
++            if (tile[y * n + x] < 0.1f) {
++                points.emplace_back(x, y);
++            }
++        }
++    }
++
++    int touching = 0;
++    for (size_t i = 0; i < points.size(); i++) {
++        for (size_t j = i + 1; j < points.size(); j++) {
++            int dx = std::abs(points[i].first - points[j].first), dy = std::abs(points[i].second - points[j].second);
++            dx = std::min(dx, n - dx);
++            dy = std::min(dy, n - dy);
++            if ((dx <= 1) && (dy <= 1)) {
++                touching++;
++            }
++        }
++    }
++
++    CHECK_EQ(touching, 0);
 +}
 +
 +// CRT beam simulator
