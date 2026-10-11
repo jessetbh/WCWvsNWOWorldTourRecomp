@@ -243,10 +243,10 @@ index f555048..a9de81e 100644
      }
 diff --git a/src/common/rt64_wcw_logic.cpp b/src/common/rt64_wcw_logic.cpp
 new file mode 100644
-index 0000000..45c2c29
+index 0000000..e07cef4
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.cpp
-@@ -0,0 +1,252 @@
+@@ -0,0 +1,256 @@
 +//
 +// RT64
 +//
@@ -296,6 +296,10 @@ index 0000000..45c2c29
 +
 +    bool aoCycleOn(uint64_t unixMs, uint64_t periodMs) {
 +        return (periodMs == 0) || (((unixMs / periodMs) % 2) == 0);
++    }
++
++    DenoiseSettings denoiseSettings() {
++        return DenoiseSettings();
 +    }
 +
 +    std::vector<float> blueNoiseTile(uint32_t size) {
@@ -501,10 +505,10 @@ index 0000000..45c2c29
 +};
 diff --git a/src/common/rt64_wcw_logic.h b/src/common/rt64_wcw_logic.h
 new file mode 100644
-index 0000000..4255bc4
+index 0000000..c8410bb
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.h
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,167 @@
 +//
 +// RT64
 +//
@@ -561,6 +565,23 @@ index 0000000..4255bc4
 +    // The AO parameters for a menu level at a ray tracing quality (0 Performance, 1 Balanced, 2 Quality). Higher
 +    // quality only adds samples; the look (strengths, radii) depends on the level alone.
 +    AoSettings aoSettings(uint32_t level, uint32_t quality);
++
++    // The resolve pass's cleanup of the traced shadow and AO terms, which it filters and accumulates separately.
++    // Shadows have real edges (a wrestler's outline on the mat), so they get a tight spatial filter and react
++    // quickly; AO is soft by nature and the noisier term (few rays in every direction), so it gets a wide filter
++    // and a longer history. Radii are in trace pixels (1 = 3x3); alpha is the weight of this frame's value
++    // against the reprojected history.
++    struct DenoiseSettings {
++        uint32_t shadowRadius = 1;
++        uint32_t aoRadius = 3;
++        float shadowAlpha = 0.1f;
++        float aoAlpha = 0.06f;
++    };
++
++    // The resolve filter reads up to this many pixels around each pixel; the trace rect's margin must cover it.
++    constexpr uint32_t DenoiseMaxRadius = 4;
++
++    DenoiseSettings denoiseSettings();
 +
 +    // Blue noise for the ray tracer's random samples (soft shadow jitter, AO directions): a size x size tile
 +    // (size a power of two) built with void-and-cluster (Ulichney 1993) on a torus, so it tiles seamlessly.
@@ -18081,10 +18102,10 @@ index 8a3782a..0789a75 100644
 \ No newline at end of file
 diff --git a/src/render/rt64_wcw_raytracer.cpp b/src/render/rt64_wcw_raytracer.cpp
 new file mode 100644
-index 0000000..d98a664
+index 0000000..ca0bb37
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.cpp
-@@ -0,0 +1,1183 @@
+@@ -0,0 +1,1194 @@
 +//
 +// RT64
 +//
@@ -18912,7 +18933,7 @@ index 0000000..d98a664
 +            traceWidth = std::max(uint32_t(std::ceil(outputWidth * traceScale)), 1u);
 +            traceHeight = std::max(uint32_t(std::ceil(outputHeight * traceScale)), 1u);
 +            outputTexture = device->createTexture(RenderTextureDesc::Texture2D(traceWidth, traceHeight, 1, RenderFormat::R16G16B16A16_FLOAT, RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS));
-+            currentTexture = device->createTexture(RenderTextureDesc::Texture2D(traceWidth, traceHeight, 1, RenderFormat::R32G32_FLOAT, RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS));
++            currentTexture = device->createTexture(RenderTextureDesc::Texture2D(traceWidth, traceHeight, 1, RenderFormat::R32G32B32A32_FLOAT, RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS));
 +        }
 +
 +        Slot &slot = slots[currentSlot];
@@ -18920,7 +18941,7 @@ index 0000000..d98a664
 +            slot.historyWidth = traceWidth;
 +            slot.historyHeight = traceHeight;
 +            for (auto &history : slot.history) {
-+                history = device->createTexture(RenderTextureDesc::Texture2D(traceWidth, traceHeight, 1, RenderFormat::R16_FLOAT, RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS));
++                history = device->createTexture(RenderTextureDesc::Texture2D(traceWidth, traceHeight, 1, RenderFormat::R16G16_FLOAT, RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS));
 +            }
 +
 +            slot.output = device->createTexture(RenderTextureDesc::Texture2D(traceWidth, traceHeight, 1, RenderFormat::R16G16B16A16_FLOAT, RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS));
@@ -19039,6 +19060,15 @@ index 0000000..d98a664
 +        params.aoGain = std::max(envFloat(getenv("WCW_RT_AO_GAIN"), ao.gain), 0.0f);
 +        params.aoSplit = (envFloat(getenv("WCW_RT_AO_SPLIT"), 0.0f) != 0.0f) ? 1u : 0u;
 +        params.filterRadius = uint32_t(std::clamp(envFloat(getenv("WCW_RT_FILTER_RADIUS"), 2.0f), 1.0f, 4.0f));
++        {
++            const WcwLogic::DenoiseSettings denoise = WcwLogic::denoiseSettings();
++            const float maxRadius = float(WcwLogic::DenoiseMaxRadius);
++            params.shadowFilterRadius = uint32_t(std::clamp(envFloat(getenv("WCW_RT_SHADOW_FILTER_RADIUS"), float(denoise.shadowRadius)), 1.0f, maxRadius));
++            params.aoFilterRadius = uint32_t(std::clamp(envFloat(getenv("WCW_RT_AO_FILTER_RADIUS"), float(denoise.aoRadius)), 1.0f, maxRadius));
++            params.shadowTemporalAlpha = std::clamp(envFloat(getenv("WCW_RT_SHADOW_ALPHA"), denoise.shadowAlpha), 0.01f, 1.0f);
++            params.aoTemporalAlpha = std::clamp(envFloat(getenv("WCW_RT_AO_ALPHA"), denoise.aoAlpha), 0.01f, 1.0f);
++            params.denoiseSplit = (envFloat(getenv("WCW_RT_DENOISE_SPLIT"), 0.0f) != 0.0f) ? 1u : 0u;
++        }
 +        params.aoCharacterGain = std::max(envFloat(getenv("WCW_RT_AO_GAIN_CHAR"), ao.characterGain), 0.0f);
 +        params.noiseMode = (envFloat(getenv("WCW_RT_NOISE"), 1.0f) != 0.0f) ? 1u : 0u;
 +        params.noiseSplit = (envFloat(getenv("WCW_RT_NOISE_SPLIT"), 0.0f) != 0.0f) ? 1u : 0u;
@@ -19057,7 +19087,8 @@ index 0000000..d98a664
 +        params.traceScale = float(traceWidth) / float(outputWidth);
 +
 +        // Trace only this workload's screen footprint (plus a margin for the bilinear upsample
-+        // and the resolve's 3x3 neighborhood).
++        // and the resolve filters' neighborhoods).
++        const float margin = float(std::max({ 3u, params.shadowFilterRadius + 1, params.aoFilterRadius + 1, params.filterRadius + 1 }));
 +        if (boundsFullScreen) {
 +            traceRect[0] = traceRect[1] = 0;
 +            traceRect[2] = traceWidth;
@@ -19065,10 +19096,10 @@ index 0000000..d98a664
 +        }
 +        else {
 +            const float scale = params.traceScale;
-+            traceRect[0] = uint32_t(std::clamp(std::floor(boundsMin[0] * scale) - 3.0f, 0.0f, float(traceWidth)));
-+            traceRect[1] = uint32_t(std::clamp(std::floor(boundsMin[1] * scale) - 3.0f, 0.0f, float(traceHeight)));
-+            traceRect[2] = uint32_t(std::clamp(std::ceil(boundsMax[0] * scale) + 3.0f, 0.0f, float(traceWidth)));
-+            traceRect[3] = uint32_t(std::clamp(std::ceil(boundsMax[1] * scale) + 3.0f, 0.0f, float(traceHeight)));
++            traceRect[0] = uint32_t(std::clamp(std::floor(boundsMin[0] * scale) - margin, 0.0f, float(traceWidth)));
++            traceRect[1] = uint32_t(std::clamp(std::floor(boundsMin[1] * scale) - margin, 0.0f, float(traceHeight)));
++            traceRect[2] = uint32_t(std::clamp(std::ceil(boundsMax[0] * scale) + margin, 0.0f, float(traceWidth)));
++            traceRect[3] = uint32_t(std::clamp(std::ceil(boundsMax[1] * scale) + margin, 0.0f, float(traceHeight)));
 +        }
 +
 +        traceRectEmpty = (traceRect[2] <= traceRect[0]) || (traceRect[3] <= traceRect[1]);
@@ -19092,6 +19123,7 @@ index 0000000..d98a664
 +        slot.tracedMeshes = uint32_t(meshes.size());
 +
 +        params.traceOffset = { traceRect[0], traceRect[1] };
++        params.traceEnd = { traceRect[2], traceRect[3] };
 +        params.receiverRadius = receiverRadius;
 +        void *paramsBytes = paramsBuffer->map();
 +        memcpy(paramsBytes, &params, sizeof(params));
@@ -19650,26 +19682,52 @@ index 0000000..334836e
 +}
 diff --git a/src/shaders/WcwRtResolveCS.hlsl b/src/shaders/WcwRtResolveCS.hlsl
 new file mode 100644
-index 0000000..771e297
+index 0000000..e017054
 --- /dev/null
 +++ b/src/shaders/WcwRtResolveCS.hlsl
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,131 @@
 +//
 +// RT64
 +//
 +
 +// [wcw rt] Temporal resolve for the hybrid ray tracing shadows (D3D12 only).
-+// The trace pass samples each area light once per pixel per frame; this pass reprojects the
-+// pixel's world position into the previous frame of the same workload slot, clamps that
-+// history to the current 3x3 neighborhood (limits ghosting on moving wrestlers) and blends.
++// The trace pass samples each area light and the AO hemisphere a few times per pixel per frame; this
++// pass filters the shadow and AO terms separately (a tight filter keeps shadow edges crisp, a wide one
++// smooths AO), reprojects the pixel's world position into the previous frame of the same workload slot,
++// clips each term's history to its neighborhood (limits ghosting on moving wrestlers) and blends.
 +
 +#include "shared/rt64_wcw_rt.h"
 +
 +ConstantBuffer<WcwRtParams> gParams : register(b0);
-+Texture2D<float2> gCurrent : register(t1);
-+Texture2D<float> gHistoryIn : register(t2);
-+RWTexture2D<float> gHistoryOut : register(u3);
++// (shadow factor, hit distance (0 = no hit), AO factor, unused) from the trace pass.
++Texture2D<float4> gCurrent : register(t1);
++// (shadow, AO) history. With WCW_RT_DENOISE_SPLIT's old path, x holds the combined factor and y is 1.
++Texture2D<float2> gHistoryIn : register(t2);
++RWTexture2D<float2> gHistoryOut : register(u3);
 +RWTexture2D<float4> gOutput : register(u4);
++
++// A depth-aware tent filter's running sums for one term.
++struct FilterSums {
++    float sum;
++    float sqSum;
++    float weight;
++};
++
++void accumulate(inout FilterSums sums, float value, float weight) {
++    sums.sum += value * weight;
++    sums.sqSum += value * value * weight;
++    sums.weight += weight;
++}
++
++// Mean, and the history clip range around it: mean +- 1.25 standard deviations + 0.04. A min/max clamp of one
++// or two noisy samples is so tight it rejects the history every frame and the term shimmers; the spread bound
++// still drops history when the shadow or occlusion really moves (a wrestler steps away).
++float3 meanAndRange(FilterSums sums) {
++    const float mean = sums.sum / max(sums.weight, 1e-4f);
++    const float variance = max(sums.sqSum / max(sums.weight, 1e-4f) - mean * mean, 0.0f);
++    const float spread = 1.25f * sqrt(variance) + 0.04f;
++    return float3(mean, mean - spread, mean + spread);
++}
 +
 +[numthreads(8, 8, 1)]
 +void CSMain(uint2 dispatchPixel : SV_DispatchThreadID) {
@@ -19678,44 +19736,53 @@ index 0000000..771e297
 +        return;
 +    }
 +
-+    const float2 current = gCurrent[pixel];
++    const float4 current = gCurrent[pixel];
 +    if (current.y <= 0.0f) {
-+        gHistoryOut[pixel] = 1.0f;
++        gHistoryOut[pixel] = float2(1.0f, 1.0f);
 +        gOutput[pixel] = float4(0.5f, 0.5f, 0.5f, 0.0f);
 +        return;
 +    }
 +
-+    // Neighborhood range of this frame's samples (hit pixels only) and a depth-aware tent filter of
-+    // them (filterRadius, 2 = 5x5): neighbors on the same surface (similar hit distance) are averaged,
-+    // so a few jittered shadow and AO rays per pixel don't speckle, while object edges stay sharp.
-+    const int radius = int(clamp(gParams.filterRadius, 1u, 4u));
-+    float filteredSum = 0.0f;
-+    float filteredSqSum = 0.0f;
-+    float weightSum = 0.0f;
++    // The old combined cleanup (shadow * AO through one filter and one history) for comparisons.
++    const bool combined = (gParams.denoiseSplit != 0) && (pixel.x < (gParams.resolution.x / 2));
++    const int shadowRadius = int(clamp(combined ? gParams.filterRadius : gParams.shadowFilterRadius, 1u, 4u));
++    const int aoRadius = combined ? 0 : int(clamp(gParams.aoFilterRadius, 1u, 4u));
++    const int radius = max(shadowRadius, aoRadius);
++
++    // Depth-aware tent filters: neighbors on the same surface (similar hit distance) are averaged, so a few
++    // jittered rays per pixel don't speckle, while object edges stay sharp. Neighbors outside the rect traced
++    // this frame hold another workload's values and are skipped.
++    const int2 rectMin = int2(gParams.traceOffset);
++    const int2 rectMax = int2(min(gParams.traceEnd, gParams.resolution)) - 1;
++    FilterSums shadowSums = { 0.0f, 0.0f, 0.0f };
++    FilterSums aoSums = { 0.0f, 0.0f, 0.0f };
 +    for (int y = -radius; y <= radius; y++) {
 +        for (int x = -radius; x <= radius; x++) {
-+            const int2 neighbor = clamp(int2(pixel) + int2(x, y), int2(0, 0), int2(gParams.resolution) - 1);
-+            const float2 sample = gCurrent[neighbor];
-+            if (sample.y > 0.0f) {
-+                const float spatial = float(radius + 1 - abs(x)) * float(radius + 1 - abs(y));
-+                const float depth = exp(-abs(sample.y - current.y) / max(current.y * 0.01f, 0.5f));
-+                filteredSum += sample.x * spatial * depth;
-+                filteredSqSum += sample.x * sample.x * spatial * depth;
-+                weightSum += spatial * depth;
++            const int2 neighbor = int2(pixel) + int2(x, y);
++            if (any(neighbor < rectMin) || any(neighbor > rectMax)) {
++                continue;
++            }
++
++            const float4 sample = gCurrent[neighbor];
++            if (sample.y <= 0.0f) {
++                continue;
++            }
++
++            const float depth = exp(-abs(sample.y - current.y) / max(current.y * 0.01f, 0.5f));
++            if ((abs(x) <= shadowRadius) && (abs(y) <= shadowRadius)) {
++                const float spatial = float(shadowRadius + 1 - abs(x)) * float(shadowRadius + 1 - abs(y));
++                accumulate(shadowSums, combined ? (sample.x * sample.z) : sample.x, spatial * depth);
++            }
++
++            if ((abs(x) <= aoRadius) && (abs(y) <= aoRadius)) {
++                const float spatial = float(aoRadius + 1 - abs(x)) * float(aoRadius + 1 - abs(y));
++                accumulate(aoSums, sample.z, spatial * depth);
 +            }
 +        }
 +    }
 +
-+    const float filtered = filteredSum / max(weightSum, 1e-4f);
-+
-+    // History is clipped to the same-surface neighborhood's mean +- spread (variance clipping).
-+    // A min/max clamp of one or two noisy samples per light is so tight it rejects the history
-+    // every frame and the penumbrae shimmer; the spread bound still drops history when the
-+    // shadow really moves (a wrestler steps away).
-+    const float variance = max(filteredSqSum / max(weightSum, 1e-4f) - filtered * filtered, 0.0f);
-+    const float spread = 1.25f * sqrt(variance) + 0.04f;
-+    const float minFactor = filtered - spread;
-+    const float maxFactor = filtered + spread;
++    const float3 shadowStats = meanAndRange(shadowSums);
++    const float3 aoStats = combined ? float3(1.0f, 1.0f, 1.0f) : meanAndRange(aoSums);
 +
 +    // Same primary ray as the trace pass, so the hit distance gives the world position.
 +    const float2 local = ((float2(pixel) + 0.5f) / gParams.traceScale - gParams.viewport.xy) / gParams.viewport.zw;
@@ -19726,7 +19793,7 @@ index 0000000..771e297
 +    const float3 rayDir = normalize(farPoint.xyz / farPoint.w - rayStart);
 +    const float3 worldPos = rayStart + rayDir * current.y;
 +
-+    float result = filtered;
++    float2 result = float2(shadowStats.x, aoStats.x);
 +    if (gParams.historyValid != 0) {
 +        const float4 prevClip = mul(gParams.prevViewProj, float4(worldPos, 1.0f));
 +        if (prevClip.w > 0.0f) {
@@ -19734,8 +19801,12 @@ index 0000000..771e297
 +            const float2 prevLocal = float2(prevNdc.x * 0.5f + 0.5f, 0.5f - prevNdc.y * 0.5f);
 +            const float2 prevPixel = (gParams.viewport.xy + prevLocal * gParams.viewport.zw) * gParams.traceScale;
 +            if (all(prevPixel >= 0.0f) && all(prevPixel < float2(gParams.resolution))) {
-+                const float history = clamp(gHistoryIn[int2(prevPixel)], minFactor, maxFactor);
-+                result = lerp(history, filtered, gParams.temporalAlpha);
++                const float2 history = gHistoryIn[int2(prevPixel)];
++                const float shadowAlpha = combined ? gParams.temporalAlpha : gParams.shadowTemporalAlpha;
++                result.x = lerp(clamp(history.x, shadowStats.y, shadowStats.z), shadowStats.x, shadowAlpha);
++                if (!combined) {
++                    result.y = lerp(clamp(history.y, aoStats.y, aoStats.z), aoStats.x, gParams.aoTemporalAlpha);
++                }
 +            }
 +        }
 +    }
@@ -19743,15 +19814,15 @@ index 0000000..771e297
 +    gHistoryOut[pixel] = result;
 +    // Stored at half scale: the composite's 2x multiply blend (dst * src * 2) applies factors up
 +    // to 2, so glows can brighten.
-+    const float encoded = min(result, 2.0f) * 0.5f;
++    const float encoded = min(result.x * result.y, 2.0f) * 0.5f;
 +    gOutput[pixel] = float4(encoded, encoded, encoded, 1.0f);
 +}
 diff --git a/src/shaders/WcwRtTraceCS.hlsl b/src/shaders/WcwRtTraceCS.hlsl
 new file mode 100644
-index 0000000..3faa497
+index 0000000..ed8f3e2
 --- /dev/null
 +++ b/src/shaders/WcwRtTraceCS.hlsl
-@@ -0,0 +1,548 @@
+@@ -0,0 +1,556 @@
 +//
 +// RT64
 +//
@@ -19772,8 +19843,9 @@ index 0000000..3faa497
 +StructuredBuffer<uint> gFaceIndices : register(t3);
 +StructuredBuffer<uint> gMeshIndexStarts : register(t4);
 +RWTexture2D<float4> gOutput : register(u5);
-+// Shadow mode: (shadow factor, primary hit distance; 0 = no hit) for the resolve pass.
-+RWTexture2D<float2> gCurrent : register(u6);
++// Shadow mode: (shadow factor, primary hit distance (0 = no hit), AO factor, unused) for the resolve pass, which
++// filters the shadow and AO terms separately. The shadow factor includes the glows (up to 2).
++RWTexture2D<float4> gCurrent : register(u6);
 +StructuredBuffer<RDPTile> gRDPTiles : register(t7);
 +StructuredBuffer<GPUTile> gGPUTiles : register(t8);
 +StructuredBuffer<float2> gTexCoords : register(t9);
@@ -19884,7 +19956,7 @@ index 0000000..3faa497
 +
 +void writeNoHit(uint2 pixel) {
 +    if (resolvedMode()) {
-+        gCurrent[pixel] = float2(1.0f, 0.0f);
++        gCurrent[pixel] = float4(1.0f, 0.0f, 1.0f, 0.0f);
 +    }
 +    else {
 +        gOutput[pixel] = float4(1.0f, 1.0f, 1.0f, 0.0f);
@@ -20141,7 +20213,7 @@ index 0000000..3faa497
 +    if (resolvedMode() && (gParams.receiverRadius > 0.0f)) {
 +        const float receiverDist = length(hitPos.xz - gParams.lightPosition.xz);
 +        if (receiverDist >= gParams.receiverRadius) {
-+            gCurrent[pixel] = float2(1.0f + glowLight(hitPos, normal), hitT);
++            gCurrent[pixel] = float4(1.0f + glowLight(hitPos, normal), hitT, 1.0f, 0.0f);
 +            return;
 +        }
 +
@@ -20244,6 +20316,7 @@ index 0000000..3faa497
 +    // Ambient occlusion: cosine-weighted hemisphere rays against all workloads' geometry, around the smooth
 +    // normal on lit draws. Directions that dip below the flat triangle are mirrored back above it (no self-hits
 +    // from the smoothing); a hit at distance t occludes by 1 - (t / radius)^2, so far hits fade in softly.
++    float ao = 1.0f;
 +    const bool aoSplitOff = (gParams.aoSplit != 0) && (pixel.x < (gParams.resolution.x / 2));
 +    if ((gParams.aoSamples > 0) && !aoSplitOff && (gParams.aoCycleOff == 0)) {
 +        const float3 hemisphere = aoNormal(primary.CommittedGeometryIndex(), primary.CommittedPrimitiveIndex(), primary.CommittedTriangleBarycentrics(), normal);
@@ -20289,16 +20362,22 @@ index 0000000..3faa497
 +            gOutput[pixel] = float4(aoFactor, aoFactor, aoFactor, 1.0f);
 +            return;
 +        }
-+        factor = (gParams.mode == WCW_RT_MODE_AO) ? aoFactor : factor * aoFactor;
++        ao = aoFactor;
++    }
++
++    // AO-only view: the shadow term stays open.
++    if (gParams.mode == WCW_RT_MODE_AO) {
++        factor = 1.0f;
 +    }
 +
 +    factor = lerp(factor, 1.0f, receiverFade);
++    ao = lerp(ao, 1.0f, receiverFade);
 +
 +    if (resolvedMode() && (gParams.mode == WCW_RT_MODE_SHADOW)) {
 +        factor *= 1.0f + glowLight(hitPos, normal);
 +    }
 +
-+    gCurrent[pixel] = float2(factor, hitT);
++    gCurrent[pixel] = float4(factor, hitT, ao, 0.0f);
 +}
 diff --git a/src/shared/rt64_video_interface.h b/src/shared/rt64_video_interface.h
 index b51cf09..19048ae 100644
@@ -20316,10 +20395,10 @@ index b51cf09..19048ae 100644
  };
 diff --git a/src/shared/rt64_wcw_rt.h b/src/shared/rt64_wcw_rt.h
 new file mode 100644
-index 0000000..d40c984
+index 0000000..36670ff
 --- /dev/null
 +++ b/src/shared/rt64_wcw_rt.h
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,156 @@
 +//
 +// RT64
 +//
@@ -20456,6 +20535,16 @@ index 0000000..d40c984
 +        // With shadowSmooth: a light's ray-traced shadow fades in over this much of the facing cosine past the
 +        // terminator, where the game's vertex lighting already darkens the surface (WCW_RT_TERMINATOR_FADE).
 +        float terminatorFade;
++        // Resolve: shadow and AO are filtered and accumulated separately (WcwLogic::denoiseSettings): tent filter
++        // radii in trace pixels and the weight of this frame against the history, per term.
++        uint shadowFilterRadius;
++        uint aoFilterRadius;
++        float shadowTemporalAlpha;
++        float aoTemporalAlpha;
++        // WCW_RT_DENOISE_SPLIT=1: the old combined cleanup (shadow * AO, filterRadius, temporalAlpha) on the left half.
++        uint denoiseSplit;
++        // End of the traced rect (exclusive, trace pixels): the resolve filter doesn't read past it.
++        uint2 traceEnd;
 +    };
 +
 +    struct WcwRtCompositeCB {
@@ -20468,10 +20557,10 @@ index 0000000..d40c984
 +#endif
 diff --git a/tests/wcw/rt64_wcw_logic_tests.cpp b/tests/wcw/rt64_wcw_logic_tests.cpp
 new file mode 100644
-index 0000000..fa5b2ed
+index 0000000..2edab68
 --- /dev/null
 +++ b/tests/wcw/rt64_wcw_logic_tests.cpp
-@@ -0,0 +1,425 @@
+@@ -0,0 +1,440 @@
 +//
 +// RT64
 +//
@@ -20596,6 +20685,21 @@ index 0000000..fa5b2ed
 +
 +TEST_CASE("ao: out-of-range levels clamp to Strong") {
 +    CHECK_EQ(aoSettings(7, 1).samples, aoSettings(uint32_t(AoLevel::Strong), 1).samples);
++}
++
++// Resolve: separate shadow and AO cleanup
++
++TEST_CASE("denoise: shadows get a tighter filter than AO (crisp shadow edges, smooth AO)") {
++    const DenoiseSettings d = denoiseSettings();
++    CHECK(d.shadowRadius < d.aoRadius);
++    CHECK(d.shadowRadius >= 1);
++    CHECK(d.aoRadius <= DenoiseMaxRadius);
++}
++
++TEST_CASE("denoise: AO accumulates longer than shadows, and both keep some history") {
++    const DenoiseSettings d = denoiseSettings();
++    CHECK(d.aoAlpha <= d.shadowAlpha);
++    CHECK(d.aoAlpha > 0.0f && d.shadowAlpha < 1.0f);
 +}
 +
 +// Blue noise (ray tracer sample jitter)
