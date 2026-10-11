@@ -10,10 +10,18 @@ index 21df8c2..5635c09 100644
 +	url = https://github.com/jessetbh/plume.git
 +	branch = wcw
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 2fb01e5..34886b5 100644
+index 2fb01e5..40d1eca 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -386,6 +386,9 @@ set (SOURCES
+@@ -319,6 +319,7 @@ set (SOURCES
+     "${PROJECT_SOURCE_DIR}/src/common/rt64_timer.cpp"
+     "${PROJECT_SOURCE_DIR}/src/common/rt64_user_configuration.cpp"
+     "${PROJECT_SOURCE_DIR}/src/common/rt64_user_paths.cpp"
++    "${PROJECT_SOURCE_DIR}/src/common/rt64_wcw_logic.cpp"
+ 
+     "${PROJECT_SOURCE_DIR}/src/gbi/rt64_gbi.cpp"
+     "${PROJECT_SOURCE_DIR}/src/gbi/rt64_gbi_f3d.cpp"
+@@ -386,6 +387,9 @@ set (SOURCES
      "${PROJECT_SOURCE_DIR}/src/render/rt64_transform_processor.cpp"
      "${PROJECT_SOURCE_DIR}/src/render/rt64_upscaler.cpp"
      "${PROJECT_SOURCE_DIR}/src/render/rt64_vertex_processor.cpp"
@@ -23,7 +31,36 @@ index 2fb01e5..34886b5 100644
      "${PROJECT_SOURCE_DIR}/src/render/rt64_vi_renderer.cpp"
  
      "${PROJECT_SOURCE_DIR}/src/preset/rt64_preset.cpp"
-@@ -527,6 +530,12 @@ build_pixel_shader(  rt64 "src/shaders/PostBlendDitherNoisePS.hlsl" "src/shaders
+@@ -442,6 +446,28 @@ target_link_libraries(rt64 nfd)
+ target_link_libraries(rt64 libzstd_static)
+ target_link_libraries(rt64 plume)
+ 
++# [wcw] Unit tests for the frame interpolation, pacing, CRT beam and ray-traced shadow logic (tests/wcw). They build
++# and run as part of every rt64 build, so a failing test fails the game's build. RT64_WCW_TESTS=OFF skips them.
++option(RT64_WCW_TESTS "Build and run the wcw unit tests with rt64" ON)
++if (RT64_WCW_TESTS AND NOT CMAKE_CROSSCOMPILING)
++    add_executable(rt64_wcw_tests
++        "${PROJECT_SOURCE_DIR}/tests/wcw/rt64_wcw_logic_tests.cpp"
++        "${PROJECT_SOURCE_DIR}/src/common/rt64_wcw_logic.cpp"
++    )
++    target_include_directories(rt64_wcw_tests PRIVATE "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/tests/wcw")
++    set(RT64_WCW_TESTS_STAMP "${CMAKE_CURRENT_BINARY_DIR}/rt64_wcw_tests.passed")
++    add_custom_command(
++        OUTPUT "${RT64_WCW_TESTS_STAMP}"
++        COMMAND rt64_wcw_tests
++        COMMAND ${CMAKE_COMMAND} -E touch "${RT64_WCW_TESTS_STAMP}"
++        DEPENDS rt64_wcw_tests
++        COMMENT "Running rt64 wcw unit tests"
++        VERBATIM
++    )
++    add_custom_target(rt64_wcw_tests_run DEPENDS "${RT64_WCW_TESTS_STAMP}")
++    add_dependencies(rt64 rt64_wcw_tests_run)
++endif()
++
+ # Add tools.
+ add_subdirectory(src/tools/texture_hasher)
+ add_subdirectory(src/tools/texture_packer)
+@@ -527,6 +553,12 @@ build_pixel_shader(  rt64 "src/shaders/PostBlendDitherNoisePS.hlsl" "src/shaders
  build_compute_shader(rt64 "src/shaders/RSPModifyCS.hlsl")
  build_compute_shader(rt64 "src/shaders/RSPProcessCS.hlsl")
  build_compute_shader(rt64 "src/shaders/RSPWorldCS.hlsl")
@@ -36,7 +73,7 @@ index 2fb01e5..34886b5 100644
  build_compute_shader(rt64 "src/shaders/RSPSmoothNormalCS.hlsl")
  build_compute_shader(rt64 "src/shaders/RSPVertexTestZCS.hlsl")
  build_compute_shader(rt64 "src/shaders/RSPVertexTestZCS.hlsl" "src/shaders/RSPVertexTestZCSMS.hlsl" "-D MULTISAMPLING")
-@@ -545,6 +554,8 @@ build_pixel_shader(  rt64 "src/shaders/TextureResolvePS.hlsl" "src/shaders/Textu
+@@ -545,6 +577,8 @@ build_pixel_shader(  rt64 "src/shaders/TextureResolvePS.hlsl" "src/shaders/Textu
  build_pixel_shader(  rt64 "src/shaders/TextureResolvePS.hlsl" "src/shaders/TextureResolveSamples8XPS.hlsl" "-D SAMPLES_8X")
  build_pixel_shader(  rt64 "src/shaders/VideoInterfacePS.hlsl" "src/shaders/VideoInterfacePSRegular.hlsl")
  build_pixel_shader(  rt64 "src/shaders/VideoInterfacePS.hlsl" "src/shaders/VideoInterfacePSPixel.hlsl" "-D PIXEL_ANTIALIASING")
@@ -204,6 +241,239 @@ index f555048..a9de81e 100644
      inline constexpr uint32_t swappedOffset(uint32_t i) {
          return i ^ 3;
      }
+diff --git a/src/common/rt64_wcw_logic.cpp b/src/common/rt64_wcw_logic.cpp
+new file mode 100644
+index 0000000..f49c894
+--- /dev/null
++++ b/src/common/rt64_wcw_logic.cpp
+@@ -0,0 +1,111 @@
++//
++// RT64
++//
++
++#include "rt64_wcw_logic.h"
++
++#include <algorithm>
++
++namespace RT64::WcwLogic {
++    bool shadowCasterFresh(uint64_t frameCounter, uint64_t builtFrame) {
++        return (frameCounter >= builtFrame) && ((frameCounter - builtFrame) <= ShadowCasterStaleFrames);
++    }
++
++    BeamDecision decideBeam(uint32_t displayRefreshRate, bool vsync, bool interpolating, uint32_t contentRate) {
++        BeamDecision decision;
++        if (interpolating && (double(contentRate) > BeamCrtRate) && ((double(displayRefreshRate) / double(contentRate)) >= 1.95)) {
++            decision.crtRate = double(contentRate);
++        }
++
++        decision.ratio = double(displayRefreshRate) / decision.crtRate;
++        if (!vsync) {
++            decision.unavailable = BeamUnavailable::NeedsVSync;
++        }
++        else if (decision.ratio < 1.95) {
++            decision.unavailable = BeamUnavailable::RefreshRateTooLow;
++        }
++
++        if (decision.unavailable != BeamUnavailable::None) {
++            decision.ratio = 0.0;
++        }
++
++        return decision;
++    }
++
++    std::chrono::steady_clock::time_point evenPresentTarget(std::chrono::steady_clock::time_point frameStart, int i, int framesToPresent, uint32_t viOriginalRate) {
++        const auto gameFrame = std::chrono::microseconds(1000000 / viOriginalRate);
++        return frameStart + (gameFrame * i) / framesToPresent;
++    }
++
++    bool sleepFramePeriodBeforePresent(bool havePreviousPresent, uint32_t targetRate, uint32_t viOriginalRate, bool beamActive) {
++        return havePreviousPresent && (targetRate > 0) && (targetRate > viOriginalRate) && !beamActive;
++    }
++
++    uint32_t framesPerGameFrame(uint32_t targetRate, uint32_t viOriginalRate, uint32_t capOverride) {
++        if (capOverride > 0) {
++            return capOverride;
++        }
++
++        return std::max(2u, (targetRate + viOriginalRate / 2) / viOriginalRate);
++    }
++
++    void InterpolationTicks::reset() {
++        logical = 0;
++        display = 0;
++    }
++
++    uint32_t InterpolationTicks::beginGameFrame(uint32_t targetRate, uint32_t viOriginalRate, uint32_t capOverride) {
++        logical += targetRate;
++        uint32_t frames = uint32_t((logical - display) / viOriginalRate);
++        const uint32_t maxFrames = framesPerGameFrame(targetRate, viOriginalRate, capOverride);
++        if (frames > maxFrames) {
++            display += int64_t(viOriginalRate) * (frames - maxFrames);
++            frames = maxFrames;
++        }
++
++        return frames;
++    }
++
++    FrameWeights InterpolationTicks::advance(uint32_t targetRate, uint32_t viOriginalRate) {
++        FrameWeights weights;
++        weights.prev = std::clamp((targetRate + display - logical) / float(targetRate), 0.0f, 1.0f);
++        display += viOriginalRate;
++        weights.cur = std::clamp((targetRate + display - logical) / float(targetRate), 0.0f, 1.0f);
++        return weights;
++    }
++
++    void InterpolationTicks::skip(uint32_t viOriginalRate, uint32_t frames) {
++        display += int64_t(viOriginalRate) * frames;
++    }
++
++    bool primeGeneratedTargets(bool primeEnabled, bool generateInterpolatedFrames, bool usingMSAA, uint32_t runLength) {
++        return primeEnabled && generateInterpolatedFrames && !usingMSAA && (runLength == 1);
++    }
++
++    MatrixSlotIdentity::MatrixSlotIdentity(uint32_t stride) : stride(stride) { }
++
++    uint32_t MatrixSlotIdentity::canonical(uint32_t address) {
++        if (stride == 0) {
++            return address;
++        }
++
++        std::lock_guard<std::mutex> lock(identitiesMutex);
++        auto it = identities.find(address);
++        if (it != identities.end()) {
++            return it->second;
++        }
++
++        uint32_t id = address;
++        auto lower = identities.find(address - stride);
++        auto upper = identities.find(address + stride);
++        if (lower != identities.end()) {
++            id = lower->second;
++        }
++        else if (upper != identities.end()) {
++            id = upper->second;
++        }
++
++        identities.emplace(address, id);
++        return id;
++    }
++};
+diff --git a/src/common/rt64_wcw_logic.h b/src/common/rt64_wcw_logic.h
+new file mode 100644
+index 0000000..0799aab
+--- /dev/null
++++ b/src/common/rt64_wcw_logic.h
+@@ -0,0 +1,110 @@
++//
++// RT64
++//
++
++#pragma once
++
++#include <chrono>
++#include <cstdint>
++#include <mutex>
++#include <unordered_map>
++
++// [wcw] Decision logic for frame interpolation, present pacing, the CRT beam simulator and ray-traced shadows, kept
++// free of renderer state so it can be unit tested (tests/wcw). The renderer calls these functions; a change to any
++// of these rules belongs here, with a test.
++namespace RT64::WcwLogic {
++    // Ray-traced shadows
++
++    // Other scenes stay shadow casters for this many game frames after their last build. Counted in game frames,
++    // not workloads: frame interpolation renders every workload once per displayed frame (4 times per game frame
++    // at 120 fps), which aged the wrestlers' scene out before the floor's pass used it.
++    constexpr uint64_t ShadowCasterStaleFrames = 2;
++
++    // Whether a scene last built on game frame builtFrame still casts shadows on game frame frameCounter.
++    bool shadowCasterFresh(uint64_t frameCounter, uint64_t builtFrame);
++
++    // CRT beam simulator
++
++    // The simulated CRT's refresh rate without frame interpolation.
++    constexpr double BeamCrtRate = 60.0;
++
++    enum class BeamUnavailable {
++        None,
++        NeedsVSync,
++        RefreshRateTooLow
++    };
++
++    struct BeamDecision {
++        // The simulated CRT's refresh rate.
++        double crtRate = BeamCrtRate;
++        // Display refreshes per simulated CRT refresh; 0 when the beam simulator can't run.
++        double ratio = 0.0;
++        BeamUnavailable unavailable = BeamUnavailable::None;
++    };
++
++    // With frame interpolation above 60 fps (e.g. 120), the simulated CRT refreshes at that rate when the display has
++    // at least two refreshes per frame, so every interpolated frame gets a scan of its own. Otherwise it stays at
++    // 60 Hz and each scan shows the latest frame. contentRate is the interpolated framerate (0 without interpolation).
++    BeamDecision decideBeam(uint32_t displayRefreshRate, bool vsync, bool interpolating, uint32_t contentRate);
++
++    // Present pacing
++
++    // The time present i of a game frame's framesToPresent presents is due: spread evenly over the game frame.
++    std::chrono::steady_clock::time_point evenPresentTarget(std::chrono::steady_clock::time_point frameStart, int i, int framesToPresent, uint32_t viOriginalRate);
++
++    // Whether a present first sleeps one frame period (at targetRate) past the previous present. Not with the beam
++    // simulator: its presents are paced to their even targets and then wait for a vblank, and sleeping a full
++    // period first rounded every 120 fps frame up to 3 refreshes at 280 Hz (presents fell to ~92/s).
++    bool sleepFramePeriodBeforePresent(bool havePreviousPresent, uint32_t targetRate, uint32_t viOriginalRate, bool beamActive);
++
++    // Frame interpolation
++
++    // Displayed frames per game frame: display rate / game rate, rounded, at least 2 (2 for a 30 fps game at 60,
++    // 4 at 120). capOverride (WCW_HFR_CAP) replaces it when non-zero.
++    uint32_t framesPerGameFrame(uint32_t targetRate, uint32_t viOriginalRate, uint32_t capOverride);
++
++    struct FrameWeights {
++        float prev = 0.0f;
++        float cur = 1.0f;
++    };
++
++    // Tick accounting that turns a display rate and a game rate into displayed frames and interpolation weights.
++    // Each game frame adds targetRate logical ticks; each displayed frame adds viOriginalRate display ticks.
++    struct InterpolationTicks {
++        int64_t logical = 0;
++        int64_t display = 0;
++
++        void reset();
++
++        // Starts a game frame and returns how many frames to display for it (capped at framesPerGameFrame).
++        uint32_t beginGameFrame(uint32_t targetRate, uint32_t viOriginalRate, uint32_t capOverride);
++
++        // Advances one displayed frame and returns its weights. The game frame's last displayed frame has a
++        // current weight of 1: the real frame.
++        FrameWeights advance(uint32_t targetRate, uint32_t viOriginalRate);
++
++        // Skips displayed frames (not rendered).
++        void skip(uint32_t viOriginalRate, uint32_t frames);
++    };
++
++    // Generated-frame priming: copying the game's buffer into a run's generated targets happens once per run, before
++    // its first layer draws the blended frame. Priming after the blend applied translucent full-screen layers
++    // (fades) twice; priming every layer replaced the earlier layers' draws with the blend (Revenge flicker).
++    bool primeGeneratedTargets(bool primeEnabled, bool generateInterpolatedFrames, bool usingMSAA, uint32_t runLength);
++
++    // Matrix identity across frames
++
++    // AKI engines double-buffer their uploaded matrices: an object's matrix alternates between two slots 'stride'
++    // bytes apart from frame to frame. Both slots get one identity: an address whose partner (address +/- stride) was
++    // already seen takes the partner's identity. A stride of 0 disables the pairing.
++    class MatrixSlotIdentity {
++    public:
++        explicit MatrixSlotIdentity(uint32_t stride);
++        uint32_t canonical(uint32_t address);
++
++    private:
++        uint32_t stride;
++        std::unordered_map<uint32_t, uint32_t> identities;
++        std::mutex identitiesMutex;
++    };
++};
 diff --git a/src/contrib/crt/NOTICE.md b/src/contrib/crt/NOTICE.md
 new file mode 100644
 index 0000000..b70179d
@@ -12793,16 +13063,17 @@ index 00a72f6..314022f 100644
  
          struct TileMap {
 diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
-index 3227ab1..173d1e8 100644
+index 3227ab1..7c1f531 100644
 --- a/src/hle/rt64_present_queue.cpp
 +++ b/src/hle/rt64_present_queue.cpp
-@@ -4,12 +4,21 @@
+@@ -4,12 +4,22 @@
  
  #include "rt64_present_queue.h"
  
 +#include <thread>
 +
  #include "common/rt64_thread.h"
++#include "common/rt64_wcw_logic.h"
 +#include "render/rt64_hdr_output.h"
  #include "rhi/rt64_render_hooks.h"
  
@@ -12818,7 +13089,7 @@ index 3227ab1..173d1e8 100644
      // PresentQueue
  
      PresentQueue::PresentQueue() {
-@@ -88,10 +97,24 @@ namespace RT64 {
+@@ -88,10 +98,24 @@ namespace RT64 {
  
          viRenderer = std::make_unique<VIRenderer>();
  
@@ -12843,7 +13114,7 @@ index 3227ab1..173d1e8 100644
      void PresentQueue::threadPresent(const Present &present, bool &swapChainValid) {
          FramebufferManager &fbManager = ext.sharedResources->framebufferManager;
          RenderTargetManager &targetManager = ext.sharedResources->renderTargetManager;
-@@ -116,8 +139,13 @@ namespace RT64 {
+@@ -116,8 +140,13 @@ namespace RT64 {
  
          RenderTarget *colorTarget = nullptr;
          int32_t framesToPresent = 1;
@@ -12858,7 +13129,7 @@ index 3227ab1..173d1e8 100644
  
          // TODO: There's a possible race condition interactions that can happen while the workload
          // queue is rendering extra frames and the present event is processed while it's generating
-@@ -127,6 +155,16 @@ namespace RT64 {
+@@ -127,6 +156,16 @@ namespace RT64 {
          
          // Perform any external write operations indicated by the event.
          if (!present.fbOperations.empty()) {
@@ -12875,7 +13146,7 @@ index 3227ab1..173d1e8 100644
              const std::scoped_lock lock(screenFbChangePoolMutex);
              {
                  RenderWorkerExecution workerExecution(ext.presentGraphicsWorker);
-@@ -177,6 +215,20 @@ namespace RT64 {
+@@ -177,6 +216,20 @@ namespace RT64 {
                          }
                      }
  
@@ -12896,7 +13167,7 @@ index 3227ab1..173d1e8 100644
                      // Present early (or games that behave like it) will make it so that the presented image is a color image
                      // that the workload modified. We run a basic check to see if that holds true to indicate it was presented
                      // so interpolation is possible.
-@@ -194,11 +246,66 @@ namespace RT64 {
+@@ -194,11 +247,66 @@ namespace RT64 {
                      ext.sharedResources->workloadMutex.lock();
                  }
  
@@ -12964,7 +13235,7 @@ index 3227ab1..173d1e8 100644
                          RenderTargetKey otherColorTargetKey(presentFb->addressStart, presentFb->width, presentFb->siz, presentFb->lastWriteType);
                          RenderTarget &otherColorTarget = targetManager.get(otherColorTargetKey, true);
                          if (!otherColorTarget.isEmpty()) {
-@@ -210,6 +317,7 @@ namespace RT64 {
+@@ -210,6 +318,7 @@ namespace RT64 {
                  }
                  else {
                      colorTarget = nullptr;
@@ -12972,7 +13243,7 @@ index 3227ab1..173d1e8 100644
                  }
  
                  if (!present.paused && (viHistory.top().vi != present.screenVI)) {
-@@ -219,6 +327,13 @@ namespace RT64 {
+@@ -219,6 +328,13 @@ namespace RT64 {
              else {
                  uint32_t fbAddress = present.screenVI.fbAddress();
  
@@ -12986,7 +13257,7 @@ index 3227ab1..173d1e8 100644
                  // Use a scratch framebuffer to upload the RAM to the render target.
                  hlslpp::uint2 fbSize = present.screenVI.fbSize();
                  scratchFb.addressStart = fbAddress;
-@@ -266,18 +381,29 @@ namespace RT64 {
+@@ -266,18 +382,29 @@ namespace RT64 {
              }
          }
          
@@ -13018,7 +13289,7 @@ index 3227ab1..173d1e8 100644
                      framesToPresent = std::min(int(frameCounters.available), i + 1);
                      frameCountersNextPresented = frameCounters.count;
                  }
-@@ -287,7 +413,33 @@ namespace RT64 {
+@@ -287,7 +414,33 @@ namespace RT64 {
  
                  if (i < framesToPresent) {
                      uint32_t targetIndex = usingMSAA ? i : (i - 1);
@@ -13053,7 +13324,7 @@ index 3227ab1..173d1e8 100644
                  }
                  else {
                      colorTarget = nullptr;
-@@ -299,8 +451,94 @@ namespace RT64 {
+@@ -299,8 +452,93 @@ namespace RT64 {
  
              uint32_t swapChainIndex = 0;
              const bool presentFrame = (i < framesToPresent) && swapChainValid;
@@ -13126,8 +13397,7 @@ index 3227ab1..173d1e8 100644
 +                    wcwHfrFrameStart = std::chrono::steady_clock::now();
 +                }
 +                else {
-+                    const auto gameFrame = std::chrono::microseconds(1000000 / viOriginalRate);
-+                    const auto target = wcwHfrFrameStart + (gameFrame * i) / framesToPresent;
++                    const auto target = WcwLogic::evenPresentTarget(wcwHfrFrameStart, int(i), int(framesToPresent), viOriginalRate);
 +                    threadBeamFillUntil(target, swapChainValid);
 +                    const auto coarse = target - std::chrono::milliseconds(1);
 +                    if (std::chrono::steady_clock::now() < coarse) {
@@ -13354,21 +13624,17 @@ index 3227ab1..173d1e8 100644
                  }
              }
  
-@@ -390,7 +804,12 @@ namespace RT64 {
+@@ -390,7 +804,8 @@ namespace RT64 {
  
              if (presentFrame && swapChainValid) {
                  // Wait until the approximate time the next present should be at the current intended rate.
 -                if ((presentTimestamp != Timestamp()) && (targetRate > 0) && (targetRate > viOriginalRate)) {
-+                // [wcw crt] Not with the beam simulator: its frames are paced to their even targets before the
-+                // acquire, and the vblank wait below lands each on a refresh. Sleeping a full frame period past
-+                // the previous present first rounded every interval up to the next refresh (3 refreshes per
-+                // 120 fps frame at 280 Hz instead of 2.33), so the presents fell behind and whole game frames
-+                // were dropped (about 92 presents/s instead of 120).
-+                if ((presentTimestamp != Timestamp()) && (targetRate > 0) && (targetRate > viOriginalRate) && !crtFilter->beamActive()) {
++                // [wcw crt] Not with the beam simulator (WcwLogic::sleepFramePeriodBeforePresent).
++                if (WcwLogic::sleepFramePeriodBeforePresent(presentTimestamp != Timestamp(), targetRate, viOriginalRate, crtFilter->beamActive())) {
                      Timer::preciseSleepUntil(presentTimestamp + std::chrono::nanoseconds(1'000'000'000 / targetRate));
                  }
  
-@@ -398,6 +817,11 @@ namespace RT64 {
+@@ -398,6 +813,11 @@ namespace RT64 {
                      ext.swapChain->wait();
                  }
  
@@ -13380,7 +13646,7 @@ index 3227ab1..173d1e8 100644
                  RenderCommandSemaphore *waitSemaphore = drawSemaphores[swapChainIndex].get();
                  presentTimestamp = Timer::current();
                  swapChainValid = ext.swapChain->present(swapChainIndex, &waitSemaphore, 1);
-@@ -430,6 +854,269 @@ namespace RT64 {
+@@ -430,6 +850,269 @@ namespace RT64 {
          barrierCursor = (barrierCursor + 1) % presents.size();
      }
  
@@ -13650,7 +13916,7 @@ index 3227ab1..173d1e8 100644
      void PresentQueue::threadLoop() {
          Thread::setCurrentThreadName("RT64 Present");
  
-@@ -452,14 +1139,36 @@ namespace RT64 {
+@@ -452,14 +1135,36 @@ namespace RT64 {
          while (presentThreadRunning) {
              {
                  std::unique_lock<std::mutex> cursorLock(cursorMutex);
@@ -13689,7 +13955,7 @@ index 3227ab1..173d1e8 100644
                  }
              }
  
-@@ -515,6 +1224,7 @@ namespace RT64 {
+@@ -515,6 +1220,7 @@ namespace RT64 {
                      notifyPresentId(present);
                  }
                  else {
@@ -13808,10 +14074,10 @@ index a10c11a..5f2345a 100644
          RT64_LOG_PRINTF("RDP::drawTexRect(ulx %d, uly %d, lrx %d, lry %d, tile %u, uls %d, ult %d, dsdx %d, dtdy %d, flip %u)", ulx, uly, lrx, lry, tile, uls, ult, dsdx, dtdy, flip);
  #   endif
 diff --git a/src/hle/rt64_rsp.cpp b/src/hle/rt64_rsp.cpp
-index ee2030b..48a9a7a 100644
+index ee2030b..7ecb2b0 100644
 --- a/src/hle/rt64_rsp.cpp
 +++ b/src/hle/rt64_rsp.cpp
-@@ -4,12 +4,16 @@
+@@ -4,12 +4,17 @@
  
  #include "rt64_rsp.h"
  
@@ -13823,12 +14089,13 @@ index ee2030b..48a9a7a 100644
  #include "../include/rt64_extended_gbi.h"
  #include "common/rt64_common.h"
  #include "common/rt64_math.h"
++#include "common/rt64_wcw_logic.h"
  #include "gbi/rt64_f3d.h"
 +#include "render/rt64_wcw_raytracer.h"
  #include "shared/rt64_rsp_fog.h"
  
  #include "rt64_interpreter.h"
-@@ -70,6 +74,8 @@ namespace RT64 {
+@@ -70,6 +75,8 @@ namespace RT64 {
          projectionIndex = -1;
          projectionMatrixChanged = false;
          projectionMatrixInversed = false;
@@ -13837,7 +14104,7 @@ index ee2030b..48a9a7a 100644
          viewportChanged = false;
          modelViewProjMatrix = hlslpp::float4x4(0.0f);
          modelViewProjChanged = false;
-@@ -131,6 +137,103 @@ namespace RT64 {
+@@ -131,6 +138,103 @@ namespace RT64 {
          segments[seg] = address;
      }
  
@@ -13941,7 +14208,7 @@ index ee2030b..48a9a7a 100644
      void RSP::matrixCommon(const hlslpp::float4x4 &floatMatrix, uint32_t address, uint8_t params) {
          // Projection matrix.
          hlslpp::float4x4 &viewMatrix = viewMatrixStack[projectionMatrixStackSize - 1];
-@@ -191,6 +294,22 @@ namespace RT64 {
+@@ -191,6 +295,22 @@ namespace RT64 {
          const uint32_t rdramAddress = fromSegmentedMasked(address);
          const FixedMatrix *fixedMatrix = reinterpret_cast<FixedMatrix *>(state->fromRDRAM(rdramAddress));
          const hlslpp::float4x4 floatMatrix = fixedMatrix->toMatrix4x4();
@@ -13964,7 +14231,7 @@ index ee2030b..48a9a7a 100644
          matrixCommon(floatMatrix, address, params);
      }
  
-@@ -301,6 +420,63 @@ namespace RT64 {
+@@ -301,6 +421,40 @@ namespace RT64 {
          }
      }
  
@@ -13973,31 +14240,8 @@ index ee2030b..48a9a7a 100644
 +    // (address +/- 0x40) was already seen takes the partner's identity. WCW_HFR_SLOTSTRIDE overrides 0x40
 +    // (0 disables).
 +    static uint32_t wcwCanonicalSlot(uint32_t addr) {
-+        static const uint32_t stride = getenv("WCW_HFR_SLOTSTRIDE") ? uint32_t(strtoul(getenv("WCW_HFR_SLOTSTRIDE"), nullptr, 0)) : 0x40u;
-+        static std::unordered_map<uint32_t, uint32_t> canonical;
-+        static std::mutex canonicalMutex;
-+        if (stride == 0) {
-+            return addr;
-+        }
-+
-+        std::lock_guard<std::mutex> lock(canonicalMutex);
-+        auto it = canonical.find(addr);
-+        if (it != canonical.end()) {
-+            return it->second;
-+        }
-+
-+        uint32_t id = addr;
-+        auto lower = canonical.find(addr - stride);
-+        auto upper = canonical.find(addr + stride);
-+        if (lower != canonical.end()) {
-+            id = lower->second;
-+        }
-+        else if (upper != canonical.end()) {
-+            id = upper->second;
-+        }
-+
-+        canonical.emplace(addr, id);
-+        return id;
++        static WcwLogic::MatrixSlotIdentity identity(getenv("WCW_HFR_SLOTSTRIDE") ? uint32_t(strtoul(getenv("WCW_HFR_SLOTSTRIDE"), nullptr, 0)) : 0x40u);
++        return identity.canonical(addr);
 +    }
 +
 +    void RSP::wcwSetScreenSpace(bool screenSpace) {
@@ -14028,7 +14272,7 @@ index ee2030b..48a9a7a 100644
      void RSP::forceMatrix(uint32_t address) {
  #   ifdef LOG_SPECIAL_MATRIX_OPERATIONS
          RT64_LOG_PRINTF("RSP::forceMatrix(0x%08X)", address);
-@@ -311,6 +487,49 @@ namespace RT64 {
+@@ -311,6 +465,49 @@ namespace RT64 {
          modelViewProjMatrix = fixedMatrix->toMatrix4x4();
          modelViewProjInserted = true;
          modelViewProjChanged = false;
@@ -14078,7 +14322,7 @@ index ee2030b..48a9a7a 100644
      }
  
      static void setExtendedMatrixFloat(RSP &rsp, uint32_t address, hlslpp::float4x4 &matrix, hlslpp::float4x4 &invMatrix) {
-@@ -333,11 +552,76 @@ namespace RT64 {
+@@ -333,11 +530,76 @@ namespace RT64 {
          rsp.lookAtChanged = true;
      }
  
@@ -14155,7 +14399,7 @@ index ee2030b..48a9a7a 100644
          setExtendedMatrixFloat(*this, address, extended.viewMatrix, extended.invViewMatrix);
      }
  
-@@ -372,6 +656,32 @@ namespace RT64 {
+@@ -372,6 +634,32 @@ namespace RT64 {
  
          const uint32_t rdramAddress = fromSegmentedMasked(address);
          const Vertex *dlVerts = reinterpret_cast<const Vertex *>(state->fromRDRAM(rdramAddress));
@@ -14188,7 +14432,7 @@ index ee2030b..48a9a7a 100644
          memcpy(&vertices[dstIndex], dlVerts, sizeof(Vertex) * vtxCount);
          setVertexCommon<true, sizeof(Vertex)>(rdramAddress, dstIndex, dstIndex + vtxCount);
      }
-@@ -465,9 +775,18 @@ namespace RT64 {
+@@ -465,9 +753,18 @@ namespace RT64 {
  
              uint32_t physicalAddress = projectionMatrixPhysicalAddressStack[projectionMatrixStackSize - 1];
              workload.physicalAddressTransformMap.emplace(physicalAddress, uint32_t(drawData.viewProjTransformGroups.size()));
@@ -14210,7 +14454,7 @@ index ee2030b..48a9a7a 100644
              drawData.viewProjTransformGroups.emplace_back(extended.curViewProjMatrixIdGroupIndex);
              drawData.rspViewports.emplace_back(viewportStack[viewportStackSize - 1]);
              drawData.viewportOrigins.emplace_back(extended.viewportOriginStack[viewportStackSize - 1]);
-@@ -515,6 +834,9 @@ namespace RT64 {
+@@ -515,6 +812,9 @@ namespace RT64 {
          
          // ModelViewProj is only updated when a vertex is processed and the flag is enabled.
          auto &worldTransforms = workload.drawData.worldTransforms;
@@ -14220,7 +14464,7 @@ index ee2030b..48a9a7a 100644
          auto &worldTransformGroups = workload.drawData.worldTransformGroups;
          auto &worldTransformSegmentedAddresses = workload.drawData.worldTransformSegmentedAddresses;
          auto &worldTransformPhysicalAddresses = workload.drawData.worldTransformPhysicalAddresses;
-@@ -524,6 +846,10 @@ namespace RT64 {
+@@ -524,6 +824,10 @@ namespace RT64 {
              computeModelViewProj();
              curTransformIndex = static_cast<uint16_t>(worldTransforms.size());
              worldTransforms.emplace_back(hlslpp::mul(modelMatrixStack[modelMatrixStackSize - 1], extended.viewProjMatrix));
@@ -14231,7 +14475,7 @@ index ee2030b..48a9a7a 100644
          }
          else if (modelViewProjInserted) {
  #       ifdef LOG_SPECIAL_MATRIX_OPERATIONS
-@@ -533,16 +859,60 @@ namespace RT64 {
+@@ -533,16 +837,60 @@ namespace RT64 {
              modelViewProjInserted = false;
  
              if (!projectionMatrixInversed) {
@@ -14294,7 +14538,7 @@ index ee2030b..48a9a7a 100644
              workload.physicalAddressTransformMap.emplace(physicalAddress, uint32_t(worldTransformGroups.size()));
              worldTransformGroups.emplace_back(extended.curModelMatrixIdGroupIndex);
              worldTransformSegmentedAddresses.emplace_back(modelMatrixSegmentedAddressStack[modelMatrixStackSize - 1]);
-@@ -1050,6 +1420,9 @@ namespace RT64 {
+@@ -1050,6 +1398,9 @@ namespace RT64 {
      }
  
      void RSP::drawIndexedTri(uint32_t a, uint32_t b, uint32_t c, bool rawGlobalIndices) {
@@ -14573,10 +14817,18 @@ index 8ea27d5..b270866 100644
  
          struct {
 diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
-index 5a331aa..9515702 100644
+index 5a331aa..89cfa53 100644
 --- a/src/hle/rt64_workload_queue.cpp
 +++ b/src/hle/rt64_workload_queue.cpp
-@@ -42,13 +42,13 @@ namespace RT64 {
+@@ -5,6 +5,7 @@
+ #include "rt64_workload_queue.h"
+ 
+ #include "common/rt64_thread.h"
++#include "common/rt64_wcw_logic.h"
+ 
+ #include "rt64_present_queue.h"
+ 
+@@ -42,13 +43,13 @@ namespace RT64 {
  
          threadCursor = 0;
          writeCursor = 0;
@@ -14592,7 +14844,7 @@ index 5a331aa..9515702 100644
  
          // Stall the thread until the barrier is lifted if we're trying to write on a workload being used by the GPU.
          bool waitForBarrier;
-@@ -80,7 +80,7 @@ namespace RT64 {
+@@ -80,7 +81,7 @@ namespace RT64 {
              return writeCursor - 1;
          }
          else {
@@ -14601,7 +14853,7 @@ index 5a331aa..9515702 100644
          }
      }
  
-@@ -131,7 +131,14 @@ namespace RT64 {
+@@ -131,7 +132,14 @@ namespace RT64 {
          const uint32_t referenceHeight = (viFbSize[1] > 0) ? std::max(viFbSize[1], MinimumReferenceHeight) : 240;
  
          // Compute the aspect ratio to be used for the frame.
@@ -14617,7 +14869,7 @@ index 5a331aa..9515702 100644
  
          const auto ratioMode = ext.sharedResources->userConfig.aspectRatio;
          switch (ratioMode) {
-@@ -263,6 +270,16 @@ namespace RT64 {
+@@ -263,6 +271,16 @@ namespace RT64 {
                  });
              }
  
@@ -14634,7 +14886,7 @@ index 5a331aa..9515702 100644
              std::scoped_lock<std::mutex> managerLock(ext.sharedResources->managerMutex);
              FramebufferManager &fbManager = ext.sharedResources->framebufferManager;
              RenderTargetManager &targetManager = ext.sharedResources->renderTargetManager;
-@@ -271,6 +288,8 @@ namespace RT64 {
+@@ -271,6 +289,8 @@ namespace RT64 {
              fbManager.destroyAllTileCopies();
              ext.sharedResources->fbConfigChanged = false;
              ext.sharedResources->interpolatedColorTargets.clear();
@@ -14643,7 +14895,7 @@ index 5a331aa..9515702 100644
          }
  
          if (ext.sharedResources->userConfigChanged) {
-@@ -289,6 +308,10 @@ namespace RT64 {
+@@ -289,6 +309,10 @@ namespace RT64 {
          }
      }
      
@@ -14654,7 +14906,7 @@ index 5a331aa..9515702 100644
      void WorkloadQueue::threadRenderFrame(GameFrame &curFrame, const GameFrame &prevFrame, const WorkloadConfiguration &workloadConfig,
          const DebuggerRenderer &debuggerRenderer, const DebuggerCamera &debuggerCamera, float curFrameWeight, float prevFrameWeight,
          float deltaTimeMs, RenderTargetKey overrideTargetKey, int32_t overrideTargetFbPairIndex, RenderTarget *overrideTarget,
-@@ -387,7 +410,8 @@ namespace RT64 {
+@@ -387,7 +411,8 @@ namespace RT64 {
                  rspProcessor->process(rspParams);
              }
  
@@ -14664,7 +14916,7 @@ index 5a331aa..9515702 100644
              if (processWorldVertices) {
                  workload.resetWorldOutputBuffers();
  
-@@ -452,6 +476,24 @@ namespace RT64 {
+@@ -452,6 +477,24 @@ namespace RT64 {
                      if (colorFb != nullptr) {
                          fbKey.colorTargetKey = RenderTargetKey(colorFb->addressStart, colorFb->width, colorFb->siz, Framebuffer::Type::Color);
                          colorTarget = &targetManager.get(fbKey.colorTargetKey);
@@ -14689,7 +14941,7 @@ index 5a331aa..9515702 100644
                      }
                      else {
                          colorTarget = nullptr;
-@@ -604,6 +646,10 @@ namespace RT64 {
+@@ -604,6 +647,10 @@ namespace RT64 {
              // Add all framebuffer pairs to the framebuffer renderer and setup the operations.
              scratchFbChangePool.reset();
              fbManager.resetOperations();
@@ -14700,7 +14952,7 @@ index 5a331aa..9515702 100644
              framebufferRenderer->resetFramebuffers(ext.workloadGraphicsWorker, ubershadersVisible, workload.extended.ditherNoiseStrength, targetManager.multisampling);
  
  #       if RT_ENABLED
-@@ -703,7 +749,40 @@ namespace RT64 {
+@@ -703,7 +750,40 @@ namespace RT64 {
              ext.workloadGraphicsWorker->commandList->writeTimestamp(queryPool.get(), 0);
              framebufferRenderer->endFramebuffers(ext.workloadGraphicsWorker, &workload.drawBuffers, &workload.outputBuffers, workloadConfig.raytracingEnabled);
              framebufferRenderer->recordSetup(ext.workloadGraphicsWorker, bufferUploaders, processRSP ? rspProcessor.get() : nullptr, processWorldVertices ? vertexProcessor.get() : nullptr, &workload.outputBuffers, workloadConfig.raytracingEnabled);
@@ -14742,7 +14994,7 @@ index 5a331aa..9515702 100644
              // Record all framebuffer pairs.
              uint32_t framebufferIndex = 0;
              for (uint32_t f = 0; f < fbPairCount; f++) {
-@@ -814,7 +893,11 @@ namespace RT64 {
+@@ -814,7 +894,11 @@ namespace RT64 {
                      const uint64_t writeTimestamp = fbManager.nextWriteTimestamp();
                      FixedRect depthFbRect;
                      if (colorFb != nullptr) {
@@ -14755,7 +15007,7 @@ index 5a331aa..9515702 100644
                          colorFb->lastWriteType = Framebuffer::Type::Color;
                          colorFb->lastWriteFmt = colorImg.fmt;
                          colorFb->lastWriteTimestamp = writeTimestamp;
-@@ -842,12 +925,83 @@ namespace RT64 {
+@@ -842,12 +926,83 @@ namespace RT64 {
              framebufferRenderer->waitForUploaders();
              ext.workloadGraphicsWorker->execute();
              ext.workloadGraphicsWorker->wait();
@@ -14839,7 +15091,7 @@ index 5a331aa..9515702 100644
  
              // Indicate to the texture cache it's safe to delete the textures if no locks are active.
              ext.textureCache->decrementLock();
-@@ -866,7 +1020,7 @@ namespace RT64 {
+@@ -866,7 +1021,7 @@ namespace RT64 {
  
      void WorkloadQueue::threadAdvanceBarrier() {
          std::scoped_lock<std::mutex> cursorLock(cursorMutex);
@@ -14848,7 +15100,14 @@ index 5a331aa..9515702 100644
      }
  
      void WorkloadQueue::threadAdvanceWorkloadId(uint64_t newWorkloadId) {
-@@ -887,7 +1041,21 @@ namespace RT64 {
+@@ -882,12 +1037,26 @@ namespace RT64 {
+         Thread::setCurrentThreadName("RT64 Workload");
+ 
+         WorkloadConfiguration workloadConfig;
+-        int64_t logicalTicks = 0;
+-        int64_t displayTicks = 0;
++        // [wcw] Logical/display tick accounting for interpolation (WcwLogic::InterpolationTicks).
++        WcwLogic::InterpolationTicks wcwTicks;
          uint32_t originalRateForTicks = 0;
          uint32_t displayRateForTicks = 0;
          int processCursor = -1;
@@ -14871,7 +15130,7 @@ index 5a331aa..9515702 100644
          while (threadsRunning) {
              {
                  std::unique_lock<std::mutex> cursorLock(cursorMutex);
-@@ -897,13 +1065,39 @@ namespace RT64 {
+@@ -897,13 +1066,39 @@ namespace RT64 {
  
                  if (threadsRunning) {
                      processCursor = threadCursor;
@@ -14912,7 +15171,7 @@ index 5a331aa..9515702 100644
                  ext.presentQueue->waitForPresentId(workload.presentId);
  
                  if (!threadsRunning) {
-@@ -914,11 +1108,157 @@ namespace RT64 {
+@@ -914,11 +1109,157 @@ namespace RT64 {
                  workloadProfiler.start();
                  threadConfigurationUpdate(workload.viFbSize, workloadConfig);
  
@@ -15070,7 +15329,7 @@ index 5a331aa..9515702 100644
                  
                  // TODO: The frame detection needs to be more elaborate than just matching one workload to one frame.
                  GameFrame &curFrame = gameFrames[curFrameIndex];
-@@ -959,6 +1299,15 @@ namespace RT64 {
+@@ -959,6 +1300,15 @@ namespace RT64 {
                              continue;
                          }
  
@@ -15086,7 +15345,7 @@ index 5a331aa..9515702 100644
                          Framebuffer *interpolationFb = fbManager.find(colorImg.address);
                          if ((interpolationFb != nullptr) && interpolationFb->interpolationEnabled) {
                              interpolationTargetKey.fbType = Framebuffer::Type::Color;
-@@ -970,6 +1319,43 @@ namespace RT64 {
+@@ -970,6 +1320,43 @@ namespace RT64 {
                      }
                  }
  
@@ -15130,7 +15389,7 @@ index 5a331aa..9515702 100644
                  float prevFrameWeight = 0.0f;
                  float curFrameWeight = 1.0f;
                  float deltaTimeMs = 1.0f / 30.0f;
-@@ -985,8 +1371,57 @@ namespace RT64 {
+@@ -985,13 +1372,61 @@ namespace RT64 {
                      matchingProfiler.end();
                      matchingProfiler.log();
  
@@ -15189,8 +15448,18 @@ index 5a331aa..9515702 100644
  
                      const bool resetTicks = !generateInterpolatedFrames || (originalRateForTicks != workload.viOriginalRate) || (displayRateForTicks != workloadConfig.targetRate) || !displayRateAboveOriginal;
                      if (resetTicks) {
-@@ -1004,10 +1439,22 @@ namespace RT64 {
-                     displayFrames = uint32_t((logicalTicks - displayTicks) / workload.viOriginalRate);
+-                        logicalTicks = 0;
+-                        displayTicks = 0;
++                        wcwTicks.reset();
+                         originalRateForTicks = workload.viOriginalRate;
+                         displayRateForTicks = workloadConfig.targetRate;
+                     }
+@@ -1000,18 +1435,24 @@ namespace RT64 {
+                 // Estimate amount of frames to render based on how many display frames it'd take to reach the next logical frame.
+                 uint32_t displayFrames = 1;
+                 if (generateInterpolatedFrames) {
+-                    logicalTicks += workloadConfig.targetRate;
+-                    displayFrames = uint32_t((logicalTicks - displayTicks) / workload.viOriginalRate);
                      deltaTimeMs = 1.0f / float(workloadConfig.targetRate);
  
 -                    if ((displayFrames > 1) && frameReduction) {
@@ -15201,12 +15470,8 @@ index 5a331aa..9515702 100644
 +                    // game at 60Hz, 4 at 120Hz): the tick accounting can otherwise creep ahead and leave the present
 +                    // behind. WCW_HFR_CAP=<n> overrides N for debugging.
 +                    static const uint32_t wcwHfrCapEnv = getenv("WCW_HFR_CAP") ? uint32_t(std::max(atoi(getenv("WCW_HFR_CAP")), 2)) : 0;
-+                    const uint32_t wcwFramesPerGameFrame = (wcwHfrCapEnv > 0) ? wcwHfrCapEnv :
-+                        std::max(2u, (workloadConfig.targetRate + workload.viOriginalRate / 2) / workload.viOriginalRate);
-+                    if (displayFrames > wcwFramesPerGameFrame) {
-+                        displayTicks += workload.viOriginalRate * (displayFrames - wcwFramesPerGameFrame);
-+                        displayFrames = wcwFramesPerGameFrame;
-+                    }
++                    const uint32_t wcwFramesPerGameFrame = WcwLogic::framesPerGameFrame(workloadConfig.targetRate, workload.viOriginalRate, wcwHfrCapEnv);
++                    displayFrames = wcwTicks.beginGameFrame(workloadConfig.targetRate, workload.viOriginalRate, wcwHfrCapEnv);
 +
 +                    // At rates that aren't a multiple of the game rate (e.g. 144 Hz) game frames alternate between
 +                    // floor and floor+1 frames; only fewer than floor is incomplete.
@@ -15215,8 +15480,14 @@ index 5a331aa..9515702 100644
 +                        wcwRunGenIncomplete = true;
                      }
  
-                     assert((logicalTicks > displayTicks) && "Logical ticks must always remain bigger than the display ticks.");
-@@ -1022,16 +1469,48 @@ namespace RT64 {
+-                    assert((logicalTicks > displayTicks) && "Logical ticks must always remain bigger than the display ticks.");
+-                    assert(((logicalTicks - displayTicks) <= (workloadConfig.targetRate + workload.viOriginalRate)) && "The gap between logical ticks and display ticks can't be bigger than the target rate.");
++                    assert((wcwTicks.logical > wcwTicks.display) && "Logical ticks must always remain bigger than the display ticks.");
++                    assert(((wcwTicks.logical - wcwTicks.display) <= (workloadConfig.targetRate + workload.viOriginalRate)) && "The gap between logical ticks and display ticks can't be bigger than the target rate.");
+                     assert((displayFrames > 0) && "At least one display frame must be generated.");
+                 }
+                 else if (workload.viOriginalRate > 0) {
+@@ -1022,16 +1463,48 @@ namespace RT64 {
                  
                  // Get the current and previous set of frame counters. The other set can be in use by the present queue. Skip if no new present event has arrived before this workload event.
                  InterpolatedFrameCounters &prevFrameCounters = ext.sharedResources->interpolatedFrames[ext.sharedResources->interpolatedFramesIndex];
@@ -15267,7 +15538,7 @@ index 5a331aa..9515702 100644
                          return (prevFrameCounters.presented == 0) || (prevFrameCounters.presented >= prevFrameCounters.available);
                      });
                  }
-@@ -1043,7 +1522,11 @@ namespace RT64 {
+@@ -1043,7 +1516,11 @@ namespace RT64 {
                  curFrameCounters.count = displayFrames;
  
                  // Create as many render targets as required to store the interpolated targets.
@@ -15280,13 +15551,14 @@ index 5a331aa..9515702 100644
                  const bool usingMSAA = (ext.sharedResources->renderTargetManager.multisampling.sampleCount > 1);
                  const bool usesHDR = ext.sharedResources->renderTargetManager.usesHDR;
                  uint32_t requiredFrames = (usingMSAA && generateInterpolatedFrames) ? displayFrames : (displayFrames - 1);
-@@ -1061,18 +1544,30 @@ namespace RT64 {
+@@ -1061,18 +1538,31 @@ namespace RT64 {
                  const int64_t maxTimePerFrameMicro = adjustedTimeWindowMicro / displayFrames;
                  bool skippedFrames = false;
                  bool skipWorkloadNow = false;
 +                // [wcw hfr] The run's first layer primes this run's generated targets (see threadRenderFrame).
 +                wcwPrimeTargets.clear();
-+                if (generateInterpolatedFrames && !usingMSAA && (wcwCompositeRunLength == 1)) {
++                const bool wcwPrimeEnabled = wcwInterpolationProfile().primeGeneratedFrames || (getenv("WCW_HFR_PRIME") != nullptr);
++                if (WcwLogic::primeGeneratedTargets(wcwPrimeEnabled, generateInterpolatedFrames, usingMSAA, wcwCompositeRunLength)) {
 +                    for (uint32_t i = 0; (i + 1 < displayFrames) && (i < interpolatedTargets.size()); i++) {
 +                        wcwPrimeTargets.push_back(interpolatedTargets[i].get());
 +                    }
@@ -15306,13 +15578,24 @@ index 5a331aa..9515702 100644
                          const int64_t expectedTimeMicro = frame * maxTimePerFrameMicro;
                          const int64_t measuredFrameMicro = renderTimeTotalMicro / framesRendered;
                          if ((currentTimeMicro > expectedTimeMicro) || ((currentTimeMicro + measuredFrameMicro) > adjustedTimeWindowMicro)) {
-                             displayTicks += workload.viOriginalRate;
+-                            displayTicks += workload.viOriginalRate;
++                            wcwTicks.skip(workload.viOriginalRate, 1);
                              skippedFrames = true;
 +                            wcwRunGenIncomplete = true;
                              continue;
                          }
                      }
-@@ -1087,16 +1582,9 @@ namespace RT64 {
+@@ -1080,23 +1570,16 @@ namespace RT64 {
+                     RenderTarget *overrideTarget = nullptr;
+                     uint32_t overrideModifier = 0;
+                     if (generateInterpolatedFrames) {
+-                        prevFrameWeight = std::clamp((workloadConfig.targetRate + displayTicks - logicalTicks) / float(workloadConfig.targetRate), 0.0f, 1.0f);
+-                        displayTicks += workload.viOriginalRate;
+-                        curFrameWeight = std::clamp((workloadConfig.targetRate + displayTicks - logicalTicks) / float(workloadConfig.targetRate), 0.0f, 1.0f);
++                        const WcwLogic::FrameWeights weights = wcwTicks.advance(workloadConfig.targetRate, workload.viOriginalRate);
++                        prevFrameWeight = weights.prev;
++                        curFrameWeight = weights.cur;
+ 
                          // Override the render target.
                          if (usingMSAA || (frame > 0)) {
                              overrideTarget = interpolatedTargets[targetIndex].get();
@@ -15332,7 +15615,7 @@ index 5a331aa..9515702 100644
  
                              targetIndex++;
                          }
-@@ -1120,6 +1608,19 @@ namespace RT64 {
+@@ -1120,6 +1603,19 @@ namespace RT64 {
                      threadRenderFrame(curFrame, prevFrame, workloadConfig, workload.debuggerRenderer, workload.debuggerCamera, curFrameWeight, prevFrameWeight, deltaTimeMs,
                          interpolationTargetKey, interpolationTargetFbPairIndex, overrideTarget, overrideModifier, velocityUploaderUsed, uploadExtras, tileInterpolationUsed, lookAtInterpolationUsed);
  
@@ -15352,7 +15635,7 @@ index 5a331aa..9515702 100644
                      // Add total time the frame took to render.
                      renderTimeTotalMicro += workloadTimer.elapsedMicroseconds() - renderTimeMicro;
  
-@@ -1132,13 +1633,56 @@ namespace RT64 {
+@@ -1132,18 +1628,61 @@ namespace RT64 {
                      if (generateInterpolatedFrames && (usingMSAA || (frame > 0))) {
                          {
                              std::scoped_lock<std::mutex> cursorLock(cursorMutex);
@@ -15412,7 +15695,13 @@ index 5a331aa..9515702 100644
                          }
  
                          // Add the amount of display ticks that correspond to the remaining frames.
-@@ -1162,6 +1706,64 @@ namespace RT64 {
+                         if (skipWorkloadNow) {
+-                            displayTicks += workload.viOriginalRate * (displayFrames - (frame + 1));
++                            wcwTicks.skip(workload.viOriginalRate, displayFrames - (frame + 1));
+                         }
+ 
+                         ext.sharedResources->interpolatedCondition.notify_all();
+@@ -1162,6 +1701,64 @@ namespace RT64 {
                      ext.sharedResources->interpolatedCondition.notify_all();
                  }
  
@@ -15542,10 +15831,10 @@ index bde2f03..baf269d 100644
          void reset();
 diff --git a/src/render/rt64_crt_filter.cpp b/src/render/rt64_crt_filter.cpp
 new file mode 100644
-index 0000000..62cc362
+index 0000000..9562703
 --- /dev/null
 +++ b/src/render/rt64_crt_filter.cpp
-@@ -0,0 +1,849 @@
+@@ -0,0 +1,841 @@
 +//
 +// RT64
 +//
@@ -15569,6 +15858,7 @@ index 0000000..62cc362
 +#include <filesystem>
 +#include <mutex>
 +
++#include "common/rt64_wcw_logic.h"
 +#include "rt64_descriptor_sets.h"
 +#include "rt64_hdr_output.h"
 +#include "rt64_render_worker.h"
@@ -15645,7 +15935,7 @@ index 0000000..62cc362
 +    static const char *BeamSimulatorPreset = "aki-beam";
 +
 +    // The simulated CRT refreshes at the N64's 60 Hz.
-+    static const double BeamCrtRate = 60.0;
++    static const double BeamCrtRate = WcwLogic::BeamCrtRate;
 +
 +    // Swap chain textures don't record their VkFormat (plume only sets it for textures it allocates).
 +    static VkFormat vulkanImageFormat(const VulkanTexture *texture) {
@@ -16057,25 +16347,16 @@ index 0000000..62cc362
 +
 +        // Display refreshes per simulated CRT refresh, or 0 when the display can't run the beam simulator.
 +        double computeBeamRatio() {
++            // [wcw hfr] The rules (CRT rate with frame interpolation, minimum refresh rate) are in WcwLogic::decideBeam.
++            const WcwLogic::BeamDecision decision = WcwLogic::decideBeam(displayRefreshRate, displayVsync, displayInterpolating, displayContentRate);
++            const double crtRate = decision.crtRate;
++            const double ratio = decision.ratio;
 +            std::string reason;
-+            // [wcw hfr] With frame interpolation above 60 fps (e.g. 120), the simulated CRT refreshes at that
-+            // rate when the display has at least two refreshes per frame, so every interpolated frame gets a
-+            // scan of its own. Otherwise it stays at 60 Hz and each scan shows the latest frame.
-+            double crtRate = BeamCrtRate;
-+            if (displayInterpolating && (double(displayContentRate) > BeamCrtRate) && ((double(displayRefreshRate) / double(displayContentRate)) >= 1.95)) {
-+                crtRate = double(displayContentRate);
-+            }
-+
-+            double ratio = double(displayRefreshRate) / crtRate;
-+            if (!displayVsync) {
++            if (decision.unavailable == WcwLogic::BeamUnavailable::NeedsVSync) {
 +                reason = "it needs V-Sync";
 +            }
-+            else if (ratio < 1.95) {
++            else if (decision.unavailable == WcwLogic::BeamUnavailable::RefreshRateTooLow) {
 +                reason = "the display refresh rate (" + std::to_string(displayRefreshRate) + " Hz) must be 120 Hz or higher";
-+            }
-+
-+            if (!reason.empty()) {
-+                ratio = 0.0;
 +            }
 +
 +            if (!beamStateLogged || (reason != beamUnavailableReason) || (crtRate != beamCrtRate)) {
@@ -17617,15 +17898,17 @@ index 8a3782a..0789a75 100644
 \ No newline at end of file
 diff --git a/src/render/rt64_wcw_raytracer.cpp b/src/render/rt64_wcw_raytracer.cpp
 new file mode 100644
-index 0000000..c2043b9
+index 0000000..30e96e3
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.cpp
-@@ -0,0 +1,1139 @@
+@@ -0,0 +1,1141 @@
 +//
 +// RT64
 +//
 +
 +#include "rt64_wcw_raytracer.h"
++
++#include "common/rt64_wcw_logic.h"
 +
 +#include <algorithm>
 +#include <cfloat>
@@ -18317,7 +18600,7 @@ index 0000000..c2043b9
 +        instances.emplace_back(RenderBufferReference(slot.blasBuffer.get()), 0, 0x1, 0, true, RenderAffineTransform());
 +        for (uint32_t s = 0; s < MaxSlots; s++) {
 +            const Slot &other = slots[s];
-+            if ((s != currentSlot) && other.valid && ((frameCounter - other.builtFrame) <= StaleFrames)) {
++            if ((s != currentSlot) && other.valid && WcwLogic::shadowCasterFresh(frameCounter, other.builtFrame)) {
 +                instances.emplace_back(RenderBufferReference(other.blasBuffer.get()), s + 1, 0x2, 0, true, RenderAffineTransform());
 +            }
 +        }
@@ -18762,10 +19045,10 @@ index 0000000..c2043b9
 +};
 diff --git a/src/render/rt64_wcw_raytracer.h b/src/render/rt64_wcw_raytracer.h
 new file mode 100644
-index 0000000..4f6815e
+index 0000000..38aa70b
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.h
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,282 @@
 +//
 +// RT64
 +//
@@ -18848,10 +19131,7 @@ index 0000000..4f6815e
 +        // bounds), not the workload's position within the present: the game's workload cycle
 +        // drifts against presents, so positions would swap scenes from frame to frame.
 +        static const uint32_t MaxSlots = 8;
-+        // Other scenes stay shadow casters for this many game frames after their last build. Counted in game
-+        // frames, not workloads: frame interpolation renders every workload once per displayed frame (4 times
-+        // per game frame at 120 Hz), which aged the wrestlers' scene out before the floor's pass used it.
-+        static const uint64_t StaleFrames = 2;
++        // How long other scenes stay shadow casters: WcwLogic::shadowCasterFresh (common/rt64_wcw_logic.h).
 +        struct Slot {
 +            std::unique_ptr<RenderBuffer> blasBuffer;
 +            std::unique_ptr<RenderAccelerationStructure> blas;
@@ -19805,3 +20085,339 @@ index 0000000..c07bd98
 +#ifdef HLSL_CPU
 +};
 +#endif
+diff --git a/tests/wcw/rt64_wcw_logic_tests.cpp b/tests/wcw/rt64_wcw_logic_tests.cpp
+new file mode 100644
+index 0000000..869000e
+--- /dev/null
++++ b/tests/wcw/rt64_wcw_logic_tests.cpp
+@@ -0,0 +1,249 @@
++//
++// RT64
++//
++
++// [wcw] Unit tests for common/rt64_wcw_logic (frame interpolation, present pacing, CRT beam simulator, ray-traced
++// shadows). Built and run as part of every rt64 build (RT64_WCW_TESTS); a failure fails the build. Each test names
++// the bug it guards against where there was one.
++
++#include "common/rt64_wcw_logic.h"
++
++#include <algorithm>
++#include <cmath>
++#include <vector>
++
++#include "wcw_test.h"
++
++using namespace RT64::WcwLogic;
++
++// Ray-traced shadows
++
++TEST_CASE("shadow casters stay fresh for 2 game frames, then age out") {
++    CHECK(shadowCasterFresh(10, 10));
++    CHECK(shadowCasterFresh(11, 10));
++    CHECK(shadowCasterFresh(12, 10));
++    CHECK(!shadowCasterFresh(13, 10));
++    CHECK(!shadowCasterFresh(9, 10));
++}
++
++TEST_CASE("shadow casters survive every render of a game frame at 120 fps (shadows vanished at 120)") {
++    // At 120 fps every workload renders 4 times per game frame. Freshness is counted in game frames, so the
++    // wrestlers' scene (built on frame 100) must still cast shadows in all 4 renders of frames 100 to 102.
++    const uint64_t built = 100;
++    for (uint64_t frame = 100; frame <= 102; frame++) {
++        for (int render = 0; render < 4; render++) {
++            CHECK(shadowCasterFresh(frame, built));
++        }
++    }
++}
++
++// CRT beam simulator
++
++TEST_CASE("beam: 120 fps on a 280 Hz display simulates a 120 Hz CRT") {
++    const BeamDecision d = decideBeam(280, true, true, 120);
++    CHECK(d.unavailable == BeamUnavailable::None);
++    CHECK_NEAR(d.crtRate, 120.0, 1e-9);
++    CHECK_NEAR(d.ratio, 280.0 / 120.0, 1e-9);
++}
++
++TEST_CASE("beam: 60 fps (or no interpolation) keeps a 60 Hz CRT") {
++    const BeamDecision smooth = decideBeam(280, true, true, 60);
++    CHECK_NEAR(smooth.crtRate, 60.0, 1e-9);
++    CHECK_NEAR(smooth.ratio, 280.0 / 60.0, 1e-9);
++    const BeamDecision original = decideBeam(280, true, false, 0);
++    CHECK_NEAR(original.crtRate, 60.0, 1e-9);
++    CHECK_NEAR(original.ratio, 280.0 / 60.0, 1e-9);
++}
++
++TEST_CASE("beam: 120 fps on a 144 Hz display falls back to a 60 Hz CRT") {
++    // 144 / 120 is under 2 refreshes per frame, so each interpolated frame can't get its own scan.
++    const BeamDecision d = decideBeam(144, true, true, 120);
++    CHECK(d.unavailable == BeamUnavailable::None);
++    CHECK_NEAR(d.crtRate, 60.0, 1e-9);
++    CHECK_NEAR(d.ratio, 2.4, 1e-9);
++}
++
++TEST_CASE("beam: unavailable without V-Sync or below 120 Hz") {
++    const BeamDecision noVsync = decideBeam(280, false, true, 120);
++    CHECK(noVsync.unavailable == BeamUnavailable::NeedsVSync);
++    CHECK_EQ(noVsync.ratio, 0.0);
++    const BeamDecision slow = decideBeam(60, true, false, 0);
++    CHECK(slow.unavailable == BeamUnavailable::RefreshRateTooLow);
++    CHECK_EQ(slow.ratio, 0.0);
++    CHECK(decideBeam(120, true, false, 0).unavailable == BeamUnavailable::None);
++}
++
++// Present pacing
++
++// Simulates the present loop's timing for one configuration using the real pacing rules: present 0 of a game frame
++// goes out when the frame arrives, later presents wait for their even target, optionally sleep a frame period past
++// the previous present, and with the beam simulator wait for the next vblank. Returns the presents per second.
++static double simulatePresentsPerSecond(uint32_t refreshRate, uint32_t targetRate, uint32_t viRate, bool beamActive) {
++    using namespace std::chrono;
++    const auto refresh = duration_cast<steady_clock::duration>(duration<double>(1.0 / refreshRate));
++    const auto period = duration_cast<steady_clock::duration>(duration<double>(1.0 / targetRate));
++    const auto gameFrame = duration_cast<steady_clock::duration>(duration<double>(1.0 / viRate));
++    const steady_clock::time_point epoch{};
++    auto nextVBlank = [&](steady_clock::time_point t) {
++        const auto n = (t - epoch + refresh - steady_clock::duration(1)) / refresh;
++        return epoch + refresh * n;
++    };
++
++    const int framesToPresent = int(framesPerGameFrame(targetRate, viRate, 0));
++    const int gameFrames = 300;
++    bool havePrevious = false;
++    steady_clock::time_point previous = epoch;
++    int presents = 0;
++    for (int f = 0; f < gameFrames; f++) {
++        // A game frame arrives every gameFrame; when the presents fall behind, its first present waits for them.
++        steady_clock::time_point frameStart = std::max(epoch + gameFrame * f, previous);
++        for (int i = 0; i < framesToPresent; i++) {
++            steady_clock::time_point t = (i == 0) ? frameStart : std::max(evenPresentTarget(frameStart, i, framesToPresent, viRate), previous);
++            if (sleepFramePeriodBeforePresent(havePrevious, targetRate, viRate, beamActive)) {
++                t = std::max(t, previous + period);
++            }
++
++            if (beamActive) {
++                t = nextVBlank(t);
++            }
++
++            // A game frame whose presents run past the next game frame's arrival loses the rest (the present
++            // thread moves on to the newer frame).
++            if ((i > 0) && (t >= epoch + gameFrame * (f + 1))) {
++                break;
++            }
++
++            previous = t;
++            havePrevious = true;
++            presents++;
++        }
++    }
++
++    return presents / (duration<double>(gameFrame).count() * gameFrames);
++}
++
++TEST_CASE("pacing: 120 fps with the beam simulator on a 280 Hz display keeps 120 presents/s (it ran at ~92)") {
++    CHECK_NEAR(simulatePresentsPerSecond(280, 120, 30, true), 120.0, 3.0);
++}
++
++TEST_CASE("pacing: 60 fps with the beam simulator on a 280 Hz display keeps 60 presents/s") {
++    CHECK_NEAR(simulatePresentsPerSecond(280, 60, 30, true), 60.0, 1.5);
++}
++
++TEST_CASE("pacing: without the beam simulator 120 and 60 fps keep their rates") {
++    CHECK_NEAR(simulatePresentsPerSecond(280, 120, 30, false), 120.0, 3.0);
++    CHECK_NEAR(simulatePresentsPerSecond(280, 60, 30, false), 60.0, 1.5);
++}
++
++TEST_CASE("pacing: presents are spread evenly over the game frame") {
++    const std::chrono::steady_clock::time_point start{};
++    const auto gameFrame = std::chrono::microseconds(1000000 / 30);
++    for (int i = 0; i < 4; i++) {
++        CHECK((evenPresentTarget(start, i, 4, 30) - start) == (gameFrame * i) / 4);
++    }
++
++    CHECK(!sleepFramePeriodBeforePresent(false, 120, 30, false));
++    CHECK(!sleepFramePeriodBeforePresent(true, 0, 30, false));
++    CHECK(!sleepFramePeriodBeforePresent(true, 30, 30, false));
++    CHECK(sleepFramePeriodBeforePresent(true, 120, 30, false));
++    CHECK(!sleepFramePeriodBeforePresent(true, 120, 30, true));
++}
++
++// Frame interpolation
++
++TEST_CASE("interpolation: frames per game frame") {
++    CHECK_EQ(framesPerGameFrame(60, 30, 0), 2u);
++    CHECK_EQ(framesPerGameFrame(120, 30, 0), 4u);
++    CHECK_EQ(framesPerGameFrame(144, 30, 0), 5u);
++    CHECK_EQ(framesPerGameFrame(30, 30, 0), 2u);
++    CHECK_EQ(framesPerGameFrame(120, 30, 3), 3u);
++}
++
++static void checkIntegerMultipleWeights(uint32_t targetRate, uint32_t viRate) {
++    InterpolationTicks ticks;
++    const uint32_t n = targetRate / viRate;
++    for (int gameFrame = 0; gameFrame < 50; gameFrame++) {
++        CHECK_EQ(ticks.beginGameFrame(targetRate, viRate, 0), n);
++        for (uint32_t i = 0; i < n; i++) {
++            const FrameWeights w = ticks.advance(targetRate, viRate);
++            CHECK_NEAR(w.prev, float(i) / n, 1e-6);
++            CHECK_NEAR(w.cur, float(i + 1) / n, 1e-6);
++        }
++
++        CHECK(ticks.logical >= ticks.display);
++    }
++}
++
++TEST_CASE("interpolation: 60 fps shows a blend and the real frame per game frame") {
++    checkIntegerMultipleWeights(60, 30);
++}
++
++TEST_CASE("interpolation: 120 fps shows three blends and the real frame per game frame") {
++    // The last displayed frame of each game frame has weight 1: the real frame, not a blend.
++    checkIntegerMultipleWeights(120, 30);
++}
++
++TEST_CASE("interpolation: 144 fps alternates 4 and 5 frames and keeps pace with the game") {
++    InterpolationTicks ticks;
++    uint32_t total = 0;
++    const int gameFrames = 300;
++    for (int f = 0; f < gameFrames; f++) {
++        const uint32_t frames = ticks.beginGameFrame(144, 30, 0);
++        CHECK((frames == 4) || (frames == 5));
++        float lastCur = -1.0f;
++        for (uint32_t i = 0; i < frames; i++) {
++            const FrameWeights w = ticks.advance(144, 30);
++            CHECK((w.prev >= 0.0f) && (w.cur <= 1.0f) && (w.prev < w.cur));
++            CHECK(w.cur > lastCur);
++            lastCur = w.cur;
++        }
++
++        CHECK((ticks.logical - ticks.display) <= int64_t(144 + 30));
++        total += frames;
++    }
++
++    CHECK_NEAR(double(total) / (gameFrames / 30.0), 144.0, 1.0);
++}
++
++TEST_CASE("interpolation: skipped frames advance the display ticks") {
++    InterpolationTicks ticks;
++    CHECK_EQ(ticks.beginGameFrame(120, 30, 0), 4u);
++    ticks.advance(120, 30);
++    ticks.skip(30, 3);
++    CHECK_EQ(ticks.display, int64_t(120));
++    CHECK_EQ(ticks.beginGameFrame(120, 30, 0), 4u);
++    ticks.reset();
++    CHECK_EQ(ticks.logical, int64_t(0));
++    CHECK_EQ(ticks.display, int64_t(0));
++}
++
++TEST_CASE("priming: only the first layer of a run primes (Revenge flicker)") {
++    CHECK(primeGeneratedTargets(true, true, false, 1));
++    CHECK(!primeGeneratedTargets(true, true, false, 2));
++    CHECK(!primeGeneratedTargets(true, true, false, 3));
++    CHECK(!primeGeneratedTargets(false, true, false, 1));
++    CHECK(!primeGeneratedTargets(true, false, false, 1));
++    CHECK(!primeGeneratedTargets(true, true, true, 1));
++}
++
++TEST_CASE("matrix slots: double-buffered slots 0x40 apart share one identity") {
++    MatrixSlotIdentity identity(0x40);
++    const uint32_t a = identity.canonical(0x80101000);
++    CHECK_EQ(a, 0x80101000u);
++    CHECK_EQ(identity.canonical(0x80101040), a);
++    CHECK_EQ(identity.canonical(0x80101000), a);
++    CHECK_EQ(identity.canonical(0x80200000), 0x80200000u);
++    // The partner can be either side: a slot 0x40 below a known one pairs with it too.
++    CHECK_EQ(identity.canonical(0x801FFFC0), 0x80200000u);
++    CHECK_EQ(identity.canonical(0x80300000), 0x80300000u);
++}
++
++TEST_CASE("matrix slots: a stride of 0 disables the pairing") {
++    MatrixSlotIdentity identity(0);
++    CHECK_EQ(identity.canonical(0x80101000), 0x80101000u);
++    CHECK_EQ(identity.canonical(0x80101040), 0x80101040u);
++}
++
++int main() {
++    return WcwTest::runAll("rt64 wcw tests");
++}
+diff --git a/tests/wcw/wcw_test.h b/tests/wcw/wcw_test.h
+new file mode 100644
+index 0000000..6a19f43
+--- /dev/null
++++ b/tests/wcw/wcw_test.h
+@@ -0,0 +1,75 @@
++//
++// RT64
++//
++
++// [wcw] Minimal unit test harness for the wcw tests: TEST_CASE registers a test, CHECK / CHECK_NEAR record failures
++// without stopping the test, and runAll() runs everything and returns the process exit code.
++
++#pragma once
++
++#include <cmath>
++#include <cstdio>
++#include <functional>
++#include <string>
++#include <vector>
++
++namespace WcwTest {
++    struct Case {
++        const char *name;
++        std::function<void()> body;
++    };
++
++    inline std::vector<Case> &cases() {
++        static std::vector<Case> list;
++        return list;
++    }
++
++    inline int &failures() {
++        static int count = 0;
++        return count;
++    }
++
++    struct Registrar {
++        Registrar(const char *name, std::function<void()> body) {
++            cases().push_back({ name, std::move(body) });
++        }
++    };
++
++    inline void fail(const char *file, int line, const std::string &message) {
++        fprintf(stderr, "  FAILED %s:%d: %s\n", file, line, message.c_str());
++        failures()++;
++    }
++
++    inline int runAll(const char *suite) {
++        int failedCases = 0;
++        for (const Case &c : cases()) {
++            const int before = failures();
++            c.body();
++            if (failures() != before) {
++                fprintf(stderr, "[%s] FAIL %s\n", suite, c.name);
++                failedCases++;
++            }
++        }
++
++        fprintf(stderr, "[%s] %zu tests, %d failed\n", suite, cases().size(), failedCases);
++        return (failedCases == 0) ? 0 : 1;
++    }
++};
++
++#define WCW_TEST_CONCAT2(a, b) a##b
++#define WCW_TEST_CONCAT(a, b) WCW_TEST_CONCAT2(a, b)
++#define TEST_CASE(name) \
++    static void WCW_TEST_CONCAT(wcwTest_, __LINE__)(); \
++    static WcwTest::Registrar WCW_TEST_CONCAT(wcwTestRegistrar_, __LINE__)(name, WCW_TEST_CONCAT(wcwTest_, __LINE__)); \
++    static void WCW_TEST_CONCAT(wcwTest_, __LINE__)()
++
++#define CHECK(expr) \
++    do { if (!(expr)) { WcwTest::fail(__FILE__, __LINE__, #expr); } } while (0)
++
++#define CHECK_EQ(a, b) \
++    do { const auto wcwA = (a); const auto wcwB = (b); if (!(wcwA == wcwB)) { \
++        WcwTest::fail(__FILE__, __LINE__, std::string(#a " == " #b " (") + std::to_string(wcwA) + " vs " + std::to_string(wcwB) + ")"); } } while (0)
++
++#define CHECK_NEAR(a, b, eps) \
++    do { const double wcwA = double(a); const double wcwB = double(b); if (!(std::fabs(wcwA - wcwB) <= double(eps))) { \
++        WcwTest::fail(__FILE__, __LINE__, std::string(#a " ~= " #b " (") + std::to_string(wcwA) + " vs " + std::to_string(wcwB) + ")"); } } while (0)

@@ -269,7 +269,7 @@ index c89956e..73c8376 100644
          return profile_index;
      }
 diff --git a/recompui/CMakeLists.txt b/recompui/CMakeLists.txt
-index b9c5458..108575f 100644
+index b9c5458..4c5926e 100644
 --- a/recompui/CMakeLists.txt
 +++ b/recompui/CMakeLists.txt
 @@ -98,6 +98,7 @@ target_include_directories(recompui PUBLIC
@@ -280,6 +280,37 @@ index b9c5458..108575f 100644
  
  target_include_directories(recompui PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include/recompui")
  
+@@ -121,3 +122,30 @@ target_link_libraries(recompui PUBLIC
+     lunasvg
+     miniz
+ )
++
++# [wcw] Unit tests for the Framerate option's rules (tests/). They build and run as part of every recompui build, so a
++# failing test fails the game's build. RECOMPUI_WCW_TESTS=OFF skips them.
++option(RECOMPUI_WCW_TESTS "Build and run the wcw unit tests with recompui" ON)
++if (RECOMPUI_WCW_TESTS AND NOT CMAKE_CROSSCOMPILING)
++    add_executable(recompui_wcw_tests
++        ${CMAKE_CURRENT_SOURCE_DIR}/tests/framerate_rules_tests.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/src/config/framerate_rules.cpp
++    )
++    target_include_directories(recompui_wcw_tests PRIVATE
++        ${CMAKE_CURRENT_SOURCE_DIR}/src/config
++        ${CMAKE_CURRENT_SOURCE_DIR}/tests
++        ${RECOMP_FRONTEND_N64MODERNRUNTIME_PATH}/ultramodern/include
++        ${RECOMP_FRONTEND_N64MODERNRUNTIME_PATH}/thirdparty
++    )
++    set(RECOMPUI_WCW_TESTS_STAMP "${CMAKE_CURRENT_BINARY_DIR}/recompui_wcw_tests.passed")
++    add_custom_command(
++        OUTPUT "${RECOMPUI_WCW_TESTS_STAMP}"
++        COMMAND recompui_wcw_tests
++        COMMAND ${CMAKE_COMMAND} -E touch "${RECOMPUI_WCW_TESTS_STAMP}"
++        DEPENDS recompui_wcw_tests
++        COMMENT "Running recompui wcw unit tests"
++        VERBATIM
++    )
++    add_custom_target(recompui_wcw_tests_run DEPENDS "${RECOMPUI_WCW_TESTS_STAMP}")
++    add_dependencies(recompui recompui_wcw_tests_run)
++endif()
 diff --git a/recompui/include/recompui/config.h b/recompui/include/recompui/config.h
 index 38b84f5..4b057d0 100644
 --- a/recompui/include/recompui/config.h
@@ -415,15 +446,84 @@ index 277a421..f5d6ad6 100644
                  recompui::config::open();
              }
          }
+diff --git a/recompui/src/config/framerate_rules.cpp b/recompui/src/config/framerate_rules.cpp
+new file mode 100644
+index 0000000..00234ae
+--- /dev/null
++++ b/recompui/src/config/framerate_rules.cpp
+@@ -0,0 +1,37 @@
++#include "framerate_rules.h"
++
++namespace recompui::framerate {
++    using ultramodern::renderer::RefreshRate;
++
++    RefreshRate parse_saved_option(const nlohmann::json &saved, uint32_t smooth_rate) {
++        if (smooth_rate == 0) {
++            return RefreshRate::Original;
++        }
++
++        const bool manual = saved.is_string() ? (saved.get<std::string>() == "Manual") :
++            (saved.is_number() && (saved.get<uint32_t>() == static_cast<uint32_t>(RefreshRate::Manual)));
++        if (manual) {
++            return RefreshRate::Manual;
++        }
++
++        if (saved.is_string() && (saved.get<std::string>() == "Smooth2x")) {
++            return RefreshRate::Display;
++        }
++
++        return RefreshRate::Original;
++    }
++
++    void apply_choice(RefreshRate &option, int &manual_value, uint32_t smooth_rate) {
++        if (smooth_rate == 0) {
++            option = RefreshRate::Original;
++        }
++        else if (option == RefreshRate::Display) {
++            // The doubled smooth rate (Smooth2x).
++            option = RefreshRate::Manual;
++            manual_value = int(smooth_rate * 2);
++        }
++        else if (option == RefreshRate::Manual) {
++            manual_value = int(smooth_rate);
++        }
++    }
++};
+diff --git a/recompui/src/config/framerate_rules.h b/recompui/src/config/framerate_rules.h
+new file mode 100644
+index 0000000..80cf16b
+--- /dev/null
++++ b/recompui/src/config/framerate_rules.h
+@@ -0,0 +1,19 @@
++#pragma once
++
++#include <cstdint>
++
++#include "ultramodern/config.hpp"
++
++// [wcw hfr] The Framerate option's rules, kept free of UI state so they can be unit tested (recompui/tests). The menu
++// offers 30 (Original), the game's smooth rate (stored as "Manual") and twice the smooth rate (stored as "Smooth2x",
++// held in the Display slot while the menu is open). The graphics tab calls these; a change to the rules belongs
++// here, with a test.
++namespace recompui::framerate {
++    // The value a saved rr_option loads as. Only a saved Smooth (Manual) or Smooth2x choice survives, and only when the
++    // game has a smooth rate; everything else, including a stale Display from older builds, loads as Original.
++    ultramodern::renderer::RefreshRate parse_saved_option(const nlohmann::json &saved, uint32_t smooth_rate);
++
++    // Turns the menu's choice into what the renderer gets: Smooth runs at smooth_rate and the doubled choice at
++    // 2 x smooth_rate, both as a Manual rate; without a smooth rate the framerate stays Original.
++    void apply_choice(ultramodern::renderer::RefreshRate &option, int &manual_value, uint32_t smooth_rate);
++};
 diff --git a/recompui/src/config/ui_config_tab_graphics.cpp b/recompui/src/config/ui_config_tab_graphics.cpp
-index 4fdf81f..cb2f6f7 100644
+index 4fdf81f..ea2c306 100644
 --- a/recompui/src/config/ui_config_tab_graphics.cpp
 +++ b/recompui/src/config/ui_config_tab_graphics.cpp
-@@ -1,7 +1,11 @@
+@@ -1,7 +1,12 @@
  #include "librecomp/config.hpp"
  #include "recompui/config.h"
  #include "recompui/renderer.h"
 +#include "recompui/program_config.h"
++#include "framerate_rules.h"
  #include "util/steam_deck.h"
 +#include "render/rt64_crt_filter.h"
 +#include "render/rt64_hdr_output.h"
@@ -431,7 +531,7 @@ index 4fdf81f..cb2f6f7 100644
  
  static bool created_graphics_config = false;
  
-@@ -64,6 +68,96 @@ namespace recompui {
+@@ -64,6 +69,96 @@ namespace recompui {
          #endif
          };
  
@@ -528,7 +628,7 @@ index 4fdf81f..cb2f6f7 100644
          static EnumOptionVector aspect_ratio_options = {
              {ultramodern::renderer::AspectRatio::Original, "Original"},
              {ultramodern::renderer::AspectRatio::Expand, "Expand"},
-@@ -83,6 +177,28 @@ namespace recompui {
+@@ -83,6 +178,28 @@ namespace recompui {
              {ultramodern::renderer::RefreshRate::Manual, "Manual"},
          };
  
@@ -557,7 +657,7 @@ index 4fdf81f..cb2f6f7 100644
          static EnumOptionVector hpfb_options = {
              {ultramodern::renderer::HighPrecisionFramebuffer::Auto, "Auto"},
              {ultramodern::renderer::HighPrecisionFramebuffer::On, "On"},
-@@ -152,11 +268,12 @@ namespace recompui {
+@@ -152,11 +269,12 @@ namespace recompui {
          }
  
          static std::string get_framerate_text(uint32_t refresh_rate) {
@@ -571,25 +671,13 @@ index 4fdf81f..cb2f6f7 100644
                  "<br />"
                  "<br />"
                  "<recomp-color primary>Detected display refresh rate: " + std::to_string(refresh_rate) + "hz</recomp-color>";
-@@ -175,9 +292,42 @@ namespace recompui {
+@@ -175,9 +293,30 @@ namespace recompui {
              new_config.hpfb_option = get_graphics_enum_value<ultramodern::renderer::HighPrecisionFramebuffer>(graphics::options::hpfb_option);
              new_config.rr_manual_value = get_graphics_number_value<int>(graphics::options::rr_manual_value);
  
-+            // [wcw hfr] Only Original or the game's fixed smooth rate (stored as Manual); Display is never offered.
-+            {
-+                const uint32_t smooth_rate = recompui::programconfig::get_frame_interpolation().smooth_rate;
-+                if (smooth_rate == 0) {
-+                    new_config.rr_option = ultramodern::renderer::RefreshRate::Original;
-+                }
-+                else if (new_config.rr_option == ultramodern::renderer::RefreshRate::Display) {
-+                    // The experimental doubled smooth rate (see smooth_rate_options).
-+                    new_config.rr_option = ultramodern::renderer::RefreshRate::Manual;
-+                    new_config.rr_manual_value = int(smooth_rate * 2);
-+                }
-+                else if (new_config.rr_option == ultramodern::renderer::RefreshRate::Manual) {
-+                    new_config.rr_manual_value = int(smooth_rate);
-+                }
-+            }
++            // [wcw hfr] Only Original, the game's fixed smooth rate or twice it (framerate_rules.h).
++            recompui::framerate::apply_choice(new_config.rr_option, new_config.rr_manual_value,
++                recompui::programconfig::get_frame_interpolation().smooth_rate);
 +
              new_config.ds_option = get_graphics_enum_value<int>(graphics::options::ds_option);
  
@@ -614,7 +702,7 @@ index 4fdf81f..cb2f6f7 100644
          }
  
          void graphics::update_msaa_supported(bool supported) {
-@@ -202,11 +352,47 @@ namespace recompui {
+@@ -202,11 +341,47 @@ namespace recompui {
              }
          }
  
@@ -664,7 +752,7 @@ index 4fdf81f..cb2f6f7 100644
          }
  
          void graphics::toggle_fullscreen() {
-@@ -299,12 +485,17 @@ namespace recompui {
+@@ -299,12 +474,17 @@ namespace recompui {
                  wm_default()
              );
  
@@ -686,7 +774,7 @@ index 4fdf81f..cb2f6f7 100644
              );
  
              config.add_number_option(
-@@ -314,12 +505,36 @@ namespace recompui {
+@@ -314,12 +494,28 @@ namespace recompui {
                  20.0, 240.0, 1.0, 0, false, 60.0
              );
              {
@@ -716,20 +804,12 @@ index 4fdf81f..cb2f6f7 100644
 +                // to Original at load without rewriting the file, so a stale Display must not turn on
 +                // interpolation by itself.
 +                config.on_json_parse_option(graphics::options::rr_option, [smooth_rate](const nlohmann::json &j) -> recomp::config::ConfigValueVariant {
-+                    const bool manual = j.is_string() ? (j.get<std::string>() == "Manual") :
-+                        (j.is_number() && (j.get<uint32_t>() == static_cast<uint32_t>(ultramodern::renderer::RefreshRate::Manual)));
-+                    if (manual && (smooth_rate > 0)) {
-+                        return static_cast<uint32_t>(ultramodern::renderer::RefreshRate::Manual);
-+                    }
-+                    if (j.is_string() && (j.get<std::string>() == "Smooth2x") && (smooth_rate > 0)) {
-+                        return static_cast<uint32_t>(ultramodern::renderer::RefreshRate::Display);
-+                    }
-+                    return static_cast<uint32_t>(ultramodern::renderer::RefreshRate::Original);
++                    return static_cast<uint32_t>(recompui::framerate::parse_saved_option(j, smooth_rate));
 +                });
              }
  
              config.add_enum_option(
-@@ -359,6 +574,119 @@ namespace recompui {
+@@ -359,6 +555,119 @@ namespace recompui {
                  true
              );
  
@@ -1130,3 +1210,183 @@ index 5fb8b5e..b8174bb 100644
          const std::u8string &get_program_id() {
              if (program_id.empty()) {
                  throw std::runtime_error("Program ID has not been set. Run recompui::programconfig::set_program_id(...) first.");
+diff --git a/recompui/tests/framerate_rules_tests.cpp b/recompui/tests/framerate_rules_tests.cpp
+new file mode 100644
+index 0000000..4047081
+--- /dev/null
++++ b/recompui/tests/framerate_rules_tests.cpp
+@@ -0,0 +1,93 @@
++// [wcw] Unit tests for the Framerate option's rules (src/config/framerate_rules). Built and run as part of every
++// recompui build (RECOMPUI_WCW_TESTS); a failure fails the build.
++
++#include "framerate_rules.h"
++
++#include "wcw_test.h"
++
++using ultramodern::renderer::RefreshRate;
++using namespace recompui::framerate;
++
++static int rateOf(RefreshRate option) {
++    return static_cast<int>(option);
++}
++
++// What the renderer runs at for a saved choice: load it, then apply it as the menu does.
++static void loadAndApply(const nlohmann::json &saved, uint32_t smooth_rate, RefreshRate &option, int &manual_value) {
++    option = parse_saved_option(saved, smooth_rate);
++    manual_value = 0;
++    apply_choice(option, manual_value, smooth_rate);
++}
++
++TEST_CASE("a saved 120 (Smooth2x) loads and runs at 120") {
++    RefreshRate option;
++    int value;
++    loadAndApply("Smooth2x", 60, option, value);
++    CHECK_EQ(rateOf(option), rateOf(RefreshRate::Manual));
++    CHECK_EQ(value, 120);
++}
++
++TEST_CASE("a saved Manual always runs at the smooth rate, whatever rr_manual_value says (120 was really 60)") {
++    // "Manual" is the stored name of the 60 (Smooth) choice: writing rr_option = Manual with rr_manual_value = 120
++    // into graphics.json gives 60, not 120. 120 is stored as "Smooth2x".
++    RefreshRate option;
++    int value;
++    loadAndApply("Manual", 60, option, value);
++    CHECK_EQ(rateOf(option), rateOf(RefreshRate::Manual));
++    CHECK_EQ(value, 60);
++    loadAndApply(static_cast<uint32_t>(RefreshRate::Manual), 60, option, value);
++    CHECK_EQ(rateOf(option), rateOf(RefreshRate::Manual));
++    CHECK_EQ(value, 60);
++}
++
++TEST_CASE("Original stays 30 (Original)") {
++    RefreshRate option;
++    int value;
++    loadAndApply("Original", 60, option, value);
++    CHECK_EQ(rateOf(option), rateOf(RefreshRate::Original));
++}
++
++TEST_CASE("a stale Display from older builds loads as Original") {
++    CHECK_EQ(rateOf(parse_saved_option("Display", 60)), rateOf(RefreshRate::Original));
++    CHECK_EQ(rateOf(parse_saved_option(static_cast<uint32_t>(RefreshRate::Display), 60)), rateOf(RefreshRate::Original));
++}
++
++TEST_CASE("unknown or malformed values load as Original") {
++    CHECK_EQ(rateOf(parse_saved_option("Bogus", 60)), rateOf(RefreshRate::Original));
++    CHECK_EQ(rateOf(parse_saved_option(nlohmann::json(), 60)), rateOf(RefreshRate::Original));
++    CHECK_EQ(rateOf(parse_saved_option(true, 60)), rateOf(RefreshRate::Original));
++}
++
++TEST_CASE("games without frame interpolation always run at Original") {
++    RefreshRate option;
++    int value;
++    for (const char *saved : { "Manual", "Smooth2x", "Display", "Original" }) {
++        loadAndApply(saved, 0, option, value);
++        CHECK_EQ(rateOf(option), rateOf(RefreshRate::Original));
++    }
++
++    option = RefreshRate::Manual;
++    value = 0;
++    apply_choice(option, value, 0);
++    CHECK_EQ(rateOf(option), rateOf(RefreshRate::Original));
++}
++
++TEST_CASE("the menu's choices map to the renderer's rate") {
++    RefreshRate option = RefreshRate::Manual;
++    int value = 999;
++    apply_choice(option, value, 60);
++    CHECK_EQ(value, 60);
++    option = RefreshRate::Display;
++    apply_choice(option, value, 60);
++    CHECK_EQ(rateOf(option), rateOf(RefreshRate::Manual));
++    CHECK_EQ(value, 120);
++    option = RefreshRate::Original;
++    value = 7;
++    apply_choice(option, value, 60);
++    CHECK_EQ(rateOf(option), rateOf(RefreshRate::Original));
++    CHECK_EQ(value, 7);
++}
++
++int main() {
++    return WcwTest::runAll("recompui wcw tests");
++}
+diff --git a/recompui/tests/wcw_test.h b/recompui/tests/wcw_test.h
+new file mode 100644
+index 0000000..abb2b85
+--- /dev/null
++++ b/recompui/tests/wcw_test.h
+@@ -0,0 +1,75 @@
++//
++// RecompFrontend
++//
++
++// [wcw] Minimal unit test harness for the wcw tests: TEST_CASE registers a test, CHECK / CHECK_NEAR record failures
++// without stopping the test, and runAll() runs everything and returns the process exit code.
++
++#pragma once
++
++#include <cmath>
++#include <cstdio>
++#include <functional>
++#include <string>
++#include <vector>
++
++namespace WcwTest {
++    struct Case {
++        const char *name;
++        std::function<void()> body;
++    };
++
++    inline std::vector<Case> &cases() {
++        static std::vector<Case> list;
++        return list;
++    }
++
++    inline int &failures() {
++        static int count = 0;
++        return count;
++    }
++
++    struct Registrar {
++        Registrar(const char *name, std::function<void()> body) {
++            cases().push_back({ name, std::move(body) });
++        }
++    };
++
++    inline void fail(const char *file, int line, const std::string &message) {
++        fprintf(stderr, "  FAILED %s:%d: %s\n", file, line, message.c_str());
++        failures()++;
++    }
++
++    inline int runAll(const char *suite) {
++        int failedCases = 0;
++        for (const Case &c : cases()) {
++            const int before = failures();
++            c.body();
++            if (failures() != before) {
++                fprintf(stderr, "[%s] FAIL %s\n", suite, c.name);
++                failedCases++;
++            }
++        }
++
++        fprintf(stderr, "[%s] %zu tests, %d failed\n", suite, cases().size(), failedCases);
++        return (failedCases == 0) ? 0 : 1;
++    }
++};
++
++#define WCW_TEST_CONCAT2(a, b) a##b
++#define WCW_TEST_CONCAT(a, b) WCW_TEST_CONCAT2(a, b)
++#define TEST_CASE(name) \
++    static void WCW_TEST_CONCAT(wcwTest_, __LINE__)(); \
++    static WcwTest::Registrar WCW_TEST_CONCAT(wcwTestRegistrar_, __LINE__)(name, WCW_TEST_CONCAT(wcwTest_, __LINE__)); \
++    static void WCW_TEST_CONCAT(wcwTest_, __LINE__)()
++
++#define CHECK(expr) \
++    do { if (!(expr)) { WcwTest::fail(__FILE__, __LINE__, #expr); } } while (0)
++
++#define CHECK_EQ(a, b) \
++    do { const auto wcwA = (a); const auto wcwB = (b); if (!(wcwA == wcwB)) { \
++        WcwTest::fail(__FILE__, __LINE__, std::string(#a " == " #b " (") + std::to_string(wcwA) + " vs " + std::to_string(wcwB) + ")"); } } while (0)
++
++#define CHECK_NEAR(a, b, eps) \
++    do { const double wcwA = double(a); const double wcwB = double(b); if (!(std::fabs(wcwA - wcwB) <= double(eps))) { \
++        WcwTest::fail(__FILE__, __LINE__, std::string(#a " ~= " #b " (") + std::to_string(wcwA) + " vs " + std::to_string(wcwB) + ")"); } } while (0)
