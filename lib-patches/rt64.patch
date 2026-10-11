@@ -243,10 +243,10 @@ index f555048..a9de81e 100644
      }
 diff --git a/src/common/rt64_wcw_logic.cpp b/src/common/rt64_wcw_logic.cpp
 new file mode 100644
-index 0000000..ce04c2f
+index 0000000..bd83fc2
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.cpp
-@@ -0,0 +1,319 @@
+@@ -0,0 +1,329 @@
 +//
 +// RT64
 +//
@@ -351,6 +351,16 @@ index 0000000..ce04c2f
 +
 +    DenoiseSettings denoiseSettings() {
 +        return DenoiseSettings();
++    }
++
++    SheenSettings sheenSettings() {
++        SheenSettings settings;
++        // Owner pick from live matches: 0.3 / 0.35 barely showed; 0.65 at exponent 8 was too much.
++        settings.specular = 0.5f;
++        settings.shininess = 12.0f;
++        settings.rim = 0.55f;
++        settings.rimPower = 3.0f;
++        return settings;
 +    }
 +
 +    std::array<float, 3> normalizedLightColor(float r, float g, float b) {
@@ -568,10 +578,10 @@ index 0000000..ce04c2f
 +};
 diff --git a/src/common/rt64_wcw_logic.h b/src/common/rt64_wcw_logic.h
 new file mode 100644
-index 0000000..2cc79fa
+index 0000000..fa5238f
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.h
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,229 @@
 +//
 +// RT64
 +//
@@ -680,6 +690,24 @@ index 0000000..2cc79fa
 +    constexpr uint32_t DenoiseMaxRadius = 4;
 +
 +    DenoiseSettings denoiseSettings();
++
++    // Wrestler sheen: highlights and backlight
++
++    // TV wrestling is lit for sheen: skin, oil and leather catch the arena lights, and the lights rim the edges of
++    // the wrestlers that face them, outlining them against the dark crowd. The ray tracer adds both to wrestlers (character draws) from the same
++    // lights and shadow rays as the shadows, so a blocked light gives no highlight. Values brighten the shadow
++    // factor (which goes up to 2): specular is the peak highlight of a fully lit pixel, rim the peak outline.
++    struct SheenSettings {
++        float specular = 0.0f;
++        // Blinn-Phong exponent: higher is a tighter, glossier highlight.
++        float shininess = 1.0f;
++        float rim = 0.0f;
++        // How quickly the outline fades from the silhouette inward (higher is thinner).
++        float rimPower = 1.0f;
++    };
++
++    // The same at every quality level (no extra rays); RT off has no sheen.
++    SheenSettings sheenSettings();
 +
 +    // Colored light
 +
@@ -18209,10 +18237,10 @@ index 8a3782a..0789a75 100644
 \ No newline at end of file
 diff --git a/src/render/rt64_wcw_raytracer.cpp b/src/render/rt64_wcw_raytracer.cpp
 new file mode 100644
-index 0000000..511bfdb
+index 0000000..068854b
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.cpp
-@@ -0,0 +1,1232 @@
+@@ -0,0 +1,1240 @@
 +//
 +// RT64
 +//
@@ -19147,6 +19175,14 @@ index 0000000..511bfdb
 +        };
 +
 +        params.colorSplit = (envFloat(getenv("WCW_RT_COLOR_SPLIT"), 0.0f) != 0.0f) ? 1u : 0u;
++        {
++            const WcwLogic::SheenSettings sheen = WcwLogic::sheenSettings();
++            params.sheenSpecular = std::max(envFloat(getenv("WCW_RT_SHEEN"), sheen.specular), 0.0f);
++            params.sheenShininess = std::max(envFloat(getenv("WCW_RT_SHEEN_SHININESS"), sheen.shininess), 1.0f);
++            params.sheenRim = std::max(envFloat(getenv("WCW_RT_RIM"), sheen.rim), 0.0f);
++            params.sheenRimPower = std::max(envFloat(getenv("WCW_RT_RIM_POWER"), sheen.rimPower), 1.0f);
++            params.sheenSplit = (envFloat(getenv("WCW_RT_SHEEN_SPLIT"), 0.0f) != 0.0f) ? 1u : 0u;
++        }
 +        params.glowPadding0 = params.glowPadding1 = params.glowPadding2 = 0.0f;
 +        params.glowIntensity = { 0.0f, 0.0f, 0.0f, 0.0f };
 +        for (const auto &g : preset.glows) {
@@ -19989,10 +20025,10 @@ index 0000000..a961cbd
 +}
 diff --git a/src/shaders/WcwRtTraceCS.hlsl b/src/shaders/WcwRtTraceCS.hlsl
 new file mode 100644
-index 0000000..a2c5c50
+index 0000000..a13eae7
 --- /dev/null
 +++ b/src/shaders/WcwRtTraceCS.hlsl
-@@ -0,0 +1,569 @@
+@@ -0,0 +1,601 @@
 +//
 +// RT64
 +//
@@ -20403,6 +20439,7 @@ index 0000000..a2c5c50
 +    const uint lightCount = min(gParams.lightListCount, WCW_RT_MAX_LIGHTS);
 +    float lightWeights[WCW_RT_MAX_LIGHTS];
 +    float weightSum = 0.0f;
++    float weightMax = 0.0f;
 +    for (uint w = 0; w < lightCount; w++) {
 +        float lw = gParams.lights[w].w;
 +        if (gParams.lightFalloff > 0.0f) {
@@ -20412,6 +20449,7 @@ index 0000000..a2c5c50
 +
 +        lightWeights[w] = lw;
 +        weightSum += lw;
++        weightMax = max(weightMax, lw);
 +    }
 +
 +    // Smooth shadows on lit draws (wrestlers): facing from the smooth normal, rays from the lifted hit point.
@@ -20421,6 +20459,13 @@ index 0000000..a2c5c50
 +
 +    // Light reaching the pixel, in the lights' colors (white lights: the visible fraction of the total weight).
 +    float3 lit = float3(0.0f, 0.0f, 0.0f);
++    // Wrestler sheen: highlights and backlight from the lights that reach the pixel (no extra rays).
++    const bool characterReceiver = (gMeshIndexStarts[primary.CommittedGeometryIndex()] & WCW_RT_MESH_CHARACTER) != 0;
++    const bool sheenOn = characterReceiver && ((gParams.sheenSpecular > 0.0f) || (gParams.sheenRim > 0.0f)) &&
++        !((gParams.sheenSplit != 0) && (pixel.x < (gParams.resolution.x / 2)));
++    const float3 viewDir = -ray.Direction;
++    const float rimEdge = pow(1.0f - saturate(dot(shadeNormal, viewDir)), max(gParams.sheenRimPower, 1.0f));
++    float3 sheen = float3(0.0f, 0.0f, 0.0f);
 +    int occluderId = -1;
 +    // Heavier lights cast proportionally darker shadows, so their sampling noise shows more:
 +    // each light gets samples in proportion to its preset weight (key light 2 -> twice the rays).
@@ -20447,6 +20492,21 @@ index 0000000..a2c5c50
 +        // Just past the terminator the vertex lighting is already dark too: the shadow fades in over terminatorFade.
 +        const float shadowShare = smoothShadow ? smoothstep(0.0f, max(gParams.terminatorFade, 1e-4f), facing) : 1.0f;
 +
++        // This sample's highlight and backlight, added below in proportion to how much of it gets through.
++        float3 sampleSheen = float3(0.0f, 0.0f, 0.0f);
++        if (sheenOn) {
++            const float3 toLightDir = toLight / max(lightDist, 1e-6f);
++            const float3 halfway = normalize(toLightDir + viewDir);
++            const float highlight = pow(saturate(dot(shadeNormal, halfway)), max(gParams.sheenShininess, 1.0f)) * facing;
++            // The outline facing a light: overhead TV lights rim the shoulders and heads as seen from the hard cam.
++            const float backlight = rimEdge * facing;
++            // Each light's sheen at its own strength relative to the strongest light (not its share of the total):
++            // a highlight from one light isn't dimmer because other lights exist.
++            const float3 sheenColor = whiteLight(pixel) ? float3(1.0f, 1.0f, 1.0f) : gParams.lightColors[l].rgb;
++            const float sheenWeight = lightWeights[l] / max(weightMax, 1e-6f) / float(samples);
++            sampleSheen = sheenColor * sheenWeight * (gParams.sheenSpecular * highlight + gParams.sheenRim * backlight);
++        }
++
 +        RayDesc shadowRay;
 +        shadowRay.Origin = shadowStart + normal * 0.5f;
 +        shadowRay.Direction = toLight / lightDist;
@@ -20454,6 +20514,7 @@ index 0000000..a2c5c50
 +        shadowRay.TMax = lightDist - gParams.lightClearance;
 +        if (shadowRay.TMax <= shadowRay.TMin) {
 +            lit += weight;
++            sheen += sampleSheen;
 +            continue;
 +        }
 +
@@ -20468,9 +20529,11 @@ index 0000000..a2c5c50
 +        if (shadow.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
 +            occluderId = int(shadow.CommittedGeometryIndex());
 +            lit += weight * (1.0f - shadowShare);
++            sheen += sampleSheen * (1.0f - shadowShare);
 +        }
 +        else {
 +            lit += weight;
++            sheen += sampleSheen;
 +        }
 +    }
 +
@@ -20485,10 +20548,15 @@ index 0000000..a2c5c50
 +        return;
 +    }
 +
-+    const bool characterReceiver = (gMeshIndexStarts[primary.CommittedGeometryIndex()] & WCW_RT_MESH_CHARACTER) != 0;
 +    const float strength = characterReceiver ? gParams.characterShadowStrength : gParams.shadowStrength;
 +    // Unlit share (1 - strength) plus the light that arrives, so white lights give 1 - strength * (1 - visible).
 +    float3 factor = (1.0f - strength) + strength * lit;
++    if (gParams.mode == WCW_RT_MODE_SHEEN_RAW) {
++        gOutput[pixel] = float4(sheen, 1.0f);
++        return;
++    }
++
++    factor += sheen;
 +    if (gParams.mode == WCW_RT_MODE_SHADOW_RAW) {
 +        gOutput[pixel] = float4(factor, 1.0f);
 +        return;
@@ -20578,10 +20646,10 @@ index b51cf09..19048ae 100644
  };
 diff --git a/src/shared/rt64_wcw_rt.h b/src/shared/rt64_wcw_rt.h
 new file mode 100644
-index 0000000..41171ec
+index 0000000..673513d
 --- /dev/null
 +++ b/src/shared/rt64_wcw_rt.h
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,171 @@
 +//
 +// RT64
 +//
@@ -20607,6 +20675,8 @@ index 0000000..41171ec
 +#define WCW_RT_MODE_AO_RAW 9
 +// Raw shadow term before AO and filtering, grey (white = lit).
 +#define WCW_RT_MODE_SHADOW_RAW 10
++// Wrestler sheen (highlights + backlight) alone, grey on black.
++#define WCW_RT_MODE_SHEEN_RAW 12
 +
 +// Side of the blue noise tile the trace shader samples (WcwLogic::BlueNoiseSize; a power of two).
 +#define WCW_RT_BLUE_NOISE_SIZE 64
@@ -20734,6 +20804,13 @@ index 0000000..41171ec
 +        uint2 traceEnd;
 +        // WCW_RT_COLOR_SPLIT=1: white lights and glows on the left half of the screen (same-moment comparisons).
 +        uint colorSplit;
++        // Wrestler sheen (WcwLogic::sheenSettings): highlight strength and exponent, backlight strength and falloff.
++        float sheenSpecular;
++        float sheenShininess;
++        float sheenRim;
++        float sheenRimPower;
++        // WCW_RT_SHEEN_SPLIT=1: no sheen on the left half of the screen (same-moment comparisons).
++        uint sheenSplit;
 +    };
 +
 +    struct WcwRtCompositeCB {
@@ -20746,10 +20823,10 @@ index 0000000..41171ec
 +#endif
 diff --git a/tests/wcw/rt64_wcw_logic_tests.cpp b/tests/wcw/rt64_wcw_logic_tests.cpp
 new file mode 100644
-index 0000000..cd29e24
+index 0000000..21680fe
 --- /dev/null
 +++ b/tests/wcw/rt64_wcw_logic_tests.cpp
-@@ -0,0 +1,518 @@
+@@ -0,0 +1,538 @@
 +//
 +// RT64
 +//
@@ -20933,6 +21010,26 @@ index 0000000..cd29e24
 +    const DenoiseSettings d = denoiseSettings();
 +    CHECK(d.aoAlpha <= d.shadowAlpha);
 +    CHECK(d.aoAlpha > 0.0f && d.shadowAlpha < 1.0f);
++}
++
++// Wrestler sheen
++
++TEST_CASE("sheen: highlights and outlines brighten without blowing out") {
++    // The shadow factor is stored up to 2. Neither term alone may double a fully lit wrestler (factor 1), and the
++    // two together (they peak in different places: the highlight faces the light, the outline is the silhouette)
++    // stay close to that ceiling. The owner found 0.3 / 0.35 too faint and 0.65 / 0.7 too much.
++    const SheenSettings s = sheenSettings();
++    CHECK(s.specular > 0.35f && s.specular < 0.65f);
++    CHECK(s.rim > 0.35f && s.rim < 0.7f);
++    CHECK(s.specular + s.rim <= 1.1f);
++}
++
++TEST_CASE("sheen: a glossy highlight and a thin outline, not a wash") {
++    // A low exponent spreads the highlight over the whole lit side (looks like a brightness bump, not shine); a low
++    // rim power brightens the whole body instead of its outline.
++    const SheenSettings s = sheenSettings();
++    CHECK(s.shininess >= 8.0f);
++    CHECK(s.rimPower >= 2.0f);
 +}
 +
 +// Colored light
