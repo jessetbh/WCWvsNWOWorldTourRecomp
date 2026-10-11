@@ -65,6 +65,145 @@ index 1194a96..432e1ab 100644
          presentation.removeBlackBorders = true;
          rect.fixRectLR = true;
          f3dex.forceBranch = false;
+diff --git a/src/common/rt64_math.cpp b/src/common/rt64_math.cpp
+index c20fb51..09f0db5 100644
+--- a/src/common/rt64_math.cpp
++++ b/src/common/rt64_math.cpp
+@@ -4,11 +4,36 @@
+ 
+ #include "rt64_math.h"
+ 
++#include <cstdlib>
+ #include <cassert>
++#include <chrono>
+ #include <cmath>
+ #include <memory>
+ 
+ namespace RT64 {
++    std::atomic<bool> wcwInterpActive = { false };
++
++    static WcwInterpolationProfile wcwProfile;
++
++    void wcwSetInterpolationProfile(bool hooklessObjects, bool primeGeneratedFrames, bool skipClearOnlyTargets, bool evenPacing) {
++        wcwProfile.hooklessObjects = hooklessObjects;
++        wcwProfile.primeGeneratedFrames = primeGeneratedFrames;
++        wcwProfile.skipClearOnlyTargets = skipClearOnlyTargets;
++        wcwProfile.evenPacing = evenPacing;
++    }
++
++    const WcwInterpolationProfile &wcwInterpolationProfile() {
++        return wcwProfile;
++    }
++
++    std::atomic<uint32_t> wcwHfrForced = { 0 }, wcwHfrPure = { 0 }, wcwHfrPurePairs = { 0 }, wcwHfrWorkloadsCompared = { 0 }, wcwHfrIdPairs = { 0 }, wcwHfrIds = { 0 };
++    std::atomic<uint32_t> wcwLastRunLength = { 0 };
++    std::atomic<uint64_t> wcwSlotRealSerial[3] = {};
++    std::atomic<uint64_t> wcwSlotRealComplete[3] = {};
++    std::atomic<uint32_t> wcwAddrSlotAddr[4] = {};
++    std::atomic<uint64_t> wcwAddrSlotSerial[4] = {};
++    std::atomic<uint64_t> wcwAddrSlotComplete[4] = {};
++
+     float sqr(float x) {
+         return x * x;
+     }
+@@ -430,7 +455,38 @@ namespace RT64 {
+     DecomposedTransform lerpTransforms(const DecomposedTransform& a, const DecomposedTransform& b, float weight,
+         bool lerpTranslation, bool lerpRotation, bool lerpScale, bool lerpSkew, bool lerpPerpsective, bool useSlerp)
+     {
+-        assert(a.valid && b.valid);
++        // [wcw fix] Matrices that do not decompose cleanly (degenerate UI/setup matrices) cannot be
++        // interpolated: render them at the target transform instead of asserting.
++        if (!a.valid || !b.valid) {
++            return b.valid ? b : a;
++        }
++
++        // [wcw fix] In a match, also reject decompositions that are valid but unstable from one frame
++        // to the next (a mirrored axis, a near-zero or sharply changing scale, as seen on near
++        // edge-on billboards at low camera angles). Those render at the target transform.
++        if (wcwInterpActive.load(std::memory_order_relaxed)) {
++            if (a.coordinateFlip != b.coordinateFlip) {
++                return b;
++            }
++
++            const hlslpp::float3 aScale = abs(a.scale);
++            const hlslpp::float3 bScale = abs(b.scale);
++            const float minScale = 1e-4f;
++            const float maxRatio = 4.0f;
++            for (int i = 0; i < 3; i++) {
++                const float as = aScale[i];
++                const float bs = bScale[i];
++                if ((as < minScale) || (bs < minScale)) {
++                    return b;
++                }
++
++                const float ratio = (as > bs) ? (as / bs) : (bs / as);
++                if (ratio > maxRatio) {
++                    return b;
++                }
++            }
++        }
++
+         DecomposedTransform ret;
+ 
+         // Lerp the individual fields based on the provided flags.
+@@ -441,6 +497,9 @@ namespace RT64 {
+             ret.translation = b.translation;
+         }
+ 
++        // [wcw fix] Always slerp in a match: plain quaternion lerp leaves the unit sphere and adds
++        // shear to the recomposed matrix at large angular deltas.
++        useSlerp = useSlerp || wcwInterpActive.load(std::memory_order_relaxed);
+         if (lerpRotation) {
+             if (float(dot(a.rotation, b.rotation)) > 0.0f) {
+                 if (useSlerp) {
+diff --git a/src/common/rt64_math.h b/src/common/rt64_math.h
+index f555048..a9de81e 100644
+--- a/src/common/rt64_math.h
++++ b/src/common/rt64_math.h
+@@ -4,9 +4,43 @@
+ 
+ #pragma once
+ 
++#include <chrono>
+ #include "rt64_common.h"
+ 
++#include <atomic>
++
+ namespace RT64 {
++    // [wcw fix] Set once frame matching has started (target rate above the game's rate). The AKI-engine
++    // interpolation changes apply only while it is set, so the renderer behaves as stock RT64 until then.
++    extern std::atomic<bool> wcwInterpActive;
++    // [wcw hfr] Per-game interpolation profile, declared by the game through the frontend
++    // (recompui::programconfig::set_frame_interpolation). The WCW_HFR_* environment variables force a
++    // flag on for debugging.
++    struct WcwInterpolationProfile {
++        bool hooklessObjects = false;
++        bool primeGeneratedFrames = false;
++        bool skipClearOnlyTargets = true;
++        bool evenPacing = true;
++    };
++    void wcwSetInterpolationProfile(bool hooklessObjects, bool primeGeneratedFrames, bool skipClearOnlyTargets, bool evenPacing);
++    const WcwInterpolationProfile &wcwInterpolationProfile();
++    // [wcw hfr] Spike counters for WCW_HFR_LOG: forced matrices drawn in 3D with a camera loaded, how many
++    // of them had a camera-independent matrix (hook or hookless), and pairs matched on it across frames.
++    extern std::atomic<uint32_t> wcwHfrForced, wcwHfrPure, wcwHfrPurePairs, wcwHfrWorkloadsCompared, wcwHfrIdPairs, wcwHfrIds;
++    // [wcw fix] Number of layers in the last completed multi-layer frame (a "run").
++    extern std::atomic<uint32_t> wcwLastRunLength;
++    // [wcw fix] Per rotating target set (run serial % 3): the run whose real frame it holds, and that run
++    // once it has finished rendering.
++    extern std::atomic<uint64_t> wcwSlotRealSerial[3];
++    extern std::atomic<uint64_t> wcwSlotRealComplete[3];
++    // [wcw fix] Per game colour buffer (4 slots keyed by (address >> 10) & 3): the run whose blend it holds,
++    // and that run once it has finished rendering.
++    extern std::atomic<uint32_t> wcwAddrSlotAddr[4];
++    extern std::atomic<uint64_t> wcwAddrSlotSerial[4];
++    extern std::atomic<uint64_t> wcwAddrSlotComplete[4];
++    // [wcw fix] Bound for the frame-pacing waits between the render and present threads (two refreshes).
++    inline std::chrono::milliseconds wcwCoherentWaitBound() { return std::chrono::milliseconds(34); }
++
+     inline constexpr uint32_t swappedOffset(uint32_t i) {
+         return i ^ 3;
+     }
 diff --git a/src/contrib/crt/NOTICE.md b/src/contrib/crt/NOTICE.md
 new file mode 100644
 index 0000000..b70179d
@@ -12316,13 +12455,353 @@ index 785de27..b72a257 100644
          screenApiProfiler.logAndRestart();
          state->updateScreen(core.decodeVI(), false);
      }
+diff --git a/src/hle/rt64_framebuffer_pair.cpp b/src/hle/rt64_framebuffer_pair.cpp
+index c944393..cd21793 100644
+--- a/src/hle/rt64_framebuffer_pair.cpp
++++ b/src/hle/rt64_framebuffer_pair.cpp
+@@ -10,6 +10,7 @@ namespace RT64 {
+     // FramebufferPair
+ 
+     void FramebufferPair::reset() {
++        resetGeneration++;
+         fastPaths = {};
+         flushReason = FlushReason::None;
+         displayListAddress = 0;
+diff --git a/src/hle/rt64_framebuffer_pair.h b/src/hle/rt64_framebuffer_pair.h
+index 60b0fa4..74c008e 100644
+--- a/src/hle/rt64_framebuffer_pair.h
++++ b/src/hle/rt64_framebuffer_pair.h
+@@ -54,6 +54,10 @@ namespace RT64 {
+         FixedRect drawDepthRect;
+         FlushReason flushReason;
+ 
++        // [wcw fix] Counts resets (deliberately not cleared by reset()), so a stored reference can tell
++        // that this pair slot was reused.
++        uint64_t resetGeneration = 0;
++
+         void reset();
+         void addGameCall(const GameCall &gameCall);
+         bool inProjection(uint32_t transformsIndex, Projection::Type type) const;
+diff --git a/src/hle/rt64_game_frame.cpp b/src/hle/rt64_game_frame.cpp
+index 87392d0..de1b30f 100644
+--- a/src/hle/rt64_game_frame.cpp
++++ b/src/hle/rt64_game_frame.cpp
+@@ -9,6 +9,8 @@
+ 
+ #include "xxHash/xxh3.h"
+ 
++#include <cmath>
++
+ namespace RT64 {
+     // GameFrame
+     
+@@ -104,7 +106,7 @@ namespace RT64 {
+             for (uint32_t f = 0; f < workload.fbPairCount; f++) {
+                 const FramebufferPair &fbPair = workload.fbPairs[f];
+                 for (uint32_t p = 0; p < fbPair.projectionCount; p++) {
+-                    const GameIndices::Projection newProj = { w, f, p };
++                    const GameIndices::Projection newProj = { w, f, p, workload.submissionFrame, fbPair.resetGeneration };
+                     const auto &fbPairProj = fbPair.projections[p];
+                     switch (fbPairProj.type) {
+                     case Projection::Type::Perspective:
+@@ -288,6 +290,8 @@ namespace RT64 {
+             workloadMap.prevLookAtMapped.resize(prevWorkload.drawData.rspLookAt.size());
+ 
+             buildTransformIdMap(curWorkload, curWorkload.transformIdMap, curWorkload.transformIgnoredIds);
++            wcwHfrWorkloadsCompared.fetch_add(1, std::memory_order_relaxed);
++            wcwHfrIds.fetch_add(uint32_t(curWorkload.transformIdMap.size()), std::memory_order_relaxed);
+ 
+             // Retrieve the matching maps for the current and previous workload.
+             GameFrameMap::WorkloadMap &curWorkloadMap = frameMap.workloads[workloads[w]];
+@@ -309,7 +313,24 @@ namespace RT64 {
+                     prevIt++;
+                 }
+                 else {
+-                    matchTransform(curWorkload, prevWorkload, curWorkloadMap, prevWorkloadMap, curIt->second, prevIt->second, modifiedBuffers);
++                    // [wcw fix] The previous workload's id map and draw data live in the recycled workload
++                    // ring, so check every index before using it. A pair whose previous map is sized for
++                    // different content is stale and is skipped, as is one whose matrices are not finite.
++                    const uint32_t curIndex = curIt->second;
++                    const uint32_t prevIndex = prevIt->second;
++                    const bool curInRange = (curIndex < curWorkloadMap.transforms.size()) && (curIndex < curWorkload.drawData.worldTransforms.size());
++                    const bool prevInRange = (prevIndex < prevWorkload.drawData.worldTransforms.size()) &&
++                        ((prevWorkloadMap == nullptr) || (prevIndex < prevWorkloadMap->transforms.size()));
++                    if (curInRange && prevInRange) {
++                        const bool bothPure = (curWorkload.drawData.worldTransformsPureValid[curIndex] != 0) &&
++                            (prevWorkload.drawData.worldTransformsPureValid[prevIndex] != 0);
++                        const hlslpp::float4x4 &curMtx = bothPure ? curWorkload.drawData.worldTransformsPure[curIndex] : curWorkload.drawData.worldTransforms[curIndex];
++                        const hlslpp::float4x4 &prevMtx = bothPure ? prevWorkload.drawData.worldTransformsPure[prevIndex] : prevWorkload.drawData.worldTransforms[prevIndex];
++                        if (std::isfinite(float(hlslpp::length(curMtx[3].xyz - prevMtx[3].xyz)))) {
++                            matchTransform(curWorkload, prevWorkload, curWorkloadMap, prevWorkloadMap, curIndex, prevIndex, modifiedBuffers);
++                        }
++                    }
++
+                     curIt++;
+                     prevIt++;
+                 }
+@@ -373,7 +394,13 @@ namespace RT64 {
+         };
+ 
+         matchScenes(perspectiveScenes, prevFrame.perspectiveScenes);
+-        matchScenes(orthographicScenes, prevFrame.orthographicScenes);
++
++        // [wcw fix] AKI games force-load combined MVPs and never set a projection matrix, so all of this
++        // game's content (wrestlers, ring, ropes) is classified orthographic. Match it during a match;
++        // elsewhere orthographic scenes are left unmatched.
++        if (wcwInterpActive.load(std::memory_order_relaxed)) {
++            matchScenes(orthographicScenes, prevFrame.orthographicScenes);
++        }
+ 
+         if (!workloadsModified.empty()) {
+             thread_local std::vector<BufferUploader::Upload> uploads;
+@@ -398,11 +425,36 @@ namespace RT64 {
+         }
+     }
+ 
++    // [wcw fix] A projection is stale when its workload slot was recycled (submissionFrame) or its
++    // framebuffer pair was reset (resetGeneration) after GameFrame::set captured it.
++    static bool isProjectionStale(const WorkloadQueue &workloadQueue, const GameIndices::Projection &proj) {
++        const Workload &w = workloadQueue.workloads[proj.workloadIndex];
++        if (w.submissionFrame != proj.submissionFrame) {
++            return true;
++        }
++
++        return w.fbPairs[proj.fbPairIndex].resetGeneration != proj.fbPairResetGeneration;
++    }
++
++    static bool sceneHasStaleProjection(const WorkloadQueue &workloadQueue, const GameScene &scene) {
++        for (const GameIndices::Projection &proj : scene.projections) {
++            if (isProjectionStale(workloadQueue, proj)) {
++                return true;
++            }
++        }
++
++        return false;
++    }
++
+     void GameFrame::matchScene(WorkloadQueue &workloadQueue, const GameFrame &prevFrame, const GameScene &curScene, const GameScene &prevScene, std::unordered_map<uint32_t, ModifiedBuffers> &workloadsModified, bool &tileInterpolationUsed, bool &lookAtInterpolationUsed) {
+         if (curScene.projections.empty() || prevScene.projections.empty()) {
+             return;
+         }
+ 
++        if (sceneHasStaleProjection(workloadQueue, curScene) || sceneHasStaleProjection(workloadQueue, prevScene)) {
++            return;
++        }
++
+         thread_local std::multimap<uint64_t, GameCallMap> curCallHashMap;
+         thread_local std::multimap<uint64_t, GameCallMap> prevCallHashMap;
+         curCallHashMap.clear();
+@@ -460,8 +512,9 @@ namespace RT64 {
+                 const TransformGroup &curProjGroup = curWorkload.drawData.transformGroups[curProjGroupIndex];
+                 const TransformGroup &prevProjGroup = prevWorkload.drawData.transformGroups[prevProjGroupIndex];
+ 
+-                // Cameras usually look better with simple interpolation, so default decomposition to off.
+-                bool projectionDecompose = false;
++                // [wcw fix] Decompose the camera: AKI games' untagged camera always takes this default, and
++                // a componentwise lerp of a rotating camera is not a rotation.
++                bool projectionDecompose = true;
+                 uint8_t projectionLinearComponent = G_EX_COMPONENT_INTERPOLATE;
+                 uint8_t projectionAngularComponent = G_EX_COMPONENT_INTERPOLATE;
+                 uint8_t projectionScaleComponent = G_EX_COMPONENT_INTERPOLATE;
+@@ -711,20 +764,68 @@ namespace RT64 {
+ 
+     void GameFrame::matchTransform(Workload &curWorkload, const Workload &prevWorkload, GameFrameMap::WorkloadMap &curWorkloadMap, const GameFrameMap::WorkloadMap *prevWorkloadMap, uint32_t curTransformIndex, uint32_t prevTransformIndex, ModifiedBuffers &modifiedBuffers) {
+         GameFrameMap::TransformMap &curTransformMap = curWorkloadMap.transforms[curTransformIndex];
++        wcwHfrIdPairs.fetch_add(1, std::memory_order_relaxed);
+         if (prevWorkloadMap != nullptr) {
+             curTransformMap.rigidBody = prevWorkloadMap->transforms[prevTransformIndex].rigidBody;
+         }
+ 
+-        const hlslpp::float4x4 &curTransform = curWorkload.drawData.worldTransforms[curTransformIndex];
+-        const hlslpp::float4x4 &prevTransform = prevWorkload.drawData.worldTransforms[prevTransformIndex];
++        // [wcw fix] Only interpolate when both frames have the camera-independent matrix: decomposing a
++        // combined model*camera matrix is not meaningful. Otherwise leave the transform unmatched.
++        const bool useCurPure = curWorkload.drawData.worldTransformsPureValid[curTransformIndex] != 0;
++        const bool usePrevPure = prevWorkload.drawData.worldTransformsPureValid[prevTransformIndex] != 0;
++        if (!useCurPure || !usePrevPure) {
++            return;
++        }
++
++        wcwHfrPurePairs.fetch_add(1, std::memory_order_relaxed);
++        const hlslpp::float4x4 &curTransform = curWorkload.drawData.worldTransformsPure[curTransformIndex];
++        const hlslpp::float4x4 &prevTransform = prevWorkload.drawData.worldTransformsPure[prevTransformIndex];
+         const uint32_t curGroupIndex = curWorkload.drawData.worldTransformGroups[curTransformIndex];
+         const TransformGroup &curGroup = curWorkload.drawData.transformGroups[curGroupIndex];
+         curTransformMap.rigidBody.updateLinear(prevTransform, curTransform, curGroup.positionInterpolation);
+-        curTransformMap.rigidBody.updateAngular(prevTransform, curTransform, curGroup.rotationInterpolation, curGroup.scaleInterpolation, curGroup.skewInterpolation);
++        // [wcw fix] Skew is the least stable part of the decomposition (billboarded crowd); don't interpolate it.
++        curTransformMap.rigidBody.updateAngular(prevTransform, curTransform, curGroup.rotationInterpolation, curGroup.scaleInterpolation, G_EX_COMPONENT_SKIP);
+         curTransformMap.rigidBody.updatePerspective(prevTransform, curTransform, curGroup.perspectiveInterpolation);
++
++        // [wcw fix] Flag pairs whose drawn (combined) matrix changed by less than 30% to be blended
++        // componentwise from the drawn matrices instead (TransformProcessor). The camera-independent pair
++        // can swing through a large phantom rotation between frames while the drawn matrix barely moves.
++        // In a match this applies to every pair; elsewhere only to pairs that rotate more than 30 degrees
++        // or change scale by more than 25%.
++        {
++            bool candidate = wcwInterpActive.load(std::memory_order_relaxed);
++            if (!candidate) {
++                const DecomposedTransform a(prevTransform);
++                const DecomposedTransform b(curTransform);
++                candidate = !a.valid || !b.valid;
++                if (!candidate) {
++                    const float d = std::min(1.0f, std::abs(float(hlslpp::dot(a.rotation, b.rotation))));
++                    const float angleDeg = 2.0f * std::acos(d) * 57.2958f;
++                    const float ratio = std::max(float(hlslpp::length(hlslpp::abs(a.scale))), 1e-6f) / std::max(float(hlslpp::length(hlslpp::abs(b.scale))), 1e-6f);
++                    candidate = (angleDeg > 30.0f) || (ratio > 1.25f) || (ratio < 0.8f);
++                }
++            }
++
++            curTransformMap.wcwCombinedLerp = false;
++            if (candidate) {
++                float cc[16], cp[16];
++                hlslpp::store(hlslpp::float4x4(curWorkload.drawData.worldTransforms[curTransformIndex]), cc);
++                hlslpp::store(hlslpp::float4x4(prevWorkload.drawData.worldTransforms[prevTransformIndex]), cp);
++                double num = 0.0, den = 0.0;
++                bool finite = true;
++                for (int k = 0; k < 16; k++) {
++                    finite = finite && std::isfinite(cc[k]) && std::isfinite(cp[k]);
++                    num += double(cc[k] - cp[k]) * double(cc[k] - cp[k]);
++                    den += double(cc[k]) * double(cc[k]);
++                }
++
++                curTransformMap.wcwCombinedLerp = finite && (den > 0.0) && (std::sqrt(num / den) < 0.3);
++            }
++        }
+         curTransformMap.rigidBody.updateDecomposition(curTransform, curGroup.decompose);
+         curTransformMap.prevTransformIndex = prevTransformIndex;
+         curTransformMap.mapped = true;
++        curTransformMap.usedPureMatrix = true;
+         curWorkloadMap.prevTransformsMapped[prevTransformIndex] = true;
+ 
+         uint64_t curVertexHash = 0;
+@@ -733,7 +834,12 @@ namespace RT64 {
+         uint32_t curVertexCount = curWorkload.drawData.worldTransformVertexCount(curTransformIndex);
+         uint32_t prevVertexIndex = prevWorkload.drawData.worldTransformVertexIndices[prevTransformIndex];
+         uint32_t prevVertexCount = prevWorkload.drawData.worldTransformVertexCount(prevTransformIndex);
+-        if (((curGroup.vertexInterpolation != G_EX_COMPONENT_SKIP) || (curGroup.texcoordInterpolation == G_EX_COMPONENT_AUTO)) && (curVertexCount == prevVertexCount)) {
++        // [wcw fix] Bounds-check the vertex ranges before reading them (recycled workload data).
++        const bool vertexRangesInBounds =
++            ((size_t(curVertexIndex) + curVertexCount) * 3 <= curWorkload.drawData.posFloats.size()) &&
++            ((size_t(prevVertexIndex) + prevVertexCount) * 3 <= prevWorkload.drawData.posFloats.size()) &&
++            ((size_t(curVertexIndex) + curVertexCount) * 3 <= curWorkload.drawData.velFloats.size());
++        if (((curGroup.vertexInterpolation != G_EX_COMPONENT_SKIP) || (curGroup.texcoordInterpolation == G_EX_COMPONENT_AUTO)) && (curVertexCount == prevVertexCount) && vertexRangesInBounds) {
+             const std::vector<float> &curPosFloats = curWorkload.drawData.posFloats;
+             const std::vector<float> &prevPosFloats = prevWorkload.drawData.posFloats;
+             std::vector<float> &curVelFloats = curWorkload.drawData.velFloats;
+@@ -754,7 +860,11 @@ namespace RT64 {
+             }
+         }
+ 
+-        if ((curGroup.texcoordInterpolation != G_EX_COMPONENT_SKIP) && (curVertexCount == prevVertexCount)) {
++        const bool texcoordRangesInBounds =
++            ((size_t(curVertexIndex) + curVertexCount) * 2 <= curWorkload.drawData.tcFloats.size()) &&
++            ((size_t(prevVertexIndex) + prevVertexCount) * 2 <= prevWorkload.drawData.tcFloats.size()) &&
++            ((size_t(curVertexIndex) + curVertexCount) * 2 <= curWorkload.drawData.tcVelFloats.size());
++        if ((curGroup.texcoordInterpolation != G_EX_COMPONENT_SKIP) && (curVertexCount == prevVertexCount) && texcoordRangesInBounds) {
+             const std::vector<float> &curTcFloats = curWorkload.drawData.tcFloats;
+             const std::vector<float> &prevTcFloats = prevWorkload.drawData.tcFloats;
+             std::vector<float> &curVelFloats = curWorkload.drawData.tcVelFloats;
+@@ -794,7 +904,10 @@ namespace RT64 {
+             for (uint32_t m = call.callDesc.minWorldMatrix; m <= call.callDesc.maxWorldMatrix; m++) {
+                 const uint32_t groupIndex = workload.drawData.worldTransformGroups[m];
+                 const TransformGroup &group = workload.drawData.transformGroups[groupIndex];
+-                matrixIdHash = matrixIdHash * 33 ^ group.matrixId;
++                // [wcw fix] Untagged matrices (AKI games never tag them) all share G_EX_ID_AUTO; use the
++                // matrix's source address as a stable per-object identity instead.
++                const uint32_t idForHash = (group.matrixId != G_EX_ID_AUTO) ? group.matrixId : workload.drawData.worldTransformPhysicalAddresses[m];
++                matrixIdHash = matrixIdHash * 33 ^ idForHash;
+ 
+                 const bool usesIdWithAutoOrdering = (group.matrixId != G_EX_ID_AUTO) && (group.matrixId != G_EX_ID_IGNORE) && (group.ordering == G_EX_ORDER_AUTO);
+                 doTransformMatching = doTransformMatching || (group.matrixId == G_EX_ID_AUTO) || usesIdWithAutoOrdering;
+@@ -802,6 +915,14 @@ namespace RT64 {
+                 doTileMatching = doTileMatching || (group.tileInterpolation == G_EX_COMPONENT_AUTO);
+             }
+ 
++            // [wcw fix] Fold in the bound textures' content hashes, so 2D draws (no world matrix) with the
++            // same render state are told apart by what they draw.
++            for (uint32_t t = 0; t < call.callDesc.tileCount; t++) {
++                const DrawCallTile &callTile = workload.drawData.callTiles[call.callDesc.tileIndex + t];
++                const uint64_t tileHash = callTile.tmemHashOrID;
++                matrixIdHash = matrixIdHash * 33 ^ (uint32_t)(tileHash ^ (tileHash >> 32));
++            }
++
+             hashMap.emplace(hashFromCall(call, matrixIdHash), GameCallMap{ sceneProjIndex, c, doTransformMatching, doTileInterpolation, doTileMatching });
+         }
+     }
+@@ -809,12 +930,27 @@ namespace RT64 {
+     void GameFrame::buildTransformIdMap(const Workload &workload, std::multimap<uint32_t, uint32_t> &idMap, std::vector<uint32_t> &ignoredIdVector) const {
+         idMap.clear();
+         ignoredIdVector.clear();
++        // [wcw fix] Ordinal of each untagged transform within its object, see below.
++        thread_local std::unordered_map<uint32_t, uint32_t> autoIdOrdinals;
++        autoIdOrdinals.clear();
++        const bool autoIdFromAddr = wcwInterpActive.load(std::memory_order_relaxed);
+ 
+         uint32_t transformCount = uint32_t(workload.drawData.worldTransformGroups.size());
+         for (uint32_t i = 0; i < transformCount; i++) {
+             const uint32_t groupIndex = workload.drawData.worldTransformGroups[i];
+             const TransformGroup &group = workload.drawData.transformGroups[groupIndex];
+             if (group.matrixId == G_EX_ID_AUTO) {
++                // [wcw fix] AKI games never tag their matrices. In a match, give each untagged transform the
++                // key "Nth transform of the object at this address", which is stable from frame to frame;
++                // transforms with no known object address stay unkeyed.
++                if (autoIdFromAddr && (i < workload.drawData.worldTransformPhysicalAddresses.size())) {
++                    const uint32_t addr = workload.drawData.worldTransformPhysicalAddresses[i];
++                    if (addr != 0) {
++                        const uint32_t ordinal = autoIdOrdinals[addr]++;
++                        idMap.emplace(addr ^ (ordinal * 0x9E3779B9u), i);
++                    }
++                }
++
+                 continue;
+             }
+             else if (group.matrixId == G_EX_ID_IGNORE) {
+@@ -838,6 +974,8 @@ namespace RT64 {
+         CallMatchKey key;
+         key.colorCombiner = call.callDesc.colorCombiner;
+         key.otherMode = call.callDesc.otherMode;
++        // [wcw fix] The dither bits (ALPHADITHER/RGBDITHER) cycle between frames on identical draws.
++        key.otherMode.H &= ~0xF0u;
+         key.geometryMode = call.callDesc.geometryMode;
+         key.triangleCount = call.callDesc.triangleCount;
+         key.matrixIdHash = matrixIdHash;
+diff --git a/src/hle/rt64_game_frame.h b/src/hle/rt64_game_frame.h
+index 00a72f6..314022f 100644
+--- a/src/hle/rt64_game_frame.h
++++ b/src/hle/rt64_game_frame.h
+@@ -24,6 +24,10 @@ namespace RT64 {
+             uint32_t workloadIndex;
+             uint32_t fbPairIndex;
+             uint32_t projectionIndex;
++            // [wcw fix] The workload's submissionFrame and the framebuffer pair's resetGeneration at capture
++            // time: if either has changed when the projection is read, its ring slot was reused.
++            uint64_t submissionFrame = 0;
++            uint64_t fbPairResetGeneration = 0;
+         };
+ 
+         struct Call {
+@@ -53,6 +57,10 @@ namespace RT64 {
+             RigidBody rigidBody;
+             uint32_t prevTransformIndex = 0;
+             bool mapped = false;
++            // [wcw fix] Interpolated from the camera-independent matrices (camera re-applied afterwards).
++            bool usedPureMatrix = false;
++            // [wcw fix] Blend the drawn matrices componentwise instead (see GameFrame::matchTransform).
++            bool wcwCombinedLerp = false;
+         };
+ 
+         struct TileMap {
 diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
-index 3227ab1..30180ab 100644
+index 3227ab1..53ce2a6 100644
 --- a/src/hle/rt64_present_queue.cpp
 +++ b/src/hle/rt64_present_queue.cpp
-@@ -5,11 +5,18 @@
+@@ -4,12 +4,21 @@
+ 
  #include "rt64_present_queue.h"
  
++#include <thread>
++
  #include "common/rt64_thread.h"
 +#include "render/rt64_hdr_output.h"
  #include "rhi/rt64_render_hooks.h"
@@ -12339,7 +12818,7 @@ index 3227ab1..30180ab 100644
      // PresentQueue
  
      PresentQueue::PresentQueue() {
-@@ -88,6 +95,17 @@ namespace RT64 {
+@@ -88,10 +97,24 @@ namespace RT64 {
  
          viRenderer = std::make_unique<VIRenderer>();
  
@@ -12357,16 +12836,29 @@ index 3227ab1..30180ab 100644
          presentThreadRunning = true;
          presentThread = new std::thread(&PresentQueue::threadLoop, this);
      }
-@@ -116,6 +134,8 @@ namespace RT64 {
+ 
++    // [wcw hfr] Spike diagnostics: present waits that timed out since the last WCW_HFR_LOG line.
++    static uint32_t wcwHfrTimeouts = 0;
++
+     void PresentQueue::threadPresent(const Present &present, bool &swapChainValid) {
+         FramebufferManager &fbManager = ext.sharedResources->framebufferManager;
+         RenderTargetManager &targetManager = ext.sharedResources->renderTargetManager;
+@@ -116,8 +139,13 @@ namespace RT64 {
  
          RenderTarget *colorTarget = nullptr;
          int32_t framesToPresent = 1;
 +        int wcw_reason = 0; // [wcw] DIAGNOSTIC present outcome: 0=vi-not-visible 1=ok 2=target-empty 3=scratch
 +        uint32_t wcw_addr = 0; // [wcw] DIAGNOSTIC: address of the fb actually presented
++        uint64_t wcwPairBlendSerial = 0; // [wcw fix] run serial of the blend shown at i=0
++        bool wcwHfrRealRepeat = false; // [wcw hfr] trace: i=0 repeated the newest complete real frame
          bool lockedWorkloadMutex = false;
-         InterpolatedFrameCounters &frameCounters = ext.sharedResources->interpolatedFrames[ext.sharedResources->interpolatedFramesIndex];
+-        InterpolatedFrameCounters &frameCounters = ext.sharedResources->interpolatedFrames[ext.sharedResources->interpolatedFramesIndex];
++        const uint32_t wcwPresentSetIndex = ext.sharedResources->interpolatedFramesIndex;
++        InterpolatedFrameCounters &frameCounters = ext.sharedResources->interpolatedFrames[wcwPresentSetIndex];
  
-@@ -127,6 +147,16 @@ namespace RT64 {
+         // TODO: There's a possible race condition interactions that can happen while the workload
+         // queue is rendering extra frames and the present event is processed while it's generating
+@@ -127,6 +155,16 @@ namespace RT64 {
          
          // Perform any external write operations indicated by the event.
          if (!present.fbOperations.empty()) {
@@ -12383,7 +12875,28 @@ index 3227ab1..30180ab 100644
              const std::scoped_lock lock(screenFbChangePoolMutex);
              {
                  RenderWorkerExecution workerExecution(ext.presentGraphicsWorker);
-@@ -194,9 +224,27 @@ namespace RT64 {
+@@ -177,6 +215,20 @@ namespace RT64 {
+                         }
+                     }
+ 
++                    // [wcw fix] AKI games double-buffer in a match, so the buffer just drawn is never the
++                    // one being presented and the check below never passes. Allow interpolation for a
++                    // buffer that VI history shows was presented, without changing what is presented.
++                    if (!colorFb->interpolationEnabled && !present.debuggerFramebuffer.view) {
++                        for (size_t h = 0; h < viHistory.history.size(); h++) {
++                            const VIHistory::Present &entry = viHistory.history[h];
++                            if ((colorFb->addressStart == entry.vi.fbAddress()) && (colorFb->width == entry.fbWidth) &&
++                                (colorFb->siz == entry.vi.fbSiz()) && entry.vi.compatibleWith(present.screenVI)) {
++                                colorFb->interpolationEnabled = true;
++                                break;
++                            }
++                        }
++                    }
++
+                     // Present early (or games that behave like it) will make it so that the presented image is a color image
+                     // that the workload modified. We run a basic check to see if that holds true to indicate it was presented
+                     // so interpolation is possible.
+@@ -194,11 +246,66 @@ namespace RT64 {
                      ext.sharedResources->workloadMutex.lock();
                  }
  
@@ -12400,8 +12913,45 @@ index 3227ab1..30180ab 100644
 +                    ext.sharedResources->workloadMutex.lock();
 +                }
 +
++                // [wcw fix] Note which run's blend this buffer holds, so the real frame presented next
++                // can be taken from the same run.
++                {
++                    const uint32_t pairSl = (presentFb->addressStart >> 10) & 3;
++                    wcwPairBlendSerial = (RT64::wcwAddrSlotAddr[pairSl].load(std::memory_order_relaxed) == presentFb->addressStart) ? RT64::wcwAddrSlotSerial[pairSl].load(std::memory_order_relaxed) : 0;
++                }
++
                  RenderTargetKey colorTargetKey(presentFb->addressStart, presentFb->width, presentFb->siz, Framebuffer::Type::Color);
                  colorTarget = &targetManager.get(colorTargetKey, true);
++
++                // [wcw fix] In multi-layer match frames, never show a game framebuffer whose run has not
++                // finished rendering as the blend: repeat the newest complete real frame instead.
++                // (Single-layer screens are excluded: their completion stamp lags while they are fine.)
++                bool wcwUsingRealFrame = false;
++                if ((framesToPresent > 1) && !usingMSAA && RT64::wcwInterpActive.load(std::memory_order_relaxed) && (wcwPairBlendSerial > 0) &&
++                    (RT64::wcwLastRunLength.load(std::memory_order_relaxed) >= 4)) {
++                    const uint32_t sl = (presentFb->addressStart >> 10) & 3;
++                    const bool complete = (RT64::wcwAddrSlotComplete[sl].load(std::memory_order_relaxed) == wcwPairBlendSerial);
++                    if (!complete) {
++                        uint64_t bestReal = 0;
++                        int bestRealK = -1;
++                        for (int k = 0; k < 3; k++) {
++                            const uint64_t rs = RT64::wcwSlotRealSerial[k].load(std::memory_order_relaxed);
++                            if ((rs > bestReal) && (RT64::wcwSlotRealComplete[k].load(std::memory_order_relaxed) == rs)) {
++                                bestReal = rs;
++                                bestRealK = k;
++                            }
++                        }
++
++                        auto &realTargets = (bestRealK == 0) ? ext.sharedResources->interpolatedColorTargets
++                            : ((bestRealK == 1) ? ext.sharedResources->wcwInterpolatedColorTargetsB : ext.sharedResources->wcwInterpolatedColorTargetsC);
++                        if ((bestRealK >= 0) && !realTargets.empty() && (realTargets[0] != nullptr)) {
++                            colorTarget = realTargets[0].get();
++                            wcwUsingRealFrame = true;
++                            wcwHfrRealRepeat = true;
++                        }
++                    }
++                }
++
 +                // [wcw] DIAGNOSTIC: report whether the present found a non-empty rendered target.
 +                { static int pn = 0; static const bool wcwTrace = getenv("WCW_TRACE") != nullptr; if (wcwTrace && (pn++ % 61) == 0) fprintf(stderr, "[wcw][blit#%d] addr=0x%X w=%d siz=%d empty=%d interp=%d\n",
 +                    pn, presentFb->addressStart, (int)presentFb->width, (int)presentFb->siz, (int)colorTarget->isEmpty(), (int)presentFb->interpolationEnabled); }
@@ -12409,9 +12959,12 @@ index 3227ab1..30180ab 100644
 +                    wcw_reason = 1;
 +                    wcw_addr = presentFb->addressStart;
                      // If a depth framebuffer is about to be shown, convert it to color.
-                     if (presentFb->isLastWriteDifferent(Framebuffer::Type::Color)) {
+-                    if (presentFb->isLastWriteDifferent(Framebuffer::Type::Color)) {
++                    if (!wcwUsingRealFrame && presentFb->isLastWriteDifferent(Framebuffer::Type::Color)) {
                          RenderTargetKey otherColorTargetKey(presentFb->addressStart, presentFb->width, presentFb->siz, presentFb->lastWriteType);
-@@ -210,6 +258,7 @@ namespace RT64 {
+                         RenderTarget &otherColorTarget = targetManager.get(otherColorTargetKey, true);
+                         if (!otherColorTarget.isEmpty()) {
+@@ -210,6 +317,7 @@ namespace RT64 {
                  }
                  else {
                      colorTarget = nullptr;
@@ -12419,7 +12972,7 @@ index 3227ab1..30180ab 100644
                  }
  
                  if (!present.paused && (viHistory.top().vi != present.screenVI)) {
-@@ -219,6 +268,13 @@ namespace RT64 {
+@@ -219,6 +327,13 @@ namespace RT64 {
              else {
                  uint32_t fbAddress = present.screenVI.fbAddress();
  
@@ -12433,7 +12986,7 @@ index 3227ab1..30180ab 100644
                  // Use a scratch framebuffer to upload the RAM to the render target.
                  hlslpp::uint2 fbSize = present.screenVI.fbSize();
                  scratchFb.addressStart = fbAddress;
-@@ -266,6 +322,12 @@ namespace RT64 {
+@@ -266,18 +381,29 @@ namespace RT64 {
              }
          }
          
@@ -12445,11 +12998,148 @@ index 3227ab1..30180ab 100644
 +
          for (int32_t i = 0; i < framesToPresent; i++) {
              uint32_t frameCountersNextPresented = 0;
++            int64_t wcwHfrFallbackAge = -1;
              if ((framesToPresent > 1) && (usingMSAA || (i > 0))) {
-@@ -299,8 +361,11 @@ namespace RT64 {
+                 // Stall until the interpolated color target is available.
+                 const uint32_t targetIndex = usingMSAA ? i : (i - 1);
+                 std::unique_lock<std::mutex> interpolatedLock(ext.sharedResources->interpolatedMutex);
+-                ext.sharedResources->interpolatedCondition.wait(interpolatedLock, [&]() {
++                // [wcw fix] Bounded wait: in a multi-layer frame only the last layer makes the target
++                // available, and an unbounded wait here can stall VI and with it the game logic that
++                // would complete the frame. On timeout this frame is dropped like a skipped one.
++                const bool wcwInterpTimedOut = !ext.sharedResources->interpolatedCondition.wait_for(interpolatedLock, RT64::wcwCoherentWaitBound(), [&]() {
+                     return (frameCounters.available > targetIndex) || ((frameCounters.available == targetIndex) && frameCounters.skipped);
+                 });
++                wcwHfrTimeouts += wcwInterpTimedOut ? 1 : 0;
+ 
+                 // Do not present any more frames after this one after reaching the last available frame if the workload was skipped.
+-                if ((frameCounters.available == targetIndex) && frameCounters.skipped) {
++                if (wcwInterpTimedOut || ((frameCounters.available == targetIndex) && frameCounters.skipped)) {
+                     framesToPresent = std::min(int(frameCounters.available), i + 1);
+                     frameCountersNextPresented = frameCounters.count;
+                 }
+@@ -287,7 +413,33 @@ namespace RT64 {
+ 
+                 if (i < framesToPresent) {
+                     uint32_t targetIndex = usingMSAA ? i : (i - 1);
+-                    colorTarget = ext.sharedResources->interpolatedColorTargets[targetIndex].get();
++                    // [wcw fix] Counter set 1 uses the second set of interpolated targets.
++                    auto &wcwTargets = ((wcwPresentSetIndex & 1) != 0) ? ext.sharedResources->wcwInterpolatedColorTargetsB : ext.sharedResources->interpolatedColorTargets;
++                    colorTarget = (targetIndex < wcwTargets.size()) ? wcwTargets[targetIndex].get() : nullptr;
++                    // [wcw hfr] Spike diagnostics: fallback set, and how many runs old its content is.
++                    wcwHfrFallbackAge = (wcwPairBlendSerial > 0) ? int64_t(wcwPairBlendSerial) - int64_t(RT64::wcwSlotRealSerial[wcwPresentSetIndex & 1].load(std::memory_order_relaxed)) : -1;
++                    // [wcw fix] Show the real frame of the same run as the blend just shown, from its
++                    // rotating slot (serial % 3), once that run has finished.
++                    if (wcwPairBlendSerial > 0) {
++                        const uint32_t k = uint32_t(wcwPairBlendSerial % 3);
++                        colorTarget = nullptr;
++                        if ((RT64::wcwSlotRealSerial[k].load(std::memory_order_relaxed) == wcwPairBlendSerial) &&
++                            (RT64::wcwSlotRealComplete[k].load(std::memory_order_relaxed) == wcwPairBlendSerial)) {
++                            auto &slotTargets = (k == 0) ? ext.sharedResources->interpolatedColorTargets
++                                : ((k == 1) ? ext.sharedResources->wcwInterpolatedColorTargetsB : ext.sharedResources->wcwInterpolatedColorTargetsC);
++                            if (targetIndex < slotTargets.size()) {
++                                colorTarget = slotTargets[targetIndex].get();
++                                wcwHfrFallbackAge = -2;
++                            }
++                        }
++
++                        // [wcw fix] The run's generated frames aren't (all) there: present nothing more for this game
++                        // frame rather than an older run's frame. (Gadge64, No Mercy 0.2.0.)
++                        if (colorTarget == nullptr) {
++                            framesToPresent = i;
++                            frameCountersNextPresented = frameCounters.count;
++                        }
++                    }
+                 }
+                 else {
+                     colorTarget = nullptr;
+@@ -299,8 +451,94 @@ namespace RT64 {
  
              uint32_t swapChainIndex = 0;
              const bool presentFrame = (i < framesToPresent) && swapChainValid;
++
++            // [wcw hfr] WCW_HFR_LOG=1: presents per second, and how many were generated in-between frames.
++            static const bool wcwHfrLog = getenv("WCW_HFR_LOG") != nullptr;
++            if (wcwHfrLog && presentFrame) {
++                static auto wcwHfrStart = std::chrono::steady_clock::now();
++                static uint32_t wcwHfrPresents = 0, wcwHfrInterpolated = 0, wcwHfrMaxBurst = 0;
++                static uint32_t wcwHfrFresh = 0, wcwHfrFallback = 0, wcwHfrStale = 0;
++                static int64_t wcwHfrMaxAge = 0;
++                wcwHfrPresents++;
++                wcwHfrInterpolated += (i > 0) ? 1 : 0;
++                if (i > 0) {
++                    if (wcwHfrFallbackAge == -2) {
++                        wcwHfrFresh++;
++                    }
++                    else {
++                        wcwHfrFallback++;
++                        wcwHfrStale += (wcwHfrFallbackAge > 0) ? 1 : 0;
++                        wcwHfrMaxAge = std::max(wcwHfrMaxAge, wcwHfrFallbackAge);
++                    }
++                }
++                wcwHfrMaxBurst = std::max(wcwHfrMaxBurst, uint32_t(framesToPresent));
++                const double wcwHfrSecs = std::chrono::duration<double>(std::chrono::steady_clock::now() - wcwHfrStart).count();
++                if (wcwHfrSecs >= 1.0) {
++                    fprintf(stderr, "[wcw hfr] %.1f presents/s, %.1f interpolated/s, max %u per game frame | in-between: fresh %u fallback %u (older run %u, max age %lld) | wait timeouts %u | 3D matrices %u, camera-independent %u, paired %u | passes compared %u, ids %u, id matches %u\n",
++                        wcwHfrPresents / wcwHfrSecs, wcwHfrInterpolated / wcwHfrSecs, wcwHfrMaxBurst, wcwHfrFresh, wcwHfrFallback, wcwHfrStale,
++                        (long long)wcwHfrMaxAge, wcwHfrTimeouts, wcwHfrForced.exchange(0), wcwHfrPure.exchange(0), wcwHfrPurePairs.exchange(0),
++                        wcwHfrWorkloadsCompared.exchange(0), wcwHfrIds.exchange(0), wcwHfrIdPairs.exchange(0));
++                    wcwHfrStart = std::chrono::steady_clock::now();
++                    wcwHfrPresents = wcwHfrInterpolated = wcwHfrMaxBurst = 0;
++                    wcwHfrFresh = wcwHfrFallback = wcwHfrStale = wcwHfrTimeouts = 0;
++                    wcwHfrMaxAge = 0;
++                }
++            }
++
++            // [wcw hfr] WCW_HFR_TRACE=<first present>,<count>: one line per presented frame. The present
++            // number matches wcw_present_lum.csv (counted after the present, hence + 1).
++            static int wcwHfrTraceFirst = -1, wcwHfrTraceCount = 0;
++            static bool wcwHfrTraceInit = false;
++            if (!wcwHfrTraceInit) {
++                wcwHfrTraceInit = true;
++                if (const char *e = getenv("WCW_HFR_TRACE")) {
++                    sscanf(e, "%d,%d", &wcwHfrTraceFirst, &wcwHfrTraceCount);
++                }
++            }
++
++            if (presentFrame && (wcwHfrTraceFirst >= 0)) {
++                const int n = int(wcwRtPresentCounter) + 1;
++                if ((n >= wcwHfrTraceFirst) && (n < wcwHfrTraceFirst + wcwHfrTraceCount)) {
++                    fprintf(stderr, "[wcw hfr trace] n=%d i=%d/%d set=%u avail=%u count=%u presented=%u skipped=%d serial=%llu src=%s realRepeat=%d target=%p empty=%d\n",
++                        n, int(i), int(framesToPresent), wcwPresentSetIndex, frameCounters.available, frameCounters.count, frameCounters.presented,
++                        int(frameCounters.skipped), (unsigned long long)wcwPairBlendSerial,
++                        (i == 0) ? "real" : ((wcwHfrFallbackAge == -2) ? "slot" : "fallback"), int(wcwHfrRealRepeat),
++                        (void *)colorTarget, (colorTarget != nullptr) ? int(colorTarget->isEmpty()) : -1);
++                }
++            }
++
++            // [wcw hfr] WCW_HFR_PACE=1: spread a game frame's presents evenly over its duration (present i at
++            // start + i * gameFrame / framesToPresent). Presenting on the next refresh bunches them on fast
++            // displays (2 frames ~7 ms apart at 144 Hz, then a long gap), which looks like judder.
++            static const bool wcwHfrPaceEnv = getenv("WCW_HFR_PACE") != nullptr;
++            // [wcw crt] The beam simulator always paces evenly: the wait happens before the swap chain image is
++            // acquired, so it can be filled with beam sub-frames (one per display refresh).
++            const bool wcwHfrPace = wcwInterpolationProfile().evenPacing || wcwHfrPaceEnv || crtFilter->beamActive();
++            static std::chrono::steady_clock::time_point wcwHfrFrameStart;
++            if (wcwHfrPace && presentFrame && (framesToPresent > 1) && (viOriginalRate > 0)) {
++                if (i == 0) {
++                    wcwHfrFrameStart = std::chrono::steady_clock::now();
++                }
++                else {
++                    const auto gameFrame = std::chrono::microseconds(1000000 / viOriginalRate);
++                    const auto target = wcwHfrFrameStart + (gameFrame * i) / framesToPresent;
++                    threadBeamFillUntil(target, swapChainValid);
++                    const auto coarse = target - std::chrono::milliseconds(1);
++                    if (std::chrono::steady_clock::now() < coarse) {
++                        std::this_thread::sleep_until(coarse);
++                    }
++
++                    while (std::chrono::steady_clock::now() < target) {
++                        std::this_thread::yield();
++                    }
++                }
++            }
++
 +            double wcwAcqMs = 0.0;
              if (presentFrame) {
 +                auto wcwAcq0 = std::chrono::steady_clock::now();
@@ -12458,7 +13148,7 @@ index 3227ab1..30180ab 100644
              }
  
              if (presentFrame && swapChainValid) {
-@@ -340,12 +405,41 @@ namespace RT64 {
+@@ -340,12 +578,42 @@ namespace RT64 {
                      }
                  }
                  
@@ -12487,8 +13177,9 @@ index 3227ab1..30180ab 100644
                      commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(renderParams.texture, RenderTextureLayout::SHADER_READ));
 -                    viRenderer->render(renderParams);
 +
-+                    crtFilter->setDisplayConditions(ext.appWindow->getRefreshRate(), ext.swapChain->isVsyncEnabled(),
-+                        (framesToPresent > 1) || (refreshRate != UserConfiguration::RefreshRate::Original));
++                    const bool crtInterpolating = (framesToPresent > 1) || (refreshRate != UserConfiguration::RefreshRate::Original);
++                    crtFilter->setDisplayConditions(ext.appWindow->getRefreshRate(), ext.swapChain->isVsyncEnabled(), crtInterpolating,
++                        crtInterpolating ? targetRate : 0);
 +
 +                    CrtFilter::RenderParams crtParams;
 +                    crtParams.presentWorker = ext.presentGraphicsWorker;
@@ -12501,7 +13192,7 @@ index 3227ab1..30180ab 100644
                  }
  
                  RenderHookDraw *drawHook = GetRenderHookDraw();
-@@ -358,7 +452,43 @@ namespace RT64 {
+@@ -358,7 +626,59 @@ namespace RT64 {
                      if (inspector != nullptr) {
                          inspector->draw(commandList);
                      }
@@ -12514,9 +13205,14 @@ index 3227ab1..30180ab 100644
 +                    // BMP dump window configurable: WCW_BMP_START (default 600), WCW_BMP_COUNT
 +                    // (default 13), WCW_LUM_END (default 1500) — lets captures target any moment
 +                    // (e.g. in-game menus) instead of only early boot.
-+                    static const int wcwBmpStart = getenv("WCW_BMP_START") ? atoi(getenv("WCW_BMP_START")) : 600;
++                    static int wcwBmpStart = getenv("WCW_BMP_START") ? atoi(getenv("WCW_BMP_START")) : 600;
++                    // WCW_BMP_START_SEC=S: start the dump window at the first present S seconds after the first
++                    // present instead (present counts per second vary with the framerate; game time does not).
++                    static const double wcwBmpStartSec = getenv("WCW_BMP_START_SEC") ? atof(getenv("WCW_BMP_START_SEC")) : -1.0;
++                    static std::chrono::steady_clock::time_point wcwBmpClock0 = std::chrono::steady_clock::now();
++                    static bool wcwBmpStartResolved = false;
 +                    static const int wcwBmpCount = getenv("WCW_BMP_COUNT") ? atoi(getenv("WCW_BMP_COUNT")) : 13;
-+                    static const int wcwLumEnd = getenv("WCW_LUM_END") ? atoi(getenv("WCW_LUM_END")) : 1500;
++                    static int wcwLumEnd = getenv("WCW_LUM_END") ? atoi(getenv("WCW_LUM_END")) : 1500;
 +                    // WCW_BMP_EVERY=N: dump every Nth present from WCW_BMP_START instead (WCW_BMP_COUNT
 +                    // dumps), reading back only those presents.
 +                    static const int wcwBmpEvery = getenv("WCW_BMP_EVERY") ? atoi(getenv("WCW_BMP_EVERY")) : 0;
@@ -12527,7 +13223,18 @@ index 3227ab1..30180ab 100644
 +                    if (wcwLum) {
 +                        wcwPresentN++;
 +                        wcwRtPresentCounter = wcwPresentN;
-+                        const bool wcwEveryHit = (wcwBmpEvery <= 0) || ((wcwPresentN >= wcwBmpStart) && (((wcwPresentN - wcwBmpStart) % wcwBmpEvery) == 0));
++                        if ((wcwBmpStartSec >= 0.0) && !wcwBmpStartResolved) {
++                            wcwBmpStart = INT_MAX;
++                            if (std::chrono::duration<double>(std::chrono::steady_clock::now() - wcwBmpClock0).count() >= wcwBmpStartSec) {
++                                wcwBmpStart = wcwPresentN;
++                                wcwBmpStartResolved = true;
++                                // Read back only the dump window (reading every present slows the presents).
++                                wcwLumEnd = wcwBmpStart + wcwBmpCount * std::max(wcwBmpEvery, 1);
++                                fprintf(stderr, "[wcw] BMP window starts at present %d (%.1f s)\n", wcwPresentN, wcwBmpStartSec);
++                            }
++                        }
++                        const bool wcwEveryHit = (wcwBmpEvery <= 0) ? ((wcwBmpStartSec < 0.0) || (wcwPresentN >= wcwBmpStart))
++                            : ((wcwPresentN >= wcwBmpStart) && (((wcwPresentN - wcwBmpStart) % wcwBmpEvery) == 0));
 +                        if (wcwPresentN >= 240 && wcwPresentN <= wcwLumEnd && wcwEveryHit) {
 +                            uint32_t w = ext.swapChain->getWidth(), h = ext.swapChain->getHeight();
 +                            uint32_t row = (w + 63) & ~63u;
@@ -12546,7 +13253,7 @@ index 3227ab1..30180ab 100644
                      commandList->barriers(RenderBarrierStage::NONE, RenderTextureBarrier(swapChainTexture, RenderTextureLayout::PRESENT));
                      commandList->end();
                      const RenderCommandList *commandList = ext.presentGraphicsWorker->commandList.get();
-@@ -366,6 +496,100 @@ namespace RT64 {
+@@ -366,6 +686,100 @@ namespace RT64 {
                      RenderCommandSemaphore *signalSemaphore = drawSemaphores[swapChainIndex].get();
                      ext.presentGraphicsWorker->commandQueue->executeCommandLists(&commandList, 1, &waitSemaphore, 1, &signalSemaphore, 1, ext.presentGraphicsWorker->commandFence.get());
                      ext.presentGraphicsWorker->wait();
@@ -12647,7 +13354,21 @@ index 3227ab1..30180ab 100644
                  }
              }
  
-@@ -398,6 +622,11 @@ namespace RT64 {
+@@ -390,7 +804,12 @@ namespace RT64 {
+ 
+             if (presentFrame && swapChainValid) {
+                 // Wait until the approximate time the next present should be at the current intended rate.
+-                if ((presentTimestamp != Timestamp()) && (targetRate > 0) && (targetRate > viOriginalRate)) {
++                // [wcw crt] Not with the beam simulator: its frames are paced to their even targets before the
++                // acquire, and the vblank wait below lands each on a refresh. Sleeping a full frame period past
++                // the previous present first rounded every interval up to the next refresh (3 refreshes per
++                // 120 fps frame at 280 Hz instead of 2.33), so the presents fell behind and whole game frames
++                // were dropped (about 92 presents/s instead of 120).
++                if ((presentTimestamp != Timestamp()) && (targetRate > 0) && (targetRate > viOriginalRate) && !crtFilter->beamActive()) {
+                     Timer::preciseSleepUntil(presentTimestamp + std::chrono::nanoseconds(1'000'000'000 / targetRate));
+                 }
+ 
+@@ -398,6 +817,11 @@ namespace RT64 {
                      ext.swapChain->wait();
                  }
  
@@ -12659,7 +13380,7 @@ index 3227ab1..30180ab 100644
                  RenderCommandSemaphore *waitSemaphore = drawSemaphores[swapChainIndex].get();
                  presentTimestamp = Timer::current();
                  swapChainValid = ext.swapChain->present(swapChainIndex, &waitSemaphore, 1);
-@@ -430,6 +659,245 @@ namespace RT64 {
+@@ -430,6 +854,269 @@ namespace RT64 {
          barrierCursor = (barrierCursor + 1) % presents.size();
      }
  
@@ -12815,7 +13536,24 @@ index 3227ab1..30180ab 100644
 +    }
 +
 +    // [wcw crt] Presents the next beam simulator sub-frame of the last frame, with the UI on top.
-+    void PresentQueue::threadBeamPresent(bool &swapChainValid) {
++    // [wcw crt] Frame interpolation presents a few frames per game frame (e.g. 4 at 120 fps), fewer than the
++    // display's refreshes (280 Hz: 2.33 per frame): fill the refreshes before the next interpolated frame is
++    // due with beam sub-frames of the current one. Called from threadPresent, which holds threadMutex.
++    void PresentQueue::threadBeamFillUntil(std::chrono::steady_clock::time_point deadline, bool &swapChainValid) {
++        const uint32_t refreshRate = ext.appWindow->getRefreshRate();
++        if ((refreshRate == 0) || !crtFilter->beamActive()) {
++            return;
++        }
++
++        const auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(1.0 / double(refreshRate)));
++        while (swapChainValid && ((std::chrono::steady_clock::now() + period) < deadline) &&
++            crtFilter->hasBeamFrame(ext.swapChain->getWidth(), ext.swapChain->getHeight()))
++        {
++            threadBeamPresent(swapChainValid, false);
++        }
++    }
++
++    void PresentQueue::threadBeamPresent(bool &swapChainValid, bool lockThread) {
 +        // [wcw crt] DIAGNOSTIC (env WCW_CRT_LOG=1): per-phase timing of the idle beam present.
 +        using BeamClock = std::chrono::steady_clock;
 +        static double phaseMs[6] = {};
@@ -12827,10 +13565,17 @@ index 3227ab1..30180ab 100644
 +            phaseStart = now;
 +        };
 +
-+        std::unique_lock<std::mutex> threadLock(threadMutex);
++        std::unique_lock<std::mutex> threadLock(threadMutex, std::defer_lock);
++        if (lockThread) {
++            threadLock.lock();
++        }
++
 +        phase(0);
 +        if (!swapChainValid || ext.swapChain->needsResize() || ext.swapChain->isEmpty() || swapChainFramebuffers.empty()) {
-+            threadLock.unlock();
++            if (threadLock.owns_lock()) {
++                threadLock.unlock();
++            }
++
 +            std::this_thread::sleep_for(std::chrono::milliseconds(1));
 +            return;
 +        }
@@ -12905,7 +13650,7 @@ index 3227ab1..30180ab 100644
      void PresentQueue::threadLoop() {
          Thread::setCurrentThreadName("RT64 Present");
  
-@@ -452,14 +920,36 @@ namespace RT64 {
+@@ -452,14 +1139,36 @@ namespace RT64 {
          while (presentThreadRunning) {
              {
                  std::unique_lock<std::mutex> cursorLock(cursorMutex);
@@ -12945,10 +13690,10 @@ index 3227ab1..30180ab 100644
              }
  
 diff --git a/src/hle/rt64_present_queue.h b/src/hle/rt64_present_queue.h
-index e08b02c..e9aae84 100644
+index e08b02c..9ebe9c2 100644
 --- a/src/hle/rt64_present_queue.h
 +++ b/src/hle/rt64_present_queue.h
-@@ -6,6 +6,7 @@
+@@ -6,13 +6,15 @@
  
  #include "common/rt64_profiling_timer.h"
  #include "gui/rt64_inspector.h"
@@ -12956,7 +13701,16 @@ index e08b02c..e9aae84 100644
  #include "render/rt64_vi_renderer.h"
  
  #include "rt64_application_window.h"
-@@ -52,6 +53,7 @@ namespace RT64 {
+ #include "rt64_present.h"
+ #include "rt64_shared_queue_resources.h"
+ 
+-#define PRESENT_QUEUE_SIZE 4
++// [wcw fix] Grown from 4 (keep in step with WORKLOAD_QUEUE_SIZE).
++#define PRESENT_QUEUE_SIZE 8
+ 
+ namespace RT64 {
+     struct WorkloadQueue;
+@@ -52,6 +54,7 @@ namespace RT64 {
          std::unique_ptr<RenderCommandSemaphore> acquiredSemaphore;
          std::vector<std::unique_ptr<RenderCommandSemaphore>> drawSemaphores;
          std::unique_ptr<VIRenderer> viRenderer;
@@ -12964,11 +13718,12 @@ index e08b02c..e9aae84 100644
          std::unique_ptr<Inspector> inspector;
          ProfilingTimer presentProfiler = ProfilingTimer(120);
          Timestamp presentTimestamp;
-@@ -68,6 +70,7 @@ namespace RT64 {
+@@ -68,6 +71,8 @@ namespace RT64 {
          void waitForPresentId(uint64_t waitId);
          void setup(const External &ext);
          void threadPresent(const Present &present, bool &swapChainValid);
-+        void threadBeamPresent(bool &swapChainValid);
++        void threadBeamPresent(bool &swapChainValid, bool lockThread = true);
++        void threadBeamFillUntil(std::chrono::steady_clock::time_point deadline, bool &swapChainValid);
          void skipInterpolation();
          void notifyPresentId(const Present &present);
          void threadAdvanceBarrier();
@@ -13035,15 +13790,16 @@ index a10c11a..5f2345a 100644
          RT64_LOG_PRINTF("RDP::drawTexRect(ulx %d, uly %d, lrx %d, lry %d, tile %u, uls %d, ult %d, dsdx %d, dtdy %d, flip %u)", ulx, uly, lrx, lry, tile, uls, ult, dsdx, dtdy, flip);
  #   endif
 diff --git a/src/hle/rt64_rsp.cpp b/src/hle/rt64_rsp.cpp
-index ee2030b..4f87101 100644
+index ee2030b..48a9a7a 100644
 --- a/src/hle/rt64_rsp.cpp
 +++ b/src/hle/rt64_rsp.cpp
-@@ -4,12 +4,15 @@
+@@ -4,12 +4,16 @@
  
  #include "rt64_rsp.h"
  
 +#include <array>
  #include <cassert>
++#include <mutex>
 +#include <unordered_map>
  
  #include "../include/rt64_extended_gbi.h"
@@ -13054,18 +13810,101 @@ index ee2030b..4f87101 100644
  #include "shared/rt64_rsp_fog.h"
  
  #include "rt64_interpreter.h"
-@@ -70,6 +73,7 @@ namespace RT64 {
+@@ -70,6 +74,8 @@ namespace RT64 {
          projectionIndex = -1;
          projectionMatrixChanged = false;
          projectionMatrixInversed = false;
 +        wcwCameraLoaded = false;
++        wcwScreenSpace = false;
          viewportChanged = false;
          modelViewProjMatrix = hlslpp::float4x4(0.0f);
          modelViewProjChanged = false;
-@@ -131,6 +135,21 @@ namespace RT64 {
+@@ -131,6 +137,103 @@ namespace RT64 {
          segments[seg] = address;
      }
  
++    // [wcw fix] Frame interpolation: AKI games upload only fully combined model*camera matrices
++    // (gSPForceMatrix), which cannot be interpolated cleanly. In games whose camera multiply is a
++    // function (No Mercy, WM2000, VPW2), hand-edited hooks in the recompiled code (each game's
++    // tools/readd_hand_edits.py) report each object's camera-independent matrix and the camera it was
++    // combined with, keyed by the address of the result; forceMatrix looks the pair up when that result
++    // is uploaded. The camera multiply (out = A * B with B the camera) stores entries, guMtxF2L moves
++    // them from the float source to the fixed-point upload address. Games that multiply inline (World
++    // Tour, Revenge, VPW64) use the hookless path in forceMatrix instead.
++    static std::mutex g_wcwLocalMatrixMutex;
++    // entityAddr is the object's own local-matrix address: a stable per-object identity across frames.
++    struct WcwLocalMatrixEntry { hlslpp::float4x4 pureLocal; hlslpp::float4x4 camera; uint32_t entityAddr = 0; };
++    static std::unordered_map<uint32_t, WcwLocalMatrixEntry> g_wcwLocalMatrixByAddr;
++    // The camera address differs per game (No Mercy 0x80062BA8, WM2000 0x80057198, VPW2 0x80056F78).
++    // Each game's hook filters on its own camera address before calling in, so opBAddr is not
++    // re-checked here.
++
++    static hlslpp::float4x4 wcwMatrixFromRowMajor16(const float *m16) {
++        hlslpp::float4x4 m;
++        for (uint32_t j = 0; j < 4; j++) {
++            for (uint32_t i = 0; i < 4; i++) {
++                m[j][i] = m16[j * 4 + i];
++            }
++        }
++        return m;
++    }
++
++    extern "C" void wcw_interp_process_multiply(uint32_t destAddr, uint32_t opBAddr, uint32_t srcAddr, const float *aMatrix16, const float *bMatrix16) {
++        std::lock_guard<std::mutex> lock(g_wcwLocalMatrixMutex);
++        if (bMatrix16 != nullptr) {
++            // Only accept a real perspective camera matrix.
++            const float row3_2 = bMatrix16[14];
++            const float row3_3 = bMatrix16[15];
++            const float row2_3 = bMatrix16[11];
++            const bool looksLikeCamera = (abs(row3_3 - row3_2) > 5.0f) && (abs(row2_3) > 1e-3f);
++            if (!looksLikeCamera) {
++                g_wcwLocalMatrixByAddr.erase(destAddr);
++                return;
++            }
++
++            WcwLocalMatrixEntry entry;
++            entry.pureLocal = wcwMatrixFromRowMajor16(aMatrix16);
++            entry.camera = wcwMatrixFromRowMajor16(bMatrix16);
++            entry.entityAddr = srcAddr;
++            g_wcwLocalMatrixByAddr[destAddr] = entry;
++            return;
++        }
++
++        // Not a camera multiply: the address now holds something else.
++        g_wcwLocalMatrixByAddr.erase(destAddr);
++    }
++
++    extern "C" void wcw_interp_invalidate_local_matrix(uint32_t destAddr) {
++        std::lock_guard<std::mutex> lock(g_wcwLocalMatrixMutex);
++        g_wcwLocalMatrixByAddr.erase(destAddr);
++    }
++
++    extern "C" void wcw_interp_forward_local_matrix(uint32_t srcAddr, uint32_t dstAddr) {
++        std::lock_guard<std::mutex> lock(g_wcwLocalMatrixMutex);
++        auto it = g_wcwLocalMatrixByAddr.find(srcAddr);
++        if (it == g_wcwLocalMatrixByAddr.end()) {
++            g_wcwLocalMatrixByAddr.erase(dstAddr);
++            return;
++        }
++
++        // Copy rather than move: the same source may be converted more than once.
++        g_wcwLocalMatrixByAddr[dstAddr] = it->second;
++    }
++
++    // One-shot lookup by the force-matrix upload address.
++    static bool wcwLookupLocalMatrix(uint32_t stagingAddr, hlslpp::float4x4 &outLocal, hlslpp::float4x4 &outCamera, uint32_t &outEntityAddr) {
++        std::lock_guard<std::mutex> lock(g_wcwLocalMatrixMutex);
++        auto it = g_wcwLocalMatrixByAddr.find(stagingAddr);
++        if (it == g_wcwLocalMatrixByAddr.end()) {
++            return false;
++        }
++        outLocal = it->second.pureLocal;
++        outCamera = it->second.camera;
++        outEntityAddr = it->second.entityAddr;
++        g_wcwLocalMatrixByAddr.erase(it);
++        return true;
++    }
++
 +    // [wcw fix] AKI-engine games (WCW/WWF) never load a projection matrix: they submit fully
 +    // composed MVPs through G_FORCEMTX only. The projection stack top then stays at its zero
 +    // reset value, which is singular — hlslpp::inverse() returns NaN and poisons every world
@@ -13084,7 +13923,7 @@ index ee2030b..4f87101 100644
      void RSP::matrixCommon(const hlslpp::float4x4 &floatMatrix, uint32_t address, uint8_t params) {
          // Projection matrix.
          hlslpp::float4x4 &viewMatrix = viewMatrixStack[projectionMatrixStackSize - 1];
-@@ -191,6 +210,22 @@ namespace RT64 {
+@@ -191,6 +294,22 @@ namespace RT64 {
          const uint32_t rdramAddress = fromSegmentedMasked(address);
          const FixedMatrix *fixedMatrix = reinterpret_cast<FixedMatrix *>(state->fromRDRAM(rdramAddress));
          const hlslpp::float4x4 floatMatrix = fixedMatrix->toMatrix4x4();
@@ -13107,10 +13946,103 @@ index ee2030b..4f87101 100644
          matrixCommon(floatMatrix, address, params);
      }
  
-@@ -311,6 +346,20 @@ namespace RT64 {
+@@ -301,6 +420,63 @@ namespace RT64 {
+         }
+     }
+ 
++    // [wcw hfr] AKI engines double-buffer their uploaded matrices: an object's matrix alternates between
++    // two slots 0x40 apart from frame to frame. Give both slots one identity: an address whose partner
++    // (address +/- 0x40) was already seen takes the partner's identity. WCW_HFR_SLOTSTRIDE overrides 0x40
++    // (0 disables).
++    static uint32_t wcwCanonicalSlot(uint32_t addr) {
++        static const uint32_t stride = getenv("WCW_HFR_SLOTSTRIDE") ? uint32_t(strtoul(getenv("WCW_HFR_SLOTSTRIDE"), nullptr, 0)) : 0x40u;
++        static std::unordered_map<uint32_t, uint32_t> canonical;
++        static std::mutex canonicalMutex;
++        if (stride == 0) {
++            return addr;
++        }
++
++        std::lock_guard<std::mutex> lock(canonicalMutex);
++        auto it = canonical.find(addr);
++        if (it != canonical.end()) {
++            return it->second;
++        }
++
++        uint32_t id = addr;
++        auto lower = canonical.find(addr - stride);
++        auto upper = canonical.find(addr + stride);
++        if (lower != canonical.end()) {
++            id = lower->second;
++        }
++        else if (upper != canonical.end()) {
++            id = upper->second;
++        }
++
++        canonical.emplace(addr, id);
++        return id;
++    }
++
++    void RSP::wcwSetScreenSpace(bool screenSpace) {
++        if (screenSpace == wcwScreenSpace) {
++            return;
++        }
++
++        const int top = projectionMatrixStackSize - 1;
++        if (screenSpace) {
++            wcwCameraView = viewMatrixStack[top];
++            wcwCameraProj = projMatrixStack[top];
++            wcwCameraViewProj = viewProjMatrixStack[top];
++            viewMatrixStack[top] = wcwPreCameraView;
++            projMatrixStack[top] = wcwPreCameraProj;
++            viewProjMatrixStack[top] = wcwPreCameraViewProj;
++        }
++        else {
++            viewMatrixStack[top] = wcwCameraView;
++            projMatrixStack[top] = wcwCameraProj;
++            viewProjMatrixStack[top] = wcwCameraViewProj;
++        }
++
++        wcwScreenSpace = screenSpace;
++        projectionMatrixChanged = true;
++        projectionMatrixInversed = false;
++    }
++
+     void RSP::forceMatrix(uint32_t address) {
+ #   ifdef LOG_SPECIAL_MATRIX_OPERATIONS
+         RT64_LOG_PRINTF("RSP::forceMatrix(0x%08X)", address);
+@@ -311,6 +487,49 @@ namespace RT64 {
          modelViewProjMatrix = fixedMatrix->toMatrix4x4();
          modelViewProjInserted = true;
          modelViewProjChanged = false;
++
++        // [wcw hfr] With a camera loaded, a matrix without perspective is a screen-space draw.
++        if (wcwCameraLoaded) {
++            const float eps = 1e-5f;
++            const bool affine = (std::abs(float(modelViewProjMatrix[0][3])) < eps) && (std::abs(float(modelViewProjMatrix[1][3])) < eps) &&
++                (std::abs(float(modelViewProjMatrix[2][3])) < eps) && (std::abs(float(modelViewProjMatrix[3][3]) - 1.0f) < eps);
++            wcwSetScreenSpace(affine);
++        }
++
++        // [wcw fix] The hooks key entries by KSEG0 address; rdramAddress is the physical offset.
++        pureModelMatrixValid = wcwLookupLocalMatrix(rdramAddress + 0x80000000u, pureModelMatrix, currentCameraMatrix, pureModelEntityAddr);
++
++        // [wcw hfr] WCW_HFR_HOOKLESS=1: with the camera loaded and no hook entry, derive the
++        // camera-independent matrix from the combined one (pure = MVP * inv(camera VP)); the object's
++        // identity across frames is the address the matrix is uploaded from.
++        static const bool wcwHfrHooklessEnv = getenv("WCW_HFR_HOOKLESS") != nullptr;
++        const bool wcwHfrHookless = wcwInterpolationProfile().hooklessObjects || wcwHfrHooklessEnv;
++        if (wcwCameraLoaded && !wcwScreenSpace) {
++            const hlslpp::float4x4 &wcwVP = viewProjMatrixStack[projectionMatrixStackSize - 1];
++            if (!pureModelMatrixValid && wcwHfrHookless && !isMatrixZero(wcwVP)) {
++                currentCameraMatrix = wcwVP;
++                pureModelMatrix = hlslpp::mul(modelViewProjMatrix, hlslpp::inverse(wcwVP));
++                pureModelEntityAddr = wcwCanonicalSlot(rdramAddress + 0x80000000u);
++                pureModelMatrixValid = true;
++            }
++
++            wcwHfrForced.fetch_add(1, std::memory_order_relaxed);
++            wcwHfrPure.fetch_add(pureModelMatrixValid ? 1 : 0, std::memory_order_relaxed);
++        }
 +
 +        // [wcw2k] WCW2K_MTXLOG=1: log gSPForceMatrix loads (AKI engines CPU-transform
 +        // and force the combined MVP via G_MOVEMEM instead of gSPMatrix).
@@ -13128,7 +14060,7 @@ index ee2030b..4f87101 100644
      }
  
      static void setExtendedMatrixFloat(RSP &rsp, uint32_t address, hlslpp::float4x4 &matrix, hlslpp::float4x4 &invMatrix) {
-@@ -333,11 +382,65 @@ namespace RT64 {
+@@ -333,11 +552,76 @@ namespace RT64 {
          rsp.lookAtChanged = true;
      }
  
@@ -13148,11 +14080,22 @@ index ee2030b..4f87101 100644
 +
 +        // With ray tracing off the camera is consumed and ignored, so the default path keeps the
 +        // identity-VP [wcw fix] behavior and never touches the extended correction matrices.
-+        if (!WcwRaytracer::active()) {
++        // [wcw hfr] Interpolation (framerate above Original) also uses the camera: it splits forced
++        // matrices into object and camera, and keeps screen-space draws out of the camera.
++        const bool wcwInterpCamera = (state->ext.workloadQueue != nullptr) &&
++            (state->ext.workloadQueue->ext.sharedResources->userConfig.refreshRate != UserConfiguration::RefreshRate::Original) &&
++            (getenv("WCW_HFR_NOCAMERA") == nullptr);
++        if (!WcwRaytracer::active() && !wcwInterpCamera) {
 +            return true;
 +        }
 +
++        // [wcw hfr] A camera load always applies to the camera matrices, not the screen-space set.
++        wcwSetScreenSpace(false);
++
 +        if (!wcwCameraLoaded) {
++            wcwPreCameraView = viewMatrixStack[top];
++            wcwPreCameraProj = projMatrixStack[top];
++            wcwPreCameraViewProj = viewProjMatrixStack[top];
 +            viewMatrixStack[top] = hlslpp::float4x4::identity();
 +            projMatrixStack[top] = hlslpp::float4x4::identity();
 +            wcwCameraLoaded = true;
@@ -13194,7 +14137,7 @@ index ee2030b..4f87101 100644
          setExtendedMatrixFloat(*this, address, extended.viewMatrix, extended.invViewMatrix);
      }
  
-@@ -372,6 +475,32 @@ namespace RT64 {
+@@ -372,6 +656,32 @@ namespace RT64 {
  
          const uint32_t rdramAddress = fromSegmentedMasked(address);
          const Vertex *dlVerts = reinterpret_cast<const Vertex *>(state->fromRDRAM(rdramAddress));
@@ -13227,7 +14170,7 @@ index ee2030b..4f87101 100644
          memcpy(&vertices[dstIndex], dlVerts, sizeof(Vertex) * vtxCount);
          setVertexCommon<true, sizeof(Vertex)>(rdramAddress, dstIndex, dstIndex + vtxCount);
      }
-@@ -465,9 +594,18 @@ namespace RT64 {
+@@ -465,9 +775,18 @@ namespace RT64 {
  
              uint32_t physicalAddress = projectionMatrixPhysicalAddressStack[projectionMatrixStackSize - 1];
              workload.physicalAddressTransformMap.emplace(physicalAddress, uint32_t(drawData.viewProjTransformGroups.size()));
@@ -13249,7 +14192,28 @@ index ee2030b..4f87101 100644
              drawData.viewProjTransformGroups.emplace_back(extended.curViewProjMatrixIdGroupIndex);
              drawData.rspViewports.emplace_back(viewportStack[viewportStackSize - 1]);
              drawData.viewportOrigins.emplace_back(extended.viewportOriginStack[viewportStackSize - 1]);
-@@ -533,12 +671,41 @@ namespace RT64 {
+@@ -515,6 +834,9 @@ namespace RT64 {
+         
+         // ModelViewProj is only updated when a vertex is processed and the flag is enabled.
+         auto &worldTransforms = workload.drawData.worldTransforms;
++        auto &worldTransformsPure = workload.drawData.worldTransformsPure;
++        auto &worldTransformsCamera = workload.drawData.worldTransformsCamera;
++        auto &worldTransformsPureValid = workload.drawData.worldTransformsPureValid;
+         auto &worldTransformGroups = workload.drawData.worldTransformGroups;
+         auto &worldTransformSegmentedAddresses = workload.drawData.worldTransformSegmentedAddresses;
+         auto &worldTransformPhysicalAddresses = workload.drawData.worldTransformPhysicalAddresses;
+@@ -524,6 +846,10 @@ namespace RT64 {
+             computeModelViewProj();
+             curTransformIndex = static_cast<uint16_t>(worldTransforms.size());
+             worldTransforms.emplace_back(hlslpp::mul(modelMatrixStack[modelMatrixStackSize - 1], extended.viewProjMatrix));
++            // [wcw fix] Keep the parallel pure/camera arrays in sync (no pure matrix on this path).
++            worldTransformsPure.emplace_back(worldTransforms.back());
++            worldTransformsCamera.emplace_back(hlslpp::float4x4::identity());
++            worldTransformsPureValid.emplace_back(0);
+         }
+         else if (modelViewProjInserted) {
+ #       ifdef LOG_SPECIAL_MATRIX_OPERATIONS
+@@ -533,16 +859,60 @@ namespace RT64 {
              modelViewProjInserted = false;
  
              if (!projectionMatrixInversed) {
@@ -13266,6 +14230,18 @@ index ee2030b..4f87101 100644
  
              curTransformIndex = static_cast<uint16_t>(worldTransforms.size());
              worldTransforms.emplace_back(hlslpp::mul(hlslpp::mul(modelViewProjMatrix, invViewProjMatrixStack[projectionMatrixStackSize - 1]), extended.viewProjMatrix));
++            // [wcw fix] Carry the camera-independent matrix and its camera alongside the combined one
++            // when the hooks provided them; otherwise fall back to the combined matrix.
++            if (pureModelMatrixValid) {
++                worldTransformsPure.emplace_back(pureModelMatrix);
++                worldTransformsCamera.emplace_back(currentCameraMatrix);
++                worldTransformsPureValid.emplace_back(1);
++            }
++            else {
++                worldTransformsPure.emplace_back(worldTransforms.back());
++                worldTransformsCamera.emplace_back(hlslpp::float4x4::identity());
++                worldTransformsPureValid.emplace_back(0);
++            }
 +
 +            // [wcw rt] WCW_RT_LOG=1: sample decomposed world translations (static scenery must
 +            // stay put while the camera moves when the camera hand-off is correct).
@@ -13292,7 +14268,15 @@ index ee2030b..4f87101 100644
          }
  
          if (addWorldTransform) {
-@@ -1050,6 +1217,9 @@ namespace RT64 {
+-            uint32_t physicalAddress = modelMatrixPhysicalAddressStack[modelMatrixStackSize - 1];
++            // [wcw fix] AKI games never update the gSPMatrix address stack, so use the object's own
++            // local-matrix address as its cross-frame identity when it is known for THIS transform.
++            const bool usePureEntityAddr = worldTransformsPureValid.back() != 0;
++            uint32_t physicalAddress = usePureEntityAddr ? pureModelEntityAddr : modelMatrixPhysicalAddressStack[modelMatrixStackSize - 1];
+             workload.physicalAddressTransformMap.emplace(physicalAddress, uint32_t(worldTransformGroups.size()));
+             worldTransformGroups.emplace_back(extended.curModelMatrixIdGroupIndex);
+             worldTransformSegmentedAddresses.emplace_back(modelMatrixSegmentedAddressStack[modelMatrixStackSize - 1]);
+@@ -1050,6 +1420,9 @@ namespace RT64 {
      }
  
      void RSP::drawIndexedTri(uint32_t a, uint32_t b, uint32_t c, bool rawGlobalIndices) {
@@ -13303,10 +14287,10 @@ index ee2030b..4f87101 100644
          const uint32_t cycleType = state->rdp->otherMode.cycleType();
          assert(cycleType != G_CYC_COPY);
 diff --git a/src/hle/rt64_rsp.h b/src/hle/rt64_rsp.h
-index 61bb3b1..5ca1a6c 100644
+index 61bb3b1..6f701a7 100644
 --- a/src/hle/rt64_rsp.h
 +++ b/src/hle/rt64_rsp.h
-@@ -149,6 +149,10 @@ namespace RT64 {
+@@ -149,10 +149,29 @@ namespace RT64 {
          uint8_t curLightCount;
          bool projectionMatrixChanged;
          bool projectionMatrixInversed;
@@ -13314,10 +14298,29 @@ index 61bb3b1..5ca1a6c 100644
 +        // [wcw rt] Set once a forceMatrix-only game has supplied its real camera through
 +        // the float view/projection commands this display list (see setWcwCameraMatrix).
 +        bool wcwCameraLoaded;
++
++        // [wcw hfr] While a camera is loaded, screen-space draws (forced matrices without perspective:
++        // the HUD, 2D overlays) use the matrices the display list had before the camera, so that
++        // interpolating the camera never moves them. wcwScreenSpace says which set is current.
++        bool wcwScreenSpace;
++        hlslpp::float4x4 wcwPreCameraView, wcwPreCameraProj, wcwPreCameraViewProj;
++        hlslpp::float4x4 wcwCameraView, wcwCameraProj, wcwCameraViewProj;
++        void wcwSetScreenSpace(bool screenSpace);
          bool viewportChanged;
          hlslpp::float4x4 modelViewProjMatrix;
          bool modelViewProjChanged;
-@@ -247,6 +251,7 @@ namespace RT64 {
+         bool modelViewProjInserted;
++        // [wcw fix] The camera-independent model matrix, the camera it was combined with and the
++        // object's local-matrix address for the current force-matrix upload, when the game-side
++        // hooks provided them (see the matrix cache in rt64_rsp.cpp).
++        hlslpp::float4x4 pureModelMatrix;
++        hlslpp::float4x4 currentCameraMatrix;
++        bool pureModelMatrixValid = false;
++        uint32_t pureModelEntityAddr = 0;
+         int projectionIndex;
+         std::array<interop::RSPViewport, RSP_EXTENDED_STACK_SIZE> viewportStack;
+         int viewportStackSize;
+@@ -247,6 +266,7 @@ namespace RT64 {
          void insertMatrix(uint32_t address, uint32_t value);
          void forceMatrix(uint32_t address);
          void setProjectionMatrixFloat(uint32_t address);
@@ -13325,6 +14328,20 @@ index 61bb3b1..5ca1a6c 100644
          void setViewMatrixFloat(uint32_t address);
          void computeModelViewProj();
          void specialComputeModelViewProj();
+diff --git a/src/hle/rt64_shared_queue_resources.h b/src/hle/rt64_shared_queue_resources.h
+index 8858dac..520519d 100644
+--- a/src/hle/rt64_shared_queue_resources.h
++++ b/src/hle/rt64_shared_queue_resources.h
+@@ -52,6 +52,9 @@ namespace RT64 {
+         std::vector<uint32_t> colorImageAddressVector;
+         std::unordered_set<uint32_t> colorImageAddressSet;
+         std::vector<std::unique_ptr<RenderTarget>> interpolatedColorTargets;
++        // [wcw fix] Two more sets of interpolated targets: sets are chosen by run serial % 3.
++        std::vector<std::unique_ptr<RenderTarget>> wcwInterpolatedColorTargetsB;
++        std::vector<std::unique_ptr<RenderTarget>> wcwInterpolatedColorTargetsC;
+         InterpolatedFrameCounters interpolatedFrames[2];
+         uint32_t interpolatedFramesIndex = 0;
+         std::mutex interpolatedMutex;
 diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
 index d249a97..62597ad 100644
 --- a/src/hle/rt64_state.cpp
@@ -13405,7 +14422,7 @@ index d249a97..62597ad 100644
              // See if there's an existing framebuffer that lines up with the VI. If there is, we support reading 
              // CPU changes directly to it and recreating them in the render thread at low resolution.
 diff --git a/src/hle/rt64_vi.cpp b/src/hle/rt64_vi.cpp
-index a870166..bc0aec8 100644
+index a870166..ad4c1d8 100644
 --- a/src/hle/rt64_vi.cpp
 +++ b/src/hle/rt64_vi.cpp
 @@ -20,7 +20,29 @@ namespace RT64 {
@@ -13450,10 +14467,122 @@ index a870166..bc0aec8 100644
          if (siz >= G_IM_SIZ_16b) {
              const bool interlacedStep = status.serrate && (vCurrentLine & 0x1);
              const uint32_t rowBytes = width * (1U << (siz - 1));
+@@ -162,13 +188,30 @@ namespace RT64 {
+     }
+ 
+     uint32_t VIHistory::logicalRateFromFactors() {
+-        if ((factors[0] != 0) && std::all_of(factors.begin(), factors.end(), [&](uint32_t factor) { return factor == factors[0]; })) {
+-            const uint32_t FullRate = 60; // TODO: PAL support.
+-            return FullRate / factors[0];
+-        }
+-        else {
+-            return 0;
++        // [wcw fix] Tolerate a single-sample outlier instead of requiring strict unanimous
++        // agreement across all history slots: real gameplay VI timing has occasional one-tick
++        // jitter (camera cuts, hit effects), which previously zeroed out rate detection for a
++        // beat and made interpolation flicker on/off instead of running consistently. Accept a
++        // 2-of-3 majority match instead of requiring all 3 to agree.
++        for (size_t i = 0; i < factors.size(); i++) {
++            if (factors[i] == 0) {
++                continue;
++            }
++
++            uint32_t matches = 0;
++            for (size_t j = 0; j < factors.size(); j++) {
++                if (factors[j] == factors[i]) {
++                    matches++;
++                }
++            }
++
++            if (matches >= 2) {
++                const uint32_t FullRate = 60; // TODO: PAL support.
++                return FullRate / factors[i];
++            }
+         }
++
++        return 0;
+     }
+ 
+     const VIHistory::Present &VIHistory::top() const {
+diff --git a/src/hle/rt64_workload.cpp b/src/hle/rt64_workload.cpp
+index b4c85f5..f530450 100644
+--- a/src/hle/rt64_workload.cpp
++++ b/src/hle/rt64_workload.cpp
+@@ -74,6 +74,9 @@ namespace RT64 {
+         drawData.lerpRspLookAt.clear();
+         drawData.loadOperations.clear();
+         drawData.worldTransforms.clear();
++        drawData.worldTransformsPure.clear();
++        drawData.worldTransformsCamera.clear();
++        drawData.worldTransformsPureValid.clear();
+         drawData.viewTransforms.clear();
+         drawData.projTransforms.clear();
+         drawData.viewProjTransforms.clear();
+@@ -106,6 +109,10 @@ namespace RT64 {
+         drawData.projTransforms.push_back(interop::float4x4::identity());
+         drawData.viewProjTransforms.push_back(interop::float4x4::identity());
+         drawData.worldTransforms.push_back(interop::float4x4::identity());
++        // [wcw fix] Keep the parallel pure/camera arrays index-aligned with worldTransforms.
++        drawData.worldTransformsPure.push_back(hlslpp::float4x4::identity());
++        drawData.worldTransformsCamera.push_back(hlslpp::float4x4::identity());
++        drawData.worldTransformsPureValid.push_back(0);
+         drawData.transformGroups.push_back(TransformGroup());
+         drawData.worldTransformGroups.push_back(0);
+         drawData.viewProjTransformGroups.push_back(0);
+diff --git a/src/hle/rt64_workload.h b/src/hle/rt64_workload.h
+index 8ea27d5..b270866 100644
+--- a/src/hle/rt64_workload.h
++++ b/src/hle/rt64_workload.h
+@@ -55,6 +55,11 @@ namespace RT64 {
+         std::vector<interop::float4x4> prevWorldTransforms;
+         std::vector<interop::float4x4> invTWorldTransforms;
+         std::vector<interop::float4x4> lerpWorldTransforms;
++        // [wcw fix] Parallel to worldTransforms: the camera-independent matrix and the camera it was combined
++        // with, when the game-side hooks provided them (worldTransformsPureValid).
++        std::vector<interop::float4x4> worldTransformsPure;
++        std::vector<interop::float4x4> worldTransformsCamera;
++        std::vector<uint8_t> worldTransformsPureValid;
+         std::vector<interop::RDPTile> rdpTiles;
+         std::vector<interop::RDPTile> lerpRdpTiles;
+         std::vector<interop::GPUTile> gpuTiles;
+@@ -233,6 +238,8 @@ namespace RT64 {
+         std::vector<uint32_t> transformIgnoredIds;
+         uint64_t workloadId = 0;
+         uint64_t presentId = 0;
++        // [wcw fix] Serial number of the displayed frame (run of layers) this workload belongs to.
++        uint64_t wcwRunSerial = 0;
+         bool paused = false;
+ 
+         struct {
 diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
-index 5a331aa..713f36f 100644
+index 5a331aa..469b19b 100644
 --- a/src/hle/rt64_workload_queue.cpp
 +++ b/src/hle/rt64_workload_queue.cpp
+@@ -42,13 +42,13 @@ namespace RT64 {
+ 
+         threadCursor = 0;
+         writeCursor = 0;
+-        barrierCursor = int(workloads.size()) - 1;
++        barrierCursor = int(WORKLOAD_QUEUE_SIZE) - 1;
+         workloadId = 0;
+         lastPresentId = 0;
+     }
+ 
+     void WorkloadQueue::advanceToNextWorkload() {
+-        int nextWriteCursor = (writeCursor + 1) % workloads.size();
++        int nextWriteCursor = (writeCursor + 1) % WORKLOAD_QUEUE_SIZE;
+ 
+         // Stall the thread until the barrier is lifted if we're trying to write on a workload being used by the GPU.
+         bool waitForBarrier;
+@@ -80,7 +80,7 @@ namespace RT64 {
+             return writeCursor - 1;
+         }
+         else {
+-            return uint32_t(workloads.size()) - 1;
++            return uint32_t(WORKLOAD_QUEUE_SIZE) - 1;
+         }
+     }
+ 
 @@ -131,7 +131,14 @@ namespace RT64 {
          const uint32_t referenceHeight = (viFbSize[1] > 0) ? std::max(viFbSize[1], MinimumReferenceHeight) : 240;
  
@@ -13470,7 +14599,27 @@ index 5a331aa..713f36f 100644
  
          const auto ratioMode = ext.sharedResources->userConfig.aspectRatio;
          switch (ratioMode) {
-@@ -387,7 +394,8 @@ namespace RT64 {
+@@ -271,6 +278,8 @@ namespace RT64 {
+             fbManager.destroyAllTileCopies();
+             ext.sharedResources->fbConfigChanged = false;
+             ext.sharedResources->interpolatedColorTargets.clear();
++            ext.sharedResources->wcwInterpolatedColorTargetsB.clear();
++            ext.sharedResources->wcwInterpolatedColorTargetsC.clear();
+         }
+ 
+         if (ext.sharedResources->userConfigChanged) {
+@@ -289,6 +298,10 @@ namespace RT64 {
+         }
+     }
+     
++    // [wcw hfr] Generated targets to prime before the run's first layer draws its blended frame (set by the
++    // workload thread, consumed by threadRenderFrame).
++    static std::vector<RenderTarget *> wcwPrimeTargets;
++
+     void WorkloadQueue::threadRenderFrame(GameFrame &curFrame, const GameFrame &prevFrame, const WorkloadConfiguration &workloadConfig,
+         const DebuggerRenderer &debuggerRenderer, const DebuggerCamera &debuggerCamera, float curFrameWeight, float prevFrameWeight,
+         float deltaTimeMs, RenderTargetKey overrideTargetKey, int32_t overrideTargetFbPairIndex, RenderTarget *overrideTarget,
+@@ -387,7 +400,8 @@ namespace RT64 {
                  rspProcessor->process(rspParams);
              }
  
@@ -13480,7 +14629,7 @@ index 5a331aa..713f36f 100644
              if (processWorldVertices) {
                  workload.resetWorldOutputBuffers();
  
-@@ -452,6 +460,24 @@ namespace RT64 {
+@@ -452,6 +466,24 @@ namespace RT64 {
                      if (colorFb != nullptr) {
                          fbKey.colorTargetKey = RenderTargetKey(colorFb->addressStart, colorFb->width, colorFb->siz, Framebuffer::Type::Color);
                          colorTarget = &targetManager.get(fbKey.colorTargetKey);
@@ -13505,7 +14654,7 @@ index 5a331aa..713f36f 100644
                      }
                      else {
                          colorTarget = nullptr;
-@@ -604,6 +630,10 @@ namespace RT64 {
+@@ -604,6 +636,10 @@ namespace RT64 {
              // Add all framebuffer pairs to the framebuffer renderer and setup the operations.
              scratchFbChangePool.reset();
              fbManager.resetOperations();
@@ -13516,7 +14665,62 @@ index 5a331aa..713f36f 100644
              framebufferRenderer->resetFramebuffers(ext.workloadGraphicsWorker, ubershadersVisible, workload.extended.ditherNoiseStrength, targetManager.multisampling);
  
  #       if RT_ENABLED
-@@ -842,12 +872,83 @@ namespace RT64 {
+@@ -703,7 +739,40 @@ namespace RT64 {
+             ext.workloadGraphicsWorker->commandList->writeTimestamp(queryPool.get(), 0);
+             framebufferRenderer->endFramebuffers(ext.workloadGraphicsWorker, &workload.drawBuffers, &workload.outputBuffers, workloadConfig.raytracingEnabled);
+             framebufferRenderer->recordSetup(ext.workloadGraphicsWorker, bufferUploaders, processRSP ? rspProcessor.get() : nullptr, processWorldVertices ? vertexProcessor.get() : nullptr, &workload.outputBuffers, workloadConfig.raytracingEnabled);
+-            
++
++            // [wcw hfr] WCW_HFR_PRIME=1: start a generated frame's target from the live target's content
++            // (ported from the July World Tour fix, bd35fac). Games that clear each buffer in the PREVIOUS
++            // frame submit no clear in this one, so a fresh override target keeps undefined (white)
++            // content behind the re-rendered geometry: World Tour's title fade alternated grey/white.
++            static const bool wcwHfrPrimeEnv = getenv("WCW_HFR_PRIME") != nullptr;
++            const bool wcwHfrPrime = wcwInterpolationProfile().primeGeneratedFrames || wcwHfrPrimeEnv;
++            // The copy happens once per run, before its first layer draws the blended frame into the live target:
++            // the generated targets then start from the same content as the game's buffer (usually the clear
++            // the previous frame left). Priming each generated frame from the live target after the blend was
++            // drawn applied translucent full-screen layers (fades) twice, and priming every layer replaced the
++            // earlier layers' draws with the blended frame's.
++            if (wcwHfrPrime && (overrideTarget == nullptr) && !wcwPrimeTargets.empty() && !usingMSAA) {
++                RenderTarget &liveTarget = targetManager.get(overrideTargetKey, true);
++                for (RenderTarget *primeTarget : wcwPrimeTargets) {
++                    if (liveTarget.isEmpty() || (primeTarget == nullptr) || (&liveTarget == primeTarget)) {
++                        continue;
++                    }
++
++                    primeTarget->resize(ext.workloadGraphicsWorker, liveTarget.width, liveTarget.height);
++                    RenderTextureBarrier primeBarriers[] = {
++                        RenderTextureBarrier(liveTarget.texture.get(), RenderTextureLayout::COPY_SOURCE),
++                        RenderTextureBarrier(primeTarget->texture.get(), RenderTextureLayout::COPY_DEST)
++                    };
++                    ext.workloadGraphicsWorker->commandList->barriers(RenderBarrierStage::COPY, primeBarriers, uint32_t(std::size(primeBarriers)));
++                    const RenderBox primeBox(0, 0, int32_t(std::min(liveTarget.width, primeTarget->width)), int32_t(std::min(liveTarget.height, primeTarget->height)));
++                    ext.workloadGraphicsWorker->commandList->copyTextureRegion(
++                        RenderTextureCopyLocation::Subresource(primeTarget->texture.get()),
++                        RenderTextureCopyLocation::Subresource(liveTarget.texture.get()), 0, 0, 0, &primeBox);
++                }
++            }
++
++            wcwPrimeTargets.clear();
++
+             // Record all framebuffer pairs.
+             uint32_t framebufferIndex = 0;
+             for (uint32_t f = 0; f < fbPairCount; f++) {
+@@ -814,7 +883,11 @@ namespace RT64 {
+                     const uint64_t writeTimestamp = fbManager.nextWriteTimestamp();
+                     FixedRect depthFbRect;
+                     if (colorFb != nullptr) {
+-                        colorFb->lastWriteRect.merge(fbPair.drawColorRect.scaled(fixedResScale.x, fixedResScale.y));
++                        // [wcw fix] A layer can draw nothing into colour; don't merge a null rect.
++                        if (!fbPair.drawColorRect.isNull()) {
++                            colorFb->lastWriteRect.merge(fbPair.drawColorRect.scaled(fixedResScale.x, fixedResScale.y));
++                        }
++
+                         colorFb->lastWriteType = Framebuffer::Type::Color;
+                         colorFb->lastWriteFmt = colorImg.fmt;
+                         colorFb->lastWriteTimestamp = writeTimestamp;
+@@ -842,12 +915,83 @@ namespace RT64 {
              framebufferRenderer->waitForUploaders();
              ext.workloadGraphicsWorker->execute();
              ext.workloadGraphicsWorker->wait();
@@ -13600,7 +14804,47 @@ index 5a331aa..713f36f 100644
  
              // Indicate to the texture cache it's safe to delete the textures if no locks are active.
              ext.textureCache->decrementLock();
-@@ -904,6 +1005,32 @@ namespace RT64 {
+@@ -866,7 +1010,7 @@ namespace RT64 {
+ 
+     void WorkloadQueue::threadAdvanceBarrier() {
+         std::scoped_lock<std::mutex> cursorLock(cursorMutex);
+-        barrierCursor = (barrierCursor + 1) % workloads.size();
++        barrierCursor = (barrierCursor + 1) % WORKLOAD_QUEUE_SIZE;
+     }
+ 
+     void WorkloadQueue::threadAdvanceWorkloadId(uint64_t newWorkloadId) {
+@@ -887,7 +1031,21 @@ namespace RT64 {
+         uint32_t originalRateForTicks = 0;
+         uint32_t displayRateForTicks = 0;
+         int processCursor = -1;
+-        bool frameReduction = false;
++        // [wcw fix] AKI games draw one displayed frame as a run of layers (several workloads to the
++        // same colour address, about 5 in a match). State for the current run: its length, recent run
++        // lengths, its serial number, and its generated frame while it waits for the run's last layer.
++        uint32_t wcwCompositeRunLength = 0;
++        uint32_t wcwLastCompositeRunLength = 0;
++        uint32_t wcwRunLengthHistory[8] = {};
++        uint32_t wcwRunLengthCursor = 0;
++        uint64_t wcwRunSerialCounter = 0;
++        bool wcwInterpFlushPending = false;
++        uint32_t wcwInterpFlushIndex = 0;
++        uint64_t wcwPendingRunSerial = 0;
++        uint32_t wcwPendingRunAddr = 0;
++        uint32_t wcwPendingFrames = 0; // generated frames the pending run will make available
++        // True once any layer of the current run has skipped its generated frame.
++        bool wcwRunGenIncomplete = false;
+         while (threadsRunning) {
+             {
+                 std::unique_lock<std::mutex> cursorLock(cursorMutex);
+@@ -897,13 +1055,39 @@ namespace RT64 {
+ 
+                 if (threadsRunning) {
+                     processCursor = threadCursor;
+-                    threadCursor = (threadCursor + 1) % workloads.size();
++                    threadCursor = (threadCursor + 1) % WORKLOAD_QUEUE_SIZE;
+                 }
+             }
+ 
              if (processCursor >= 0) {
                  std::unique_lock<std::mutex> threadLock(threadMutex);
                  Workload &workload = workloads[processCursor];
@@ -13633,24 +14877,640 @@ index 5a331aa..713f36f 100644
                  ext.presentQueue->waitForPresentId(workload.presentId);
  
                  if (!threadsRunning) {
-@@ -986,7 +1113,10 @@ namespace RT64 {
+@@ -914,11 +1098,157 @@ namespace RT64 {
+                 workloadProfiler.start();
+                 threadConfigurationUpdate(workload.viFbSize, workloadConfig);
+ 
++                // [wcw fix] Detect multi-layer frames: several consecutive workloads drawing to the same colour
++                // address make up one displayed frame. immediateRepeat marks layers 2+ of the current run;
++                // recentColorGroups remembers how long each address's last run was, which classifies layer 1.
++                uint32_t thisWorkloadColorAddress = (workload.fbPairCount > 0) ? workload.fbPairs[0].colorImage.address : 0;
++                // [wcw fix] A workload that draws nothing belongs to the current run (it cannot change the
++                // image), instead of splitting the run or refusing generation.
++                bool wcwDrawsNothing = false;
++                if (RT64::wcwInterpActive.load(std::memory_order_relaxed)) {
++                    wcwDrawsNothing = true;
++                    for (uint32_t f = 0; f < workload.fbPairCount; f++) {
++                        if (!workload.fbPairs[f].drawColorRect.isEmpty()) {
++                            wcwDrawsNothing = false;
++                            break;
++                        }
++                    }
++
++                    if (wcwDrawsNothing && hasLastGroupColorAddress) {
++                        thisWorkloadColorAddress = lastGroupColorAddress;
++                    }
++                }
++
++                const bool immediateRepeat = hasLastGroupColorAddress && (thisWorkloadColorAddress == lastGroupColorAddress);
++                if (immediateRepeat) {
++                    currentGroupRunLength++;
++                }
++                else {
++                    if (hasLastGroupColorAddress) {
++                        bool updatedExisting = false;
++                        for (auto &g : recentColorGroups) {
++                            if (g.address == lastGroupColorAddress) {
++                                g.runLength = currentGroupRunLength;
++                                updatedExisting = true;
++                                break;
++                            }
++                        }
++
++                        if (!updatedExisting) {
++                            recentColorGroups[recentColorGroupsNext] = { lastGroupColorAddress, currentGroupRunLength };
++                            recentColorGroupsNext = (recentColorGroupsNext + 1) % recentColorGroups.size();
++                        }
++                    }
++
++                    currentGroupRunLength = 1;
++                }
++
++                bool knownComposite = false;
++                for (const auto &g : recentColorGroups) {
++                    if ((g.address == thisWorkloadColorAddress) && (g.runLength >= 2)) {
++                        knownComposite = true;
++                        break;
++                    }
++                }
++
++                // Multi-layer screens are not interpolated, except while the 60Hz path is active (a match
++                // draws every frame as several layers).
++                bool multiLayerComposite = immediateRepeat || knownComposite;
++                if (RT64::wcwInterpActive.load(std::memory_order_relaxed)) {
++                    multiLayerComposite = false;
++                }
++
++                lastGroupColorAddress = thisWorkloadColorAddress;
++                hasLastGroupColorAddress = true;
++
+                 // FIXME: This is a very hacky way to find out if we need to advance the frame if the workload was paused for the first time.
+                 if (!workload.paused || (!gameFrames[curFrameIndex].workloads.empty() && (gameFrames[curFrameIndex].workloads[0] != (uint32_t)processCursor))) {
+                     prevFrameIndex = curFrameIndex;
+                     curFrameIndex = (curFrameIndex + 1) % gameFrames.size();
+                 }
++
++                // [wcw fix] Pair each layer with the same layer of the previous displayed frame, not with the
++                // previous layer of this one. For an N-layer frame that is N game frames back.
++                if (!immediateRepeat) {
++                    if (wcwCompositeRunLength > 0) {
++                        wcwLastCompositeRunLength = wcwCompositeRunLength;
++                        RT64::wcwLastRunLength.store(wcwCompositeRunLength, std::memory_order_relaxed);
++                        wcwRunLengthHistory[wcwRunLengthCursor] = wcwCompositeRunLength;
++                        wcwRunLengthCursor = (wcwRunLengthCursor + 1) % uint32_t(std::size(wcwRunLengthHistory));
++                    }
++
++                    wcwCompositeRunLength = 1;
++                    wcwRunGenIncomplete = false;
++                    wcwRunSerialCounter++;
++                }
++                else {
++                    wcwCompositeRunLength++;
++                }
++
++                workload.wcwRunSerial = wcwRunSerialCounter;
++                {
++                    const uint32_t step = (wcwLastCompositeRunLength > 0) ? wcwLastCompositeRunLength : 1;
++                    if (step < gameFrames.size()) {
++                        prevFrameIndex = (curFrameIndex + (uint32_t)gameFrames.size() - step) % (uint32_t)gameFrames.size();
++                    }
++                }
++
++                // [wcw fix] The fixed step lands on the wrong layer when run lengths vary, and the ring slot it
++                // points at may already be recycled. Layers are therefore snapshotted after rendering (see the
++                // end of this iteration), and paired with their snapshot from the previous run instead.
++                // The wrestler layer (80+ transforms) pairs with the latest wrestler snapshot, if it is intact,
++                // at most two presents old and of a similar size.
++                {
++                    const uint32_t curXf = uint32_t(workload.drawData.worldTransforms.size());
++                    if ((curXf >= 80) && (wcwSnapFrameIndex < gameFrames.size()) && (wcwSnapFrameIndex != curFrameIndex) &&
++                        RT64::wcwInterpActive.load(std::memory_order_relaxed)) {
++                        const GameFrame &snapFrame = gameFrames[wcwSnapFrameIndex];
++                        const bool intact = (snapFrame.workloads.size() == 1) && (snapFrame.workloads[0] == wcwSnapWorkloadIndex);
++                        const bool recent = (workload.presentId > wcwSnapPresentId) && ((workload.presentId - wcwSnapPresentId) <= 2);
++                        const uint32_t snapXf = intact ? uint32_t(workloads[wcwSnapWorkloadIndex].drawData.worldTransforms.size()) : 0;
++                        const bool sameLayer = (snapXf * 4 <= curXf * 5) && (curXf * 4 <= snapXf * 5);
++                        if (intact && recent && sameLayer) {
++                            prevFrameIndex = wcwSnapFrameIndex;
++                        }
++                    }
++                }
++
++                // Other layers pair with the previous run's snapshot of the closest transform count (run
++                // position breaks ties).
++                {
++                    const uint32_t curXf = uint32_t(workload.drawData.worldTransforms.size());
++                    if ((curXf >= 1) && (curXf < 80) && (workload.wcwRunSerial > 0) && RT64::wcwInterpActive.load(std::memory_order_relaxed)) {
++                        uint32_t best = UINT32_MAX, bestScore = UINT32_MAX;
++                        for (uint32_t k = 0; k < WCW_SNAPSHOT_SLOTS; k++) {
++                            const WcwLayerSnap &reg = wcwLayerSnaps[k];
++                            const uint32_t wi = WORKLOAD_QUEUE_SIZE + k;
++                            if ((reg.runSerial + 1 != workload.wcwRunSerial) || (reg.frameIndex >= gameFrames.size()) || (reg.frameIndex == curFrameIndex)) {
++                                continue;
++                            }
++
++                            const GameFrame &f = gameFrames[reg.frameIndex];
++                            if ((f.workloads.size() != 1) || (f.workloads[0] != wi) || (workloads[wi].wcwRunSerial != reg.runSerial)) {
++                                continue;
++                            }
++
++                            const uint32_t a = curXf, b = std::max(reg.xf, 1u);
++                            if ((a * 10 > b * 13) || (b * 10 > a * 13)) {
++                                continue;
++                            }
++
++                            const uint32_t posDiff = (reg.runPos > wcwCompositeRunLength) ? (reg.runPos - wcwCompositeRunLength) : (wcwCompositeRunLength - reg.runPos);
++                            const uint32_t score = ((a > b) ? (a - b) : (b - a)) * 4 + posDiff;
++                            if (score < bestScore) {
++                                bestScore = score;
++                                best = reg.frameIndex;
++                            }
++                        }
++
++                        if (best != UINT32_MAX) {
++                            prevFrameIndex = best;
++                        }
++                    }
++                }
+                 
+                 // TODO: The frame detection needs to be more elaborate than just matching one workload to one frame.
+                 GameFrame &curFrame = gameFrames[curFrameIndex];
+@@ -959,6 +1289,15 @@ namespace RT64 {
+                             continue;
+                         }
+ 
++                        // [wcw hfr] WCW_HFR_TARGETDRAWS=1: never pick a pair that only clears (fill rects) as the
++                        // interpolation target. Older AKI engines end a frame by pre-clearing the NEXT buffer, which
++                        // the scan above reaches first: every generated frame then re-renders only that clear (black).
++                        static const bool wcwHfrTargetDrawsEnv = getenv("WCW_HFR_TARGETDRAWS") != nullptr;
++                        const bool wcwHfrTargetDraws = wcwInterpolationProfile().skipClearOnlyTargets || wcwHfrTargetDrawsEnv;
++                        if (wcwHfrTargetDraws && (fbPair.fillRectOnly || (fbPair.gameCallCount == 0))) {
++                            continue;
++                        }
++
+                         Framebuffer *interpolationFb = fbManager.find(colorImg.address);
+                         if ((interpolationFb != nullptr) && interpolationFb->interpolationEnabled) {
+                             interpolationTargetKey.fbType = Framebuffer::Type::Color;
+@@ -970,6 +1309,43 @@ namespace RT64 {
+                     }
+                 }
+ 
++                // [wcw hfr] WCW_HFR_FBTRACE=<first present>,<count>: per workload, every framebuffer pair and the
++                // interpolation target the scan picked (present numbers as in wcw_present_lum.csv).
++                {
++                    static int wcwFbTraceFirst = -1, wcwFbTraceCount = 0;
++                    static bool wcwFbTraceInit = false;
++                    if (!wcwFbTraceInit) {
++                        wcwFbTraceInit = true;
++                        if (const char *e = getenv("WCW_HFR_FBTRACE")) {
++                            sscanf(e, "%d,%d", &wcwFbTraceFirst, &wcwFbTraceCount);
++                        }
++                    }
++
++                    const int n = int(wcwRtPresentCounter);
++                    if ((wcwFbTraceFirst >= 0) && (n >= wcwFbTraceFirst) && (n < wcwFbTraceFirst + wcwFbTraceCount)) {
++                        fprintf(stderr, "[wcw hfr fb] present %d workload %u run %llu pairs %u target 0x%X pair %d\n", n, processCursor,
++                            (unsigned long long)workload.wcwRunSerial, workload.fbPairCount, interpolationTargetKey.address, interpolationTargetFbPairIndex);
++                        for (uint32_t f = 0; f < workload.fbPairCount; f++) {
++                            const FramebufferPair &p = workload.fbPairs[f];
++                            fprintf(stderr, "[wcw hfr fb]   pair %u color 0x%X depth 0x%X calls %u fillOnly %d candidate %d drawRect %s projections %u\n", f,
++                                p.colorImage.address, p.depthImage.address, p.gameCallCount, int(p.fillRectOnly), int(p.earlyPresentCandidate()),
++                                p.drawColorRect.isEmpty() ? "empty" : "set", p.projectionCount);
++                        }
++                    }
++                }
++
++                // [wcw fix] A layer that draws nothing inherits the run's interpolation target.
++                {
++                    static RenderTargetKey wcwLastRunKey;
++                    if (!interpolationTargetKey.isEmpty()) {
++                        wcwLastRunKey = interpolationTargetKey;
++                    }
++                    else if (wcwDrawsNothing && !wcwLastRunKey.isEmpty() && (wcwLastRunKey.address == thisWorkloadColorAddress)) {
++                        interpolationTargetKey = wcwLastRunKey;
++                        interpolationTargetFbPairIndex = -1;
++                    }
++                }
++
+                 float prevFrameWeight = 0.0f;
+                 float curFrameWeight = 1.0f;
+                 float deltaTimeMs = 1.0f / 30.0f;
+@@ -985,8 +1361,57 @@ namespace RT64 {
+                     matchingProfiler.end();
                      matchingProfiler.log();
  
++                    // [wcw fix] A layer with no VI rate of its own belongs to the same tick as the rest of its
++                    // run: give it the last known rate rather than refusing it a generated frame.
++                    static uint32_t wcwLastGoodRate = 0;
++                    if (workload.viOriginalRate > 0) {
++                        wcwLastGoodRate = workload.viOriginalRate;
++                    }
++                    else if (RT64::wcwInterpActive.load(std::memory_order_relaxed) && (wcwLastGoodRate > 0)) {
++                        workload.viOriginalRate = wcwLastGoodRate;
++                    }
++
++                    // [wcw fix] After a hitch the VI rate estimate briefly reads the full display rate, which
++                    // would switch generation off. Hold the last rate below the target instead, for at most
++                    // 40 consecutive workloads.
++                    {
++                        static uint32_t wcwLastSubTargetRate = 0;
++                        static uint32_t wcwClampRun = 0;
++                        if (workloadConfig.targetRate > 0) {
++                            if ((workload.viOriginalRate > 0) && (workload.viOriginalRate < workloadConfig.targetRate)) {
++                                wcwLastSubTargetRate = workload.viOriginalRate;
++                                wcwClampRun = 0;
++                            }
++                            else if ((workload.viOriginalRate >= workloadConfig.targetRate) && (wcwLastSubTargetRate > 0) &&
++                                RT64::wcwInterpActive.load(std::memory_order_relaxed) && (wcwClampRun < 40)) {
++                                workload.viOriginalRate = wcwLastSubTargetRate;
++                                wcwClampRun++;
++                            }
++                        }
++                    }
++
++                    // [wcw fix] All layers of a run use the rate of its first layer, so they agree on how many frames
++                    // to generate and at which weights. A later layer's estimate can read double (e.g. 60 instead of
++                    // 30); at a 120Hz target that gave it 2 frames while the rest of the run drew 4, leaving the extra
++                    // generated frames with only some of the run's layers. (Gadge64, No Mercy 0.2.0.)
++                    {
++                        static uint32_t wcwRunRate = 0;
++                        if (RT64::wcwInterpActive.load(std::memory_order_relaxed) && (wcwCompositeRunLength > 1) && (wcwRunRate > 0)) {
++                            workload.viOriginalRate = wcwRunRate;
++                        }
++                        else {
++                            wcwRunRate = workload.viOriginalRate;
++                        }
++                    }
++
                      const bool displayRateAboveOriginal = (workload.viOriginalRate > 0) && (workloadConfig.targetRate > workload.viOriginalRate);
 -                    generateInterpolatedFrames = !workload.paused && displayRateAboveOriginal && !interpolationTargetKey.isEmpty();
 +                    // [wcw] DIAGNOSTIC: WCW_NO_INTERP=1 disables interpolated-frame generation, to
 +                    // test whether the black flicker frames are produced by the interpolation path.
 +                    static const bool wcwNoInterp = getenv("WCW_NO_INTERP") != nullptr;
-+                    generateInterpolatedFrames = !workload.paused && displayRateAboveOriginal && !interpolationTargetKey.isEmpty() && !wcwNoInterp;
++                    generateInterpolatedFrames = !workload.paused && displayRateAboveOriginal && !interpolationTargetKey.isEmpty() && !wcwNoInterp && !multiLayerComposite;
++
++                    // [wcw fix] Frame matching is running: enable the 60Hz behaviour elsewhere in the renderer.
++                    RT64::wcwInterpActive.store(true, std::memory_order_relaxed);
  
                      const bool resetTicks = !generateInterpolatedFrames || (originalRateForTicks != workload.viOriginalRate) || (displayRateForTicks != workloadConfig.targetRate) || !displayRateAboveOriginal;
                      if (resetTicks) {
+@@ -1004,10 +1429,22 @@ namespace RT64 {
+                     displayFrames = uint32_t((logicalTicks - displayTicks) / workload.viOriginalRate);
+                     deltaTimeMs = 1.0f / float(workloadConfig.targetRate);
+ 
+-                    if ((displayFrames > 1) && frameReduction) {
+-                        displayTicks += workload.viOriginalRate;
+-                        displayFrames--;
+-                        frameReduction = false;
++                    // [wcw fix] Cap the display frames per game frame at N = display rate / game rate (2 for a 30Hz
++                    // game at 60Hz, 4 at 120Hz): the tick accounting can otherwise creep ahead and leave the present
++                    // behind. WCW_HFR_CAP=<n> overrides N for debugging.
++                    static const uint32_t wcwHfrCapEnv = getenv("WCW_HFR_CAP") ? uint32_t(std::max(atoi(getenv("WCW_HFR_CAP")), 2)) : 0;
++                    const uint32_t wcwFramesPerGameFrame = (wcwHfrCapEnv > 0) ? wcwHfrCapEnv :
++                        std::max(2u, (workloadConfig.targetRate + workload.viOriginalRate / 2) / workload.viOriginalRate);
++                    if (displayFrames > wcwFramesPerGameFrame) {
++                        displayTicks += workload.viOriginalRate * (displayFrames - wcwFramesPerGameFrame);
++                        displayFrames = wcwFramesPerGameFrame;
++                    }
++
++                    // At rates that aren't a multiple of the game rate (e.g. 144 Hz) game frames alternate between
++                    // floor and floor+1 frames; only fewer than floor is incomplete.
++                    const uint32_t wcwMinFramesPerGameFrame = std::min(wcwFramesPerGameFrame, std::max(2u, workloadConfig.targetRate / workload.viOriginalRate));
++                    if (displayFrames < wcwMinFramesPerGameFrame) {
++                        wcwRunGenIncomplete = true;
+                     }
+ 
+                     assert((logicalTicks > displayTicks) && "Logical ticks must always remain bigger than the display ticks.");
+@@ -1022,16 +1459,48 @@ namespace RT64 {
+                 
+                 // Get the current and previous set of frame counters. The other set can be in use by the present queue. Skip if no new present event has arrived before this workload event.
+                 InterpolatedFrameCounters &prevFrameCounters = ext.sharedResources->interpolatedFrames[ext.sharedResources->interpolatedFramesIndex];
+-                const bool useDifferentCounters = (lastPresentId != workload.presentId);
++                // [wcw fix] A present event arriving in the middle of a run does not switch counter sets: the
++                // run finishes and publishes into the set it started in.
++                const bool wcwMidRunFlip = generateInterpolatedFrames && (wcwCompositeRunLength > 1) &&
++                    (lastPresentId != workload.presentId) && RT64::wcwInterpActive.load(std::memory_order_relaxed);
++                const bool useDifferentCounters = (lastPresentId != workload.presentId) && !wcwMidRunFlip;
++                // [wcw fix] A new run has started (or this workload won't generate), so the pending run is
++                // complete: publish its generated frame now.
++                if (wcwInterpFlushPending && (useDifferentCounters || !generateInterpolatedFrames)) {
++                    {
++                        std::scoped_lock<std::mutex> managerLock(ext.sharedResources->interpolatedMutex);
++                        InterpolatedFrameCounters &wcwFlushCounters = ext.sharedResources->interpolatedFrames[wcwInterpFlushIndex];
++                        wcwFlushCounters.available = std::max(wcwFlushCounters.available, wcwPendingFrames);
++                        RT64::wcwAddrSlotComplete[(wcwPendingRunAddr >> 10) & 3].store(wcwPendingRunSerial, std::memory_order_relaxed);
++                        RT64::wcwSlotRealComplete[wcwPendingRunSerial % 3].store(wcwPendingRunSerial, std::memory_order_relaxed);
++                    }
++
++                    ext.sharedResources->interpolatedCondition.notify_all();
++                    wcwInterpFlushPending = false;
++                }
++
+                 if (useDifferentCounters) {
+                     ext.sharedResources->interpolatedFramesIndex = ext.sharedResources->interpolatedFramesIndex ^ 1;
+                     lastPresentId = workload.presentId;
++
++                    // [wcw hfr] WCW_HFR_SYNC=1: the set switched to was last used two present events ago;
++                    // at 4 display frames per game frame its presentation can still be running. Wait
++                    // (bounded) until the present queue has shown everything it made available.
++                    static const bool wcwHfrSync = getenv("WCW_HFR_SYNC") != nullptr;
++                    if (wcwHfrSync && generateInterpolatedFrames) {
++                        InterpolatedFrameCounters &nextCounters = ext.sharedResources->interpolatedFrames[ext.sharedResources->interpolatedFramesIndex];
++                        std::unique_lock<std::mutex> interpolatedLock(ext.sharedResources->interpolatedMutex);
++                        ext.sharedResources->interpolatedCondition.wait_for(interpolatedLock, RT64::wcwCoherentWaitBound(), [&]() {
++                            return nextCounters.skipped || (nextCounters.presented >= nextCounters.available);
++                        });
++                    }
+                 }
+                 // If the same set of counters is used, we wait until the presentation of its targets is finished so the targets are available to use. Waiting is ignored
+                 // if the frame counter has never presented anything yet, as it'll only be a valid value if the previous present event actually did something.
+                 else if (generateInterpolatedFrames) {
++                    // [wcw fix] Bounded: with the deferred flip above, an unbounded wait here can deadlock.
+                     std::unique_lock<std::mutex> interpolatedLock(ext.sharedResources->interpolatedMutex);
+-                    ext.sharedResources->interpolatedCondition.wait(interpolatedLock, [&]() {
++                    ext.sharedResources->interpolatedCondition.wait_for(interpolatedLock, RT64::wcwCoherentWaitBound(), [&]() {
+                         return (prevFrameCounters.presented == 0) || (prevFrameCounters.presented >= prevFrameCounters.available);
+                     });
+                 }
+@@ -1043,7 +1512,11 @@ namespace RT64 {
+                 curFrameCounters.count = displayFrames;
+ 
+                 // Create as many render targets as required to store the interpolated targets.
+-                auto &interpolatedTargets = ext.sharedResources->interpolatedColorTargets;
++                // [wcw fix] Three target sets, chosen by run serial % 3: the real frame of a run stays intact
++                // until the present has shown it after that run's blend.
++                const uint32_t wcwPairSlot = uint32_t(workload.wcwRunSerial % 3);
++                auto &interpolatedTargets = (wcwPairSlot == 0) ? ext.sharedResources->interpolatedColorTargets
++                    : ((wcwPairSlot == 1) ? ext.sharedResources->wcwInterpolatedColorTargetsB : ext.sharedResources->wcwInterpolatedColorTargetsC);
+                 const bool usingMSAA = (ext.sharedResources->renderTargetManager.multisampling.sampleCount > 1);
+                 const bool usesHDR = ext.sharedResources->renderTargetManager.usesHDR;
+                 uint32_t requiredFrames = (usingMSAA && generateInterpolatedFrames) ? displayFrames : (displayFrames - 1);
+@@ -1061,18 +1534,30 @@ namespace RT64 {
+                 const int64_t maxTimePerFrameMicro = adjustedTimeWindowMicro / displayFrames;
+                 bool skippedFrames = false;
+                 bool skipWorkloadNow = false;
++                // [wcw hfr] The run's first layer primes this run's generated targets (see threadRenderFrame).
++                wcwPrimeTargets.clear();
++                if (generateInterpolatedFrames && !usingMSAA && (wcwCompositeRunLength == 1)) {
++                    for (uint32_t i = 0; (i + 1 < displayFrames) && (i < interpolatedTargets.size()); i++) {
++                        wcwPrimeTargets.push_back(interpolatedTargets[i].get());
++                    }
++                }
++
+                 uint32_t targetIndex = 0;
+                 uint32_t framesRendered = 0;
+                 int64_t renderTimeTotalMicro = 0;
+                 for (uint32_t frame = 0; (frame < displayFrames) && !skipWorkloadNow; frame++) {
+                     // Evaluate if this frame should be skipped. Measure the current time and compare it to what frame is estimated should be have been rendered by now.
+-                    if ((frame > 0) && (originalTimeMicro > 0)) {
++                    // [wcw hfr] WCW_HFR_NOSKIP=1: never skip. In a multi-layer run each layer renders its share of
++                    // every generated frame; a later layer skipping leaves those frames with only the earlier layers.
++                    static const bool wcwHfrNoSkip = getenv("WCW_HFR_NOSKIP") != nullptr;
++                    if ((frame > 0) && (originalTimeMicro > 0) && !wcwHfrNoSkip) {
+                         const int64_t currentTimeMicro = workloadTimer.elapsedMicroseconds() - setupTimeMicro;
+                         const int64_t expectedTimeMicro = frame * maxTimePerFrameMicro;
+                         const int64_t measuredFrameMicro = renderTimeTotalMicro / framesRendered;
+                         if ((currentTimeMicro > expectedTimeMicro) || ((currentTimeMicro + measuredFrameMicro) > adjustedTimeWindowMicro)) {
+                             displayTicks += workload.viOriginalRate;
+                             skippedFrames = true;
++                            wcwRunGenIncomplete = true;
+                             continue;
+                         }
+                     }
+@@ -1087,16 +1572,9 @@ namespace RT64 {
+                         // Override the render target.
+                         if (usingMSAA || (frame > 0)) {
+                             overrideTarget = interpolatedTargets[targetIndex].get();
+-                            overrideModifier = (targetIndex + 1);
+-
+-                            if (useDifferentCounters && (prevFrameCounters.available > 0) && (targetIndex < prevFrameCounters.available)) {
+-                                // Wait until the target has finished presenting if the alternate frame counter (used by the present queue) is making use of this target.
+-                                std::unique_lock<std::mutex> interpolatedLock(ext.sharedResources->interpolatedMutex);
+-                                ext.sharedResources->interpolatedCondition.wait(interpolatedLock, [&]() {
+-                                    frameReduction = frameReduction || (prevFrameCounters.presented <= targetIndex);
+-                                    return prevFrameCounters.presented > targetIndex;
+-                                });
+-                            }
++                            // [wcw fix] Each target set needs its own framebuffer-cache keys. No wait for the
++                            // present is needed: it reads a different set.
++                            overrideModifier = (targetIndex + 1) + 64 * wcwPairSlot;
+ 
+                             targetIndex++;
+                         }
+@@ -1120,6 +1598,19 @@ namespace RT64 {
+                     threadRenderFrame(curFrame, prevFrame, workloadConfig, workload.debuggerRenderer, workload.debuggerCamera, curFrameWeight, prevFrameWeight, deltaTimeMs,
+                         interpolationTargetKey, interpolationTargetFbPairIndex, overrideTarget, overrideModifier, velocityUploaderUsed, uploadExtras, tileInterpolationUsed, lookAtInterpolationUsed);
+ 
++                    // [wcw fix] Record which run each buffer now holds: the blend in the game framebuffer
++                    // (frame 0) and the real frame in this run's target set.
++                    if (generateInterpolatedFrames) {
++                        if (overrideTarget == nullptr) {
++                            const uint32_t sl = (interpolationTargetKey.address >> 10) & 3;
++                            RT64::wcwAddrSlotAddr[sl].store(interpolationTargetKey.address, std::memory_order_relaxed);
++                            RT64::wcwAddrSlotSerial[sl].store(workload.wcwRunSerial, std::memory_order_relaxed);
++                        }
++                        else {
++                            RT64::wcwSlotRealSerial[workload.wcwRunSerial % 3].store(workload.wcwRunSerial, std::memory_order_relaxed);
++                        }
++                    }
++
+                     // Add total time the frame took to render.
+                     renderTimeTotalMicro += workloadTimer.elapsedMicroseconds() - renderTimeMicro;
+ 
+@@ -1132,13 +1623,56 @@ namespace RT64 {
+                     if (generateInterpolatedFrames && (usingMSAA || (frame > 0))) {
+                         {
+                             std::scoped_lock<std::mutex> cursorLock(cursorMutex);
+-                            skipWorkloadNow = ((frame + 1) < displayFrames) && (writeCursor != threadCursor);
++                            // [wcw fix] Multi-layer frames: the next layer is always queued already, so this would stop every
++                            // layer but the last after its first generated frame (harmless at 2 frames per game frame, but at
++                            // 4 the remaining generated frames got only the last layer). Layers finish all their frames.
++                            skipWorkloadNow = ((frame + 1) < displayFrames) && (writeCursor != threadCursor) &&
++                                !RT64::wcwInterpActive.load(std::memory_order_relaxed);
++                        }
++
++                        // [wcw fix] Only the run's last layer publishes the generated frame, so the present
++                        // never shows a partly drawn one. The expected length is the longest recent run; a
++                        // run that ends shorter is published when the next run starts (see above). If any
++                        // layer of the run skipped its generated frame, drop the frame instead.
++                        uint32_t wcwExpectedRunLen = (wcwLastCompositeRunLength > 0) ? wcwLastCompositeRunLength : 1;
++                        bool wcwFlushNow = true;
++                        if (!usingMSAA) {
++                            for (uint32_t h : wcwRunLengthHistory) {
++                                wcwExpectedRunLen = std::max(wcwExpectedRunLen, h);
++                            }
++
++                            wcwFlushNow = (wcwCompositeRunLength >= wcwExpectedRunLen);
++                        }
++
++                        // A run where any layer skipped a generated frame publishes none of them: with more than one
++                        // generated frame per game frame, layers could otherwise disagree on which frames they drew.
++                        const bool wcwDropNow = wcwRunGenIncomplete;
++                        if (wcwDropNow) {
++                            wcwFlushNow = false;
++                        }
++
++                        if (wcwFlushNow) {
++                            RT64::wcwAddrSlotComplete[(interpolationTargetKey.address >> 10) & 3].store(workload.wcwRunSerial, std::memory_order_relaxed);
++                            RT64::wcwSlotRealComplete[workload.wcwRunSerial % 3].store(workload.wcwRunSerial, std::memory_order_relaxed);
+                         }
+ 
+                         {
+                             std::scoped_lock<std::mutex> managerLock(ext.sharedResources->interpolatedMutex);
+-                            curFrameCounters.skipped = skipWorkloadNow;
+-                            curFrameCounters.available++;
++                            curFrameCounters.skipped = skipWorkloadNow || wcwDropNow;
++                            if (wcwFlushNow) {
++                                curFrameCounters.available++;
++                            }
++                        }
++
++                        if (wcwFlushNow || wcwDropNow) {
++                            wcwInterpFlushPending = false;
++                        }
++                        else {
++                            wcwInterpFlushPending = true;
++                            wcwInterpFlushIndex = ext.sharedResources->interpolatedFramesIndex;
++                            wcwPendingRunSerial = workload.wcwRunSerial;
++                            wcwPendingRunAddr = interpolationTargetKey.address;
++                            wcwPendingFrames = usingMSAA ? (frame + 1) : frame;
+                         }
+ 
+                         // Add the amount of display ticks that correspond to the remaining frames.
+@@ -1162,6 +1696,64 @@ namespace RT64 {
+                     ext.sharedResources->interpolatedCondition.notify_all();
+                 }
+ 
++                // [wcw fix] Snapshot this layer (CPU-side data) into a slot past the ring that the producer never
++                // writes, and point its GameFrame at the copy, so it stays a valid predecessor for the next run
++                // after its ring slot is recycled. Consumers reach previous data through the GameFrame's workload
++                // indices; the copied submissionFrame keeps the staleness checks satisfied.
++                {
++                    const uint32_t src = uint32_t(processCursor);
++                    const size_t srcXf = (src < WORKLOAD_QUEUE_SIZE) ? workloads[src].drawData.worldTransforms.size() : 0;
++                    const bool isWrestlerLayer = (srcXf >= 80);
++                    if ((src < WORKLOAD_QUEUE_SIZE) && (curFrame.workloads.size() == 1) && (curFrame.workloads[0] == src) &&
++                        (srcXf >= 1) && RT64::wcwInterpActive.load(std::memory_order_relaxed)) {
++                        const uint32_t dstIndex = WORKLOAD_QUEUE_SIZE + (wcwSnapCounter++ % WCW_SNAPSHOT_SLOTS);
++                        const Workload &s = workloads[src];
++                        Workload &d = workloads[dstIndex];
++                        d.submissionFrame = s.submissionFrame;
++                        d.drawData = s.drawData;
++                        d.fbPairs = s.fbPairs;
++                        d.fbPairCount = s.fbPairCount;
++                        d.fbPairSubmitted = s.fbPairSubmitted;
++                        d.gameCallCount = s.gameCallCount;
++                        d.viOriginalRate = s.viOriginalRate;
++                        d.viFbSize = s.viFbSize;
++                        d.transformIdMap = s.transformIdMap;
++                        d.physicalAddressTransformMap = s.physicalAddressTransformMap;
++                        d.transformIgnoredIds = s.transformIgnoredIds;
++                        d.workloadId = s.workloadId;
++                        d.presentId = s.presentId;
++                        d.wcwRunSerial = s.wcwRunSerial;
++                        d.paused = false;
++                        d.extended = s.extended;
++
++                        curFrame.workloads[0] = dstIndex;
++                        if ((dstIndex < curFrame.frameMap.workloads.size()) && (src < curFrame.frameMap.workloads.size())) {
++                            curFrame.frameMap.workloads[dstIndex] = curFrame.frameMap.workloads[src];
++                        }
++
++                        for (std::vector<GameScene> *scenes : { &curFrame.perspectiveScenes, &curFrame.orthographicScenes }) {
++                            for (GameScene &scene : *scenes) {
++                                for (GameIndices::Projection &proj : scene.projections) {
++                                    if (proj.workloadIndex == src) {
++                                        proj.workloadIndex = dstIndex;
++                                    }
++                                }
++                            }
++                        }
++
++                        WcwLayerSnap &reg = wcwLayerSnaps[dstIndex - WORKLOAD_QUEUE_SIZE];
++                        reg.frameIndex = curFrameIndex;
++                        reg.runSerial = s.wcwRunSerial;
++                        reg.runPos = wcwCompositeRunLength;
++                        reg.xf = uint32_t(srcXf);
++                        if (isWrestlerLayer) {
++                            wcwSnapFrameIndex = curFrameIndex;
++                            wcwSnapWorkloadIndex = dstIndex;
++                            wcwSnapPresentId = s.presentId;
++                        }
++                    }
++                }
++
+                 threadConfigurationValidate();
+ 
+                 if (!workload.paused) {
+diff --git a/src/hle/rt64_workload_queue.h b/src/hle/rt64_workload_queue.h
+index bde2f03..baf269d 100644
+--- a/src/hle/rt64_workload_queue.h
++++ b/src/hle/rt64_workload_queue.h
+@@ -23,7 +23,11 @@
+ #   include "render/rt64_raytracing_shader_cache.h"
+ #endif
+ 
+-#define WORKLOAD_QUEUE_SIZE 4
++// [wcw fix] Grown from 4 (keep in step with PRESENT_QUEUE_SIZE).
++#define WORKLOAD_QUEUE_SIZE 8
++// [wcw fix] Workload slots after the ring, never written by the producer: snapshots of recent layers so the
++// next frame can still pair with them after their ring slot is recycled.
++#define WCW_SNAPSHOT_SLOTS 16
+ 
+ namespace RT64 {
+     struct PresentQueue;
+@@ -61,7 +65,21 @@ namespace RT64 {
+         };
+ 
+         External ext;
+-        std::array<Workload, WORKLOAD_QUEUE_SIZE> workloads;
++        std::array<Workload, WORKLOAD_QUEUE_SIZE + WCW_SNAPSHOT_SLOTS> workloads;
++        // [wcw fix] Latest wrestler-layer snapshot: its GameFrame, workload slot and present.
++        uint32_t wcwSnapFrameIndex = UINT32_MAX;
++        uint32_t wcwSnapWorkloadIndex = UINT32_MAX;
++        uint64_t wcwSnapPresentId = 0;
++        // [wcw fix] One entry per snapshot slot: the GameFrame that points at it, the run it came from, its
++        // position in that run and its transform count.
++        struct WcwLayerSnap {
++            uint32_t frameIndex = UINT32_MAX;
++            uint64_t runSerial = 0;
++            uint32_t runPos = 0;
++            uint32_t xf = 0;
++        };
++        WcwLayerSnap wcwLayerSnaps[WCW_SNAPSHOT_SLOTS];
++        uint32_t wcwSnapCounter = 0;
+         int threadCursor;
+         int writeCursor;
+         int barrierCursor;
+@@ -97,10 +115,21 @@ namespace RT64 {
+         ProfilingTimer rendererGPUProfiler = ProfilingTimer(120);
+         ProfilingTimer matchingProfiler = ProfilingTimer(120);
+         ProfilingTimer workloadProfiler = ProfilingTimer(120);
+-        std::array<GameFrame, 2> gameFrames;
++        // [wcw fix] Grown from 2: a layer is paired with the same layer one displayed frame (several
++        // GameFrames) back.
++        std::array<GameFrame, 16> gameFrames;
+         uint32_t prevFrameIndex = uint32_t(gameFrames.size()) - 1;
+         uint32_t curFrameIndex = 0;
+ 
++        // [wcw fix] Multi-layer frame detection: AKI games compose one displayed frame from several consecutive
++        // workloads targeting the same colour address. Remembers, per address, how long its last run was.
++        uint32_t lastGroupColorAddress = 0;
++        bool hasLastGroupColorAddress = false;
++        uint32_t currentGroupRunLength = 0;
++        struct RecentColorGroup { uint32_t address = 0; uint32_t runLength = 0; };
++        std::array<RecentColorGroup, 8> recentColorGroups{};
++        size_t recentColorGroupsNext = 0;
++
+         WorkloadQueue();
+         ~WorkloadQueue();
+         void reset();
 diff --git a/src/render/rt64_crt_filter.cpp b/src/render/rt64_crt_filter.cpp
 new file mode 100644
-index 0000000..139a48c
+index 0000000..62cc362
 --- /dev/null
 +++ b/src/render/rt64_crt_filter.cpp
-@@ -0,0 +1,828 @@
+@@ -0,0 +1,849 @@
 +//
 +// RT64
 +//
@@ -13871,8 +15731,11 @@ index 0000000..139a48c
 +        uint32_t displayRefreshRate = 0;
 +        bool displayVsync = false;
 +        bool displayInterpolating = false;
++        uint32_t displayContentRate = 0;
 +        // Display refreshes per simulated CRT refresh (e.g. 2.75 at 165 Hz), 0 when unavailable.
 +        double beamRatio = 0.0;
++        double beamCrtRate = BeamCrtRate;
++        bool beamStateLogged = false;
 +        std::string beamUnavailableReason;
 +
 +        ~Impl() {
@@ -14160,12 +16023,17 @@ index 0000000..139a48c
 +        // Display refreshes per simulated CRT refresh, or 0 when the display can't run the beam simulator.
 +        double computeBeamRatio() {
 +            std::string reason;
-+            double ratio = double(displayRefreshRate) / BeamCrtRate;
++            // [wcw hfr] With frame interpolation above 60 fps (e.g. 120), the simulated CRT refreshes at that
++            // rate when the display has at least two refreshes per frame, so every interpolated frame gets a
++            // scan of its own. Otherwise it stays at 60 Hz and each scan shows the latest frame.
++            double crtRate = BeamCrtRate;
++            if (displayInterpolating && (double(displayContentRate) > BeamCrtRate) && ((double(displayRefreshRate) / double(displayContentRate)) >= 1.95)) {
++                crtRate = double(displayContentRate);
++            }
++
++            double ratio = double(displayRefreshRate) / crtRate;
 +            if (!displayVsync) {
 +                reason = "it needs V-Sync";
-+            }
-+            else if (displayInterpolating) {
-+                reason = "it doesn't work with frame interpolation (set the framerate to Original)";
 +            }
 +            else if (ratio < 1.95) {
 +                reason = "the display refresh rate (" + std::to_string(displayRefreshRate) + " Hz) must be 120 Hz or higher";
@@ -14175,15 +16043,18 @@ index 0000000..139a48c
 +                ratio = 0.0;
 +            }
 +
-+            if (reason != beamUnavailableReason) {
++            if (!beamStateLogged || (reason != beamUnavailableReason) || (crtRate != beamCrtRate)) {
 +                if (!reason.empty()) {
 +                    fprintf(stderr, "[wcw crt] Beam simulator inactive: %s.\n", reason.c_str());
 +                }
 +                else {
-+                    fprintf(stderr, "[wcw crt] Beam simulator active: %u Hz display, %.3f refreshes per 60 Hz CRT refresh.\n", displayRefreshRate, ratio);
++                    fprintf(stderr, "[wcw crt] Beam simulator active: %u Hz display, %.3f refreshes per %.0f Hz CRT refresh%s.\n", displayRefreshRate, ratio, crtRate,
++                        displayInterpolating ? " (frame interpolation)" : "");
 +                }
 +
 +                beamUnavailableReason = reason;
++                beamCrtRate = crtRate;
++                beamStateLogged = true;
 +            }
 +
 +            return ratio;
@@ -14362,10 +16233,11 @@ index 0000000..139a48c
 +        return impl->guestActive();
 +    }
 +
-+    void CrtFilter::setDisplayConditions(uint32_t refreshRate, bool vsyncEnabled, bool interpolating) {
++    void CrtFilter::setDisplayConditions(uint32_t refreshRate, bool vsyncEnabled, bool interpolating, uint32_t contentRate) {
 +        impl->displayRefreshRate = refreshRate;
 +        impl->displayVsync = vsyncEnabled;
 +        impl->displayInterpolating = interpolating;
++        impl->displayContentRate = contentRate;
 +    }
 +
 +    bool CrtFilter::beamActive() {
@@ -14462,6 +16334,15 @@ index 0000000..139a48c
 +        return true;
 +    }
 +
++    bool CrtFilter::hasBeamFrame(uint32_t windowWidth, uint32_t windowHeight) {
++        if (!beamActive() || !impl->haveFrontFrame) {
++            return false;
++        }
++
++        const CrtTarget &front = impl->guestTargets[impl->frontTarget];
++        return (front.width == windowWidth) && (front.height == windowHeight);
++    }
++
 +    void CrtFilter::skipBeamRefreshes(uint32_t count) {
 +        impl->refreshCounter += count;
 +    }
@@ -14481,10 +16362,10 @@ index 0000000..139a48c
 +};
 diff --git a/src/render/rt64_crt_filter.h b/src/render/rt64_crt_filter.h
 new file mode 100644
-index 0000000..b08a621
+index 0000000..9f63d18
 --- /dev/null
 +++ b/src/render/rt64_crt_filter.h
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,94 @@
 +//
 +// RT64
 +//
@@ -14550,8 +16431,10 @@ index 0000000..b08a621
 +        bool active();
 +
 +        // Display conditions the beam simulator depends on, updated by the present queue before
-+        // each present: it needs vsync, an integer multiple (2x+) of 60 Hz and no frame interpolation.
-+        void setDisplayConditions(uint32_t refreshRate, bool vsyncEnabled, bool interpolating);
++        // each present: it needs vsync and a display of at least twice the simulated CRT's rate. The
++        // CRT runs at 60 Hz, or at the interpolated framerate (contentRate, e.g. 120) when the display
++        // is fast enough for that, so interpolated frames each get a scan of their own.
++        void setDisplayConditions(uint32_t refreshRate, bool vsyncEnabled, bool interpolating, uint32_t contentRate);
 +
 +        // True when the beam simulator is running, so the present queue should present a sub-frame
 +        // every display refresh (renderBeamSubframe) instead of waiting for the game's next frame.
@@ -14564,6 +16447,9 @@ index 0000000..b08a621
 +        // Draws the next beam simulator sub-frame of the last frame into the swap chain. Returns
 +        // false (having recorded nothing) when there is nothing to present.
 +        bool renderBeamSubframe(RenderWorker *presentWorker, RenderTexture *swapChainTexture, const RenderFramebuffer *swapChainFramebuffer, uint32_t windowWidth, uint32_t windowHeight);
++
++        // True when renderBeamSubframe has a frame to draw at this window size.
++        bool hasBeamFrame(uint32_t windowWidth, uint32_t windowHeight);
 +
 +        // Display refreshes that went by without a beam sub-frame (a present that missed its vblank);
 +        // keeps the simulated scan in phase with the display.
@@ -15426,6 +17312,129 @@ index 641f3ec..b19f5b0 100644
  
          ShaderLibrary(bool usesHDR, bool usesHardwareResolve);
          ~ShaderLibrary();
+diff --git a/src/render/rt64_transform_processor.cpp b/src/render/rt64_transform_processor.cpp
+index cd8004d..5e165cf 100644
+--- a/src/render/rt64_transform_processor.cpp
++++ b/src/render/rt64_transform_processor.cpp
+@@ -4,6 +4,9 @@
+ 
+ #include "rt64_transform_processor.h"
+ 
++#include <cfloat>
++#include <cmath>
++
+ #include "common/rt64_math.h"
+ #include "hle/rt64_game_frame.h"
+ #include "hle/rt64_workload_queue.h"
+@@ -37,13 +40,106 @@ namespace RT64 {
+             if (prevFrameValid) {
+                 const GameFrameMap::WorkloadMap &workloadMap = p.curFrame->frameMap.workloads[w];
+                 const DrawData &prevDrawData = p.workloadQueue->workloads[workloadMap.prevWorkloadIndex].drawData;
++                const bool inMatch = wcwInterpActive.load(std::memory_order_relaxed);
+                 for (size_t t = 0; t < drawData.worldTransforms.size(); t++) {
+                     const GameFrameMap::TransformMap &transformMap = workloadMap.transforms[t];
+                     if (transformMap.mapped) {
+-                        const hlslpp::float4x4 &prevTransform = prevDrawData.worldTransforms[workloadMap.transforms[t].prevTransformIndex];
+-                        const hlslpp::float4x4 &curTransform = drawData.worldTransforms[t];
++                        // [wcw fix] Transforms paired from their camera-independent matrices (usedPureMatrix)
++                        // interpolate those, then get the camera put back below.
++                        const bool usedPure = transformMap.usedPureMatrix;
++                        const hlslpp::float4x4 &prevTransform = usedPure
++                            ? prevDrawData.worldTransformsPure[transformMap.prevTransformIndex]
++                            : prevDrawData.worldTransforms[transformMap.prevTransformIndex];
++                        const hlslpp::float4x4 &curTransform = usedPure ? drawData.worldTransformsPure[t] : drawData.worldTransforms[t];
++
+                         prevMatrix = transformMap.rigidBody.lerp(p.prevFrameWeight, prevTransform, curTransform, true);
+                         curMatrix = transformMap.rigidBody.lerp(p.curFrameWeight, prevTransform, curTransform, true);
++
++                        if (usedPure) {
++                            // [wcw fix] Put the camera back. In a match the camera is interpolated too
++                            // (componentwise, per transform), so interpolated objects and the scene around
++                            // them are viewed from the same in-between camera during pans.
++                            const hlslpp::float4x4 &camera = drawData.worldTransformsCamera[t];
++                            const uint32_t prevIdx = transformMap.prevTransformIndex;
++                            if (inMatch && (prevIdx < prevDrawData.worldTransformsCamera.size())) {
++                                const hlslpp::float4x4 prevCamera(prevDrawData.worldTransformsCamera[prevIdx]);
++                                auto lerpCamera = [](const hlslpp::float4x4 &x, const hlslpp::float4x4 &y, float weight) {
++                                    hlslpp::float4x4 r;
++                                    for (int i = 0; i < 4; i++) {
++                                        r[i] = hlslpp::lerp(x[i], y[i], hlslpp::float4(weight));
++                                    }
++                                    return r;
++                                };
++
++                                prevMatrix = hlslpp::mul(prevMatrix, lerpCamera(prevCamera, camera, p.prevFrameWeight));
++                                curMatrix = hlslpp::mul(curMatrix, lerpCamera(prevCamera, camera, p.curFrameWeight));
++                            }
++                            else {
++                                prevMatrix = hlslpp::mul(prevMatrix, camera);
++                                curMatrix = hlslpp::mul(curMatrix, camera);
++                            }
++
++                            // [wcw fix] pure * camera is the raw uploaded MVP, but unmatched draws render with
++                            // worldTransforms[t] (MVP * inv(viewProj) * extended viewProj). Apply the same
++                            // correction K = inv(pure * camera) * worldTransforms[t] so both kinds of draw are in
++                            // the same space; at weight 1.0 this gives exactly worldTransforms[t].
++                            const hlslpp::float4x4 mvpRef = hlslpp::mul(drawData.worldTransformsPure[t], camera);
++                            const hlslpp::float4x4 kMat = hlslpp::mul(hlslpp::inverse(mvpRef), drawData.worldTransforms[t]);
++                            const hlslpp::float4x4 curFixed = hlslpp::mul(curMatrix, kMat);
++                            const hlslpp::float4x4 prevFixed = hlslpp::mul(prevMatrix, kMat);
++                            float ck[16], pk[16];
++                            hlslpp::store(curFixed, ck);
++                            hlslpp::store(prevFixed, pk);
++                            bool finite = true;
++                            for (int k = 0; k < 16; k++) {
++                                if (!std::isfinite(ck[k]) || !std::isfinite(pk[k])) {
++                                    finite = false;
++                                    break;
++                                }
++                            }
++
++                            if (finite) {
++                                curMatrix = curFixed;
++                                prevMatrix = prevFixed;
++                            }
++                        }
++
++                        // [wcw fix] Pairs flagged by GameFrame::matchTransform (implausible swing of the
++                        // camera-independent pair) blend the drawn matrices componentwise instead.
++                        if (transformMap.wcwCombinedLerp) {
++                            const uint32_t prevIdx = transformMap.prevTransformIndex;
++                            if (prevIdx < prevDrawData.worldTransforms.size()) {
++                                const hlslpp::float4x4 prevWorld(prevDrawData.worldTransforms[prevIdx]);
++                                const hlslpp::float4x4 curWorld(drawData.worldTransforms[t]);
++                                for (int i = 0; i < 4; i++) {
++                                    prevMatrix[i] = hlslpp::lerp(prevWorld[i], curWorld[i], hlslpp::float4(p.prevFrameWeight));
++                                    curMatrix[i] = hlslpp::lerp(prevWorld[i], curWorld[i], hlslpp::float4(p.curFrameWeight));
++                                }
++                            }
++                        }
++
++                        // [wcw fix] In a match, an interpolated matrix whose magnitude differs from the real
++                        // current matrix by more than 2x is wrong (unstable decompositions, e.g. edge-on
++                        // billboards at low camera angles): render that draw at the current frame instead.
++                        if (inMatch) {
++                            auto matrixNorm = [](const hlslpp::float4x4 &m) {
++                                float acc = 0.0f;
++                                for (int i = 0; i < 3; i++) {
++                                    acc += float(hlslpp::dot(m[i].xyz, m[i].xyz));
++                                }
++                                return sqrtf(acc);
++                            };
++
++                            const float refNorm = matrixNorm(drawData.worldTransforms[t]);
++                            const float lerpNorm = matrixNorm(curMatrix);
++                            const bool degenerate = !std::isfinite(lerpNorm) || (lerpNorm < 1e-6f) || (refNorm < 1e-6f);
++                            const float ratio = degenerate ? FLT_MAX : ((lerpNorm > refNorm) ? (lerpNorm / refNorm) : (refNorm / lerpNorm));
++                            if (degenerate || (ratio > 2.0f)) {
++                                curMatrix = drawData.worldTransforms[t];
++                                prevMatrix = drawData.worldTransforms[t];
++                            }
++                        }
++
+                         invMatrix = hlslpp::inverse(curMatrix);
+                         invTMatrix = hlslpp::transpose(invMatrix);
+                         lerpWorldTransforms.emplace_back(curMatrix);
 diff --git a/src/render/rt64_vi_renderer.cpp b/src/render/rt64_vi_renderer.cpp
 index b4ff4e9..d2b0115 100644
 --- a/src/render/rt64_vi_renderer.cpp
@@ -15573,10 +17582,10 @@ index 8a3782a..0789a75 100644
 \ No newline at end of file
 diff --git a/src/render/rt64_wcw_raytracer.cpp b/src/render/rt64_wcw_raytracer.cpp
 new file mode 100644
-index 0000000..b3bbb90
+index 0000000..c2043b9
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.cpp
-@@ -0,0 +1,1138 @@
+@@ -0,0 +1,1139 @@
 +//
 +// RT64
 +//
@@ -16246,6 +18255,7 @@ index 0000000..b3bbb90
 +
 +        slot.valid = true;
 +        slot.builtWorkload = workloadCounter;
++        slot.builtFrame = frameCounter;
 +        slot.meshCount = uint32_t(meshes.size());
 +        for (uint32_t i = 0; i < 3; i++) {
 +            slot.boundsMin[i] = worldMin[i];
@@ -16267,12 +18277,12 @@ index 0000000..b3bbb90
 +
 +        // Top level: this workload's geometry (mask 0x1: primary and shadow rays) plus the other
 +        // scenes built recently (mask 0x2: shadow rays only). Scenes the game stopped drawing
-+        // age out after a few workloads.
++        // age out after a few game frames.
 +        instances.clear();
 +        instances.emplace_back(RenderBufferReference(slot.blasBuffer.get()), 0, 0x1, 0, true, RenderAffineTransform());
 +        for (uint32_t s = 0; s < MaxSlots; s++) {
 +            const Slot &other = slots[s];
-+            if ((s != currentSlot) && other.valid && ((workloadCounter - other.builtWorkload) <= StaleWorkloads)) {
++            if ((s != currentSlot) && other.valid && ((frameCounter - other.builtFrame) <= StaleFrames)) {
 +                instances.emplace_back(RenderBufferReference(other.blasBuffer.get()), s + 1, 0x2, 0, true, RenderAffineTransform());
 +            }
 +        }
@@ -16717,10 +18727,10 @@ index 0000000..b3bbb90
 +};
 diff --git a/src/render/rt64_wcw_raytracer.h b/src/render/rt64_wcw_raytracer.h
 new file mode 100644
-index 0000000..a44a76d
+index 0000000..4f6815e
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.h
-@@ -0,0 +1,281 @@
+@@ -0,0 +1,285 @@
 +//
 +// RT64
 +//
@@ -16803,12 +18813,16 @@ index 0000000..a44a76d
 +        // bounds), not the workload's position within the present: the game's workload cycle
 +        // drifts against presents, so positions would swap scenes from frame to frame.
 +        static const uint32_t MaxSlots = 8;
-+        static const uint32_t StaleWorkloads = 8;
++        // Other scenes stay shadow casters for this many game frames after their last build. Counted in game
++        // frames, not workloads: frame interpolation renders every workload once per displayed frame (4 times
++        // per game frame at 120 Hz), which aged the wrestlers' scene out before the floor's pass used it.
++        static const uint64_t StaleFrames = 2;
 +        struct Slot {
 +            std::unique_ptr<RenderBuffer> blasBuffer;
 +            std::unique_ptr<RenderAccelerationStructure> blas;
 +            uint64_t blasBufferSize = 0;
 +            uint64_t builtWorkload = 0;
++            uint64_t builtFrame = 0;
 +            uint32_t meshCount = 0;
 +            float boundsMin[3] = {};
 +            float boundsMax[3] = {};
