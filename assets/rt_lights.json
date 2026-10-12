@@ -62,9 +62,20 @@
             "glows": [[0, 30, -650, 2.4, 650, 0.25, 0.5, 1.0], [0, 30, 650, 2.4, 650, 0.25, 0.5, 1.0], [-650, 30, 0, 2.4, 650, 0.25, 0.5, 1.0], [650, 30, 0, 2.4, 650, 0.25, 0.5, 1.0]]
         },
         {
+            // DOA: banks of yellow-white floodlights on poles behind the stands. Key over the ring plus four floods far out on
+            // the diagonals (long crossing shadows), warm white; blue floor panels as in the NWO arena.
             "name": "DOA",
             "match": ["78FF8215FED473DB", "4C85728B4238FC56", "159DFCA85E557F60", "B47DE1D6FE2B59A6", "B14094613036B623",
-                      "09D265B64F0DAF7A", "302E6470257ADC6A"]
+                      "09D265B64F0DAF7A", "302E6470257ADC6A"],
+            "lights": [[0, 1000, 0, 2], [-1400, 1100, -1400, 1], [1400, 1100, -1400, 1], [-1400, 1100, 1400, 1], [1400, 1100, 1400, 1]],
+            "size": 50,
+            "radius": 700,
+            "shadow": 0.7,
+            "characterShadow": 0.45,
+            "color": [1.0, 0.95, 0.82],
+            "outsideDarkness": 0.55,
+            "outsideEdge": 500,
+            "glows": [[0, 30, -650, 2.0, 650, 0.25, 0.5, 1.0], [0, 30, 650, 2.0, 650, 0.25, 0.5, 1.0], [-650, 30, 0, 2.0, 650, 0.25, 0.5, 1.0], [650, 30, 0, 2.0, 650, 0.25, 0.5, 1.0]]
         },
         {
             "name": "IU",
