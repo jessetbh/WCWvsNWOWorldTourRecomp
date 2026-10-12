@@ -78,9 +78,20 @@
             "glows": [[0, 30, -650, 2.0, 650, 0.25, 0.5, 1.0], [0, 30, 650, 2.0, 650, 0.25, 0.5, 1.0], [-650, 30, 0, 2.0, 650, 0.25, 0.5, 1.0], [650, 30, 0, 2.0, 650, 0.25, 0.5, 1.0]]
         },
         {
+            // IU: an independent show in a gym hall (wooden floor, white walls and windows). Warm tungsten lamps under the
+            // roof, harder shadows, little darkening; a warm bounce off the wood floor.
             "name": "IU",
             "match": ["F561FA5B69F1CB70", "CC1DF54A60801605", "191CB27827603AE0", "34BA8B15CA77BCCD", "8300B7D7C32B7554",
-                      "0346E91A78359360", "F24D8943D4A2F19F", "312A296B5B903392"]
+                      "0346E91A78359360", "F24D8943D4A2F19F", "312A296B5B903392"],
+            "lights": [[0, 800, 0, 3], [-450, 760, -450, 1], [450, 760, -450, 1], [-450, 760, 450, 1], [450, 760, 450, 1]],
+            "size": 25,
+            "radius": 700,
+            "shadow": 0.75,
+            "characterShadow": 0.45,
+            "color": [1.0, 0.88, 0.7],
+            "outsideDarkness": 0.35,
+            "outsideEdge": 600,
+            "glows": [[0, 60, -600, 1.2, 700, 1.0, 0.7, 0.4], [0, 60, 600, 1.2, 700, 1.0, 0.7, 0.4]]
         }
     ]
 }
