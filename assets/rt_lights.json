@@ -29,10 +29,21 @@
     },
     "venues": [
         {
+            // WCW: the TV arena with white light panels on the floor around the ring. Cool white key + four corner lamps over
+            // the ring; cool blue glows from the floor panels on all four sides.
             "name": "WCW",
             "match": ["B0F488D3C7001C37", "02FF175E934A2EBB", "F73AD35FCE2BA15B", "81F0C23F6CF07246", "7BB97210B32D76CA",
                       "B59538F04EAB076C", "F091AC8B2532DD7D", "9100C3E097C88D9C", "C473598BC55C19A3", "10CD9E6B107084CB",
-                      "449F5C44B0EA0479", "2CAD14E6B18B7BCD"]
+                      "449F5C44B0EA0479", "2CAD14E6B18B7BCD"],
+            "lights": [[0, 1000, 0, 3], [-380, 950, -380, 1], [380, 950, -380, 1], [-380, 950, 380, 1], [380, 950, 380, 1]],
+            "size": 30,
+            "radius": 650,
+            "shadow": 0.65,
+            "characterShadow": 0.4,
+            "color": [0.92, 0.95, 1.0],
+            "outsideDarkness": 0.5,
+            "outsideEdge": 500,
+            "glows": [[0, 40, -700, 1.6, 700, 0.6, 0.8, 1.0], [0, 40, 700, 1.6, 700, 0.6, 0.8, 1.0], [-700, 40, 0, 1.6, 700, 0.6, 0.8, 1.0], [700, 40, 0, 1.6, 700, 0.6, 0.8, 1.0]]
         },
         {
             "name": "NWO",
