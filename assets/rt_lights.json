@@ -1,0 +1,53 @@
+{
+    // Ray tracing light presets (read by RT64's WcwRaytracer; reloaded when this file changes).
+    // "default" applies to any venue not matched below. A venue is recognized by its "match" list of world texture
+    // hashes (WCW_RT_VENUE_LOG=1 prints the current scene's candidates; the Lighting editor's "New venue from scene"
+    // writes one).
+    // Fields: center [x, y, z] (receiver center on X/Z, key light height on Y), spread, fills, keyWeight, size (light
+    // panel width), radius (shadow receiver radius), shadow, characterShadow, clearance, falloff, anchor ("scene":
+    // offsets from the drawn scene's center and floor), or "lights": [[x, y, z, weight], ...] to place up to 8 lights
+    // explicitly (these cast the shadows).
+    // Colored light: "color" [r, g, b] tints every light (white = none; normalized, so brightness stays the same),
+    // "keyColor" / "fillColor" for the generated rig, [x, y, z, weight, r, g, b] for one light.
+    // Glows: [[x, y, z, intensity, range(, r, g, b(, flicker))], ...] (up to 4) add light in all directions, also
+    // outside the radius; they light traced geometry (floor, ramp, sets), never crowd sprites or screens. The color is
+    // not normalized (it scales the glow); flicker 0..1 = a failing tube that blinks off now and then.
+    // "outsideDarkness" (0..1) darkens everything beyond the receiver radius (crowd, arena, wrestlers out there), easing
+    // in over "outsideEdge"; "litAreas" [[x, z, radius, edge], ...] (up to 2) are places with their own light that stay
+    // out of that darkness.
+    //
+    // WCW vs. nWo World Tour (rigged 2026-10-12 with the AkiMods quickmatch mod + free camera): one arena in four
+    // federation themes (the rules screen's "Arena": WCW, NWO, DOA, IU). "WCW" lists the textures all four share, so it
+    // must stay FIRST: in the other themes it also matches fully and the later (themed) venue wins the tie.
+    "default": {
+        "center": [0, 650, 0],
+        "lights": [[0, 650, 0, 2], [-320, 600, -320, 1], [320, 600, -320, 1], [-320, 600, 320, 1], [320, 600, 320, 1]],
+        "size": 20,
+        "radius": 650,
+        "shadow": 0.6,
+        "characterShadow": 0.35
+    },
+    "venues": [
+        {
+            "name": "WCW",
+            "match": ["B0F488D3C7001C37", "02FF175E934A2EBB", "F73AD35FCE2BA15B", "81F0C23F6CF07246", "7BB97210B32D76CA",
+                      "B59538F04EAB076C", "F091AC8B2532DD7D", "9100C3E097C88D9C", "C473598BC55C19A3", "10CD9E6B107084CB",
+                      "449F5C44B0EA0479", "2CAD14E6B18B7BCD"]
+        },
+        {
+            "name": "NWO",
+            "match": ["356AF0D30845FC05", "2A42C749E9609C97", "9ED3033115BE5013", "082EB9BE5B402C47", "2A89BB376FDF64EA",
+                      "353AE49508C77572"]
+        },
+        {
+            "name": "DOA",
+            "match": ["78FF8215FED473DB", "4C85728B4238FC56", "159DFCA85E557F60", "B47DE1D6FE2B59A6", "B14094613036B623",
+                      "09D265B64F0DAF7A", "302E6470257ADC6A"]
+        },
+        {
+            "name": "IU",
+            "match": ["F561FA5B69F1CB70", "CC1DF54A60801605", "191CB27827603AE0", "34BA8B15CA77BCCD", "8300B7D7C32B7554",
+                      "0346E91A78359360", "F24D8943D4A2F19F", "312A296B5B903392"]
+        }
+    ]
+}
