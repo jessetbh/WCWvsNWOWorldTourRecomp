@@ -130,8 +130,10 @@ jobs:
           Copy-Item "$($crt.FullName)\msvcp140.dll", "$($crt.FullName)\vcruntime140.dll", "$($crt.FullName)\vcruntime140_1.dll", "$($crt.FullName)\msvcp140_atomic_wait.dll" package/
       - name: Assert no stray files in package
         run: |
-          $stray = Get-ChildItem -Recurse package -Include *.z64,*.n64,*.v64,*.json,*.json.bak,*.map,*.pdb,*.log
-          $stray += Get-ChildItem -Recurse -Directory package -Filter saves
+          # assets/rt_lights.json is the ray tracing venue light presets: shipped on purpose, not a stray config.
+          $stray = @(Get-ChildItem -Recurse package -Include *.z64,*.n64,*.v64,*.json,*.json.bak,*.map,*.pdb,*.log |
+            Where-Object { $_.FullName -notlike '*\package\assets\rt_lights.json' })
+          $stray += @(Get-ChildItem -Recurse -Directory package -Filter saves)
           if ($stray) { $stray | ForEach-Object { Write-Host "STRAY: $($_.FullName)" }; exit 1 }
           Write-Host "package is clean"
       - name: Archive WCWRecompiled
