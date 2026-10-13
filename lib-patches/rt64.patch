@@ -16272,7 +16272,7 @@ index 8ea27d5..b270866 100644
  
          struct {
 diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
-index 5a331aa..89cfa53 100644
+index 5a331aa..ac17ae9 100644
 --- a/src/hle/rt64_workload_queue.cpp
 +++ b/src/hle/rt64_workload_queue.cpp
 @@ -5,6 +5,7 @@
@@ -16324,10 +16324,27 @@ index 5a331aa..89cfa53 100644
  
          const auto ratioMode = ext.sharedResources->userConfig.aspectRatio;
          switch (ratioMode) {
-@@ -263,6 +271,16 @@ namespace RT64 {
+@@ -258,9 +266,30 @@ namespace RT64 {
+                 // Wait until the other queue has stopped using the interpolated color targets.
+                 std::unique_lock<std::mutex> interpolatedLock(ext.sharedResources->interpolatedMutex);
+                 InterpolatedFrameCounters &curFrameCounters = ext.sharedResources->interpolatedFrames[ext.sharedResources->interpolatedFramesIndex];
+-                ext.sharedResources->interpolatedCondition.wait(interpolatedLock, [&]() {
++                // [wcw fix] Bounded, like the other waits on these counters: the present thread can be waiting for
++                // this very workload (waitForWorkloadId) before it presents the remaining frames, and an unbounded
++                // wait deadlocked both (the game froze on changing the aspect ratio, resolution or MSAA with frame
++                // interpolation on). Frames still unpresented after the bound are dropped: the targets are about to be
++                // rebuilt anyway, and the present lock below keeps the destruction out of any present in progress.
++                const bool wcwDrained = ext.sharedResources->interpolatedCondition.wait_for(interpolatedLock, RT64::wcwCoherentWaitBound(), [&]() {
+                     return curFrameCounters.presented >= curFrameCounters.available;
                  });
-             }
- 
++
++                if (!wcwDrained) {
++                    curFrameCounters.available = curFrameCounters.presented;
++                    curFrameCounters.skipped = true;
++                    ext.sharedResources->interpolatedCondition.notify_all();
++                }
++            }
++
 +            // [wcw fix] Also wait for the present thread to finish the present it is in: with frame interpolation
 +            // it can still be showing a target from another set (the three rotating sets, a run's real frame)
 +            // while the counters above say this set is done, and destroying the targets under it crashed
@@ -16336,12 +16353,10 @@ index 5a331aa..89cfa53 100644
 +            std::unique_lock<std::mutex> presentLock;
 +            if (ext.presentQueue != nullptr) {
 +                presentLock = std::unique_lock<std::mutex>(ext.presentQueue->wcwPresentTargetsMutex);
-+            }
-+
+             }
+ 
              std::scoped_lock<std::mutex> managerLock(ext.sharedResources->managerMutex);
-             FramebufferManager &fbManager = ext.sharedResources->framebufferManager;
-             RenderTargetManager &targetManager = ext.sharedResources->renderTargetManager;
-@@ -271,6 +289,8 @@ namespace RT64 {
+@@ -271,6 +300,8 @@ namespace RT64 {
              fbManager.destroyAllTileCopies();
              ext.sharedResources->fbConfigChanged = false;
              ext.sharedResources->interpolatedColorTargets.clear();
@@ -16350,7 +16365,7 @@ index 5a331aa..89cfa53 100644
          }
  
          if (ext.sharedResources->userConfigChanged) {
-@@ -289,6 +309,10 @@ namespace RT64 {
+@@ -289,6 +320,10 @@ namespace RT64 {
          }
      }
      
@@ -16361,7 +16376,7 @@ index 5a331aa..89cfa53 100644
      void WorkloadQueue::threadRenderFrame(GameFrame &curFrame, const GameFrame &prevFrame, const WorkloadConfiguration &workloadConfig,
          const DebuggerRenderer &debuggerRenderer, const DebuggerCamera &debuggerCamera, float curFrameWeight, float prevFrameWeight,
          float deltaTimeMs, RenderTargetKey overrideTargetKey, int32_t overrideTargetFbPairIndex, RenderTarget *overrideTarget,
-@@ -387,7 +411,8 @@ namespace RT64 {
+@@ -387,7 +422,8 @@ namespace RT64 {
                  rspProcessor->process(rspParams);
              }
  
@@ -16371,7 +16386,7 @@ index 5a331aa..89cfa53 100644
              if (processWorldVertices) {
                  workload.resetWorldOutputBuffers();
  
-@@ -452,6 +477,24 @@ namespace RT64 {
+@@ -452,6 +488,24 @@ namespace RT64 {
                      if (colorFb != nullptr) {
                          fbKey.colorTargetKey = RenderTargetKey(colorFb->addressStart, colorFb->width, colorFb->siz, Framebuffer::Type::Color);
                          colorTarget = &targetManager.get(fbKey.colorTargetKey);
@@ -16396,7 +16411,7 @@ index 5a331aa..89cfa53 100644
                      }
                      else {
                          colorTarget = nullptr;
-@@ -604,6 +647,10 @@ namespace RT64 {
+@@ -604,6 +658,10 @@ namespace RT64 {
              // Add all framebuffer pairs to the framebuffer renderer and setup the operations.
              scratchFbChangePool.reset();
              fbManager.resetOperations();
@@ -16407,7 +16422,7 @@ index 5a331aa..89cfa53 100644
              framebufferRenderer->resetFramebuffers(ext.workloadGraphicsWorker, ubershadersVisible, workload.extended.ditherNoiseStrength, targetManager.multisampling);
  
  #       if RT_ENABLED
-@@ -703,7 +750,40 @@ namespace RT64 {
+@@ -703,7 +761,40 @@ namespace RT64 {
              ext.workloadGraphicsWorker->commandList->writeTimestamp(queryPool.get(), 0);
              framebufferRenderer->endFramebuffers(ext.workloadGraphicsWorker, &workload.drawBuffers, &workload.outputBuffers, workloadConfig.raytracingEnabled);
              framebufferRenderer->recordSetup(ext.workloadGraphicsWorker, bufferUploaders, processRSP ? rspProcessor.get() : nullptr, processWorldVertices ? vertexProcessor.get() : nullptr, &workload.outputBuffers, workloadConfig.raytracingEnabled);
@@ -16449,7 +16464,7 @@ index 5a331aa..89cfa53 100644
              // Record all framebuffer pairs.
              uint32_t framebufferIndex = 0;
              for (uint32_t f = 0; f < fbPairCount; f++) {
-@@ -814,7 +894,11 @@ namespace RT64 {
+@@ -814,7 +905,11 @@ namespace RT64 {
                      const uint64_t writeTimestamp = fbManager.nextWriteTimestamp();
                      FixedRect depthFbRect;
                      if (colorFb != nullptr) {
@@ -16462,7 +16477,7 @@ index 5a331aa..89cfa53 100644
                          colorFb->lastWriteType = Framebuffer::Type::Color;
                          colorFb->lastWriteFmt = colorImg.fmt;
                          colorFb->lastWriteTimestamp = writeTimestamp;
-@@ -842,12 +926,83 @@ namespace RT64 {
+@@ -842,12 +937,83 @@ namespace RT64 {
              framebufferRenderer->waitForUploaders();
              ext.workloadGraphicsWorker->execute();
              ext.workloadGraphicsWorker->wait();
@@ -16546,7 +16561,7 @@ index 5a331aa..89cfa53 100644
  
              // Indicate to the texture cache it's safe to delete the textures if no locks are active.
              ext.textureCache->decrementLock();
-@@ -866,7 +1021,7 @@ namespace RT64 {
+@@ -866,7 +1032,7 @@ namespace RT64 {
  
      void WorkloadQueue::threadAdvanceBarrier() {
          std::scoped_lock<std::mutex> cursorLock(cursorMutex);
@@ -16555,7 +16570,7 @@ index 5a331aa..89cfa53 100644
      }
  
      void WorkloadQueue::threadAdvanceWorkloadId(uint64_t newWorkloadId) {
-@@ -882,12 +1037,26 @@ namespace RT64 {
+@@ -882,12 +1048,26 @@ namespace RT64 {
          Thread::setCurrentThreadName("RT64 Workload");
  
          WorkloadConfiguration workloadConfig;
@@ -16585,7 +16600,7 @@ index 5a331aa..89cfa53 100644
          while (threadsRunning) {
              {
                  std::unique_lock<std::mutex> cursorLock(cursorMutex);
-@@ -897,13 +1066,39 @@ namespace RT64 {
+@@ -897,13 +1077,39 @@ namespace RT64 {
  
                  if (threadsRunning) {
                      processCursor = threadCursor;
@@ -16626,7 +16641,7 @@ index 5a331aa..89cfa53 100644
                  ext.presentQueue->waitForPresentId(workload.presentId);
  
                  if (!threadsRunning) {
-@@ -914,11 +1109,157 @@ namespace RT64 {
+@@ -914,11 +1120,157 @@ namespace RT64 {
                  workloadProfiler.start();
                  threadConfigurationUpdate(workload.viFbSize, workloadConfig);
  
@@ -16784,7 +16799,7 @@ index 5a331aa..89cfa53 100644
                  
                  // TODO: The frame detection needs to be more elaborate than just matching one workload to one frame.
                  GameFrame &curFrame = gameFrames[curFrameIndex];
-@@ -959,6 +1300,15 @@ namespace RT64 {
+@@ -959,6 +1311,15 @@ namespace RT64 {
                              continue;
                          }
  
@@ -16800,7 +16815,7 @@ index 5a331aa..89cfa53 100644
                          Framebuffer *interpolationFb = fbManager.find(colorImg.address);
                          if ((interpolationFb != nullptr) && interpolationFb->interpolationEnabled) {
                              interpolationTargetKey.fbType = Framebuffer::Type::Color;
-@@ -970,6 +1320,43 @@ namespace RT64 {
+@@ -970,6 +1331,43 @@ namespace RT64 {
                      }
                  }
  
@@ -16844,7 +16859,7 @@ index 5a331aa..89cfa53 100644
                  float prevFrameWeight = 0.0f;
                  float curFrameWeight = 1.0f;
                  float deltaTimeMs = 1.0f / 30.0f;
-@@ -985,13 +1372,61 @@ namespace RT64 {
+@@ -985,13 +1383,61 @@ namespace RT64 {
                      matchingProfiler.end();
                      matchingProfiler.log();
  
@@ -16909,7 +16924,7 @@ index 5a331aa..89cfa53 100644
                          originalRateForTicks = workload.viOriginalRate;
                          displayRateForTicks = workloadConfig.targetRate;
                      }
-@@ -1000,18 +1435,24 @@ namespace RT64 {
+@@ -1000,18 +1446,24 @@ namespace RT64 {
                  // Estimate amount of frames to render based on how many display frames it'd take to reach the next logical frame.
                  uint32_t displayFrames = 1;
                  if (generateInterpolatedFrames) {
@@ -16942,7 +16957,7 @@ index 5a331aa..89cfa53 100644
                      assert((displayFrames > 0) && "At least one display frame must be generated.");
                  }
                  else if (workload.viOriginalRate > 0) {
-@@ -1022,16 +1463,48 @@ namespace RT64 {
+@@ -1022,16 +1474,48 @@ namespace RT64 {
                  
                  // Get the current and previous set of frame counters. The other set can be in use by the present queue. Skip if no new present event has arrived before this workload event.
                  InterpolatedFrameCounters &prevFrameCounters = ext.sharedResources->interpolatedFrames[ext.sharedResources->interpolatedFramesIndex];
@@ -16993,7 +17008,7 @@ index 5a331aa..89cfa53 100644
                          return (prevFrameCounters.presented == 0) || (prevFrameCounters.presented >= prevFrameCounters.available);
                      });
                  }
-@@ -1043,7 +1516,11 @@ namespace RT64 {
+@@ -1043,7 +1527,11 @@ namespace RT64 {
                  curFrameCounters.count = displayFrames;
  
                  // Create as many render targets as required to store the interpolated targets.
@@ -17006,7 +17021,7 @@ index 5a331aa..89cfa53 100644
                  const bool usingMSAA = (ext.sharedResources->renderTargetManager.multisampling.sampleCount > 1);
                  const bool usesHDR = ext.sharedResources->renderTargetManager.usesHDR;
                  uint32_t requiredFrames = (usingMSAA && generateInterpolatedFrames) ? displayFrames : (displayFrames - 1);
-@@ -1061,18 +1538,31 @@ namespace RT64 {
+@@ -1061,18 +1549,31 @@ namespace RT64 {
                  const int64_t maxTimePerFrameMicro = adjustedTimeWindowMicro / displayFrames;
                  bool skippedFrames = false;
                  bool skipWorkloadNow = false;
@@ -17040,7 +17055,7 @@ index 5a331aa..89cfa53 100644
                              continue;
                          }
                      }
-@@ -1080,23 +1570,16 @@ namespace RT64 {
+@@ -1080,23 +1581,16 @@ namespace RT64 {
                      RenderTarget *overrideTarget = nullptr;
                      uint32_t overrideModifier = 0;
                      if (generateInterpolatedFrames) {
@@ -17070,7 +17085,7 @@ index 5a331aa..89cfa53 100644
  
                              targetIndex++;
                          }
-@@ -1120,6 +1603,19 @@ namespace RT64 {
+@@ -1120,6 +1614,19 @@ namespace RT64 {
                      threadRenderFrame(curFrame, prevFrame, workloadConfig, workload.debuggerRenderer, workload.debuggerCamera, curFrameWeight, prevFrameWeight, deltaTimeMs,
                          interpolationTargetKey, interpolationTargetFbPairIndex, overrideTarget, overrideModifier, velocityUploaderUsed, uploadExtras, tileInterpolationUsed, lookAtInterpolationUsed);
  
@@ -17090,7 +17105,7 @@ index 5a331aa..89cfa53 100644
                      // Add total time the frame took to render.
                      renderTimeTotalMicro += workloadTimer.elapsedMicroseconds() - renderTimeMicro;
  
-@@ -1132,18 +1628,61 @@ namespace RT64 {
+@@ -1132,18 +1639,61 @@ namespace RT64 {
                      if (generateInterpolatedFrames && (usingMSAA || (frame > 0))) {
                          {
                              std::scoped_lock<std::mutex> cursorLock(cursorMutex);
@@ -17156,7 +17171,7 @@ index 5a331aa..89cfa53 100644
                          }
  
                          ext.sharedResources->interpolatedCondition.notify_all();
-@@ -1162,6 +1701,64 @@ namespace RT64 {
+@@ -1162,6 +1712,64 @@ namespace RT64 {
                      ext.sharedResources->interpolatedCondition.notify_all();
                  }
  
