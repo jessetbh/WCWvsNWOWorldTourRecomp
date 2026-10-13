@@ -10,28 +10,30 @@ index 21df8c2..5635c09 100644
 +	url = https://github.com/jessetbh/plume.git
 +	branch = wcw
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 2fb01e5..40d1eca 100644
+index 2fb01e5..8e465f3 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -319,6 +319,7 @@ set (SOURCES
+@@ -319,6 +319,8 @@ set (SOURCES
      "${PROJECT_SOURCE_DIR}/src/common/rt64_timer.cpp"
      "${PROJECT_SOURCE_DIR}/src/common/rt64_user_configuration.cpp"
      "${PROJECT_SOURCE_DIR}/src/common/rt64_user_paths.cpp"
 +    "${PROJECT_SOURCE_DIR}/src/common/rt64_wcw_logic.cpp"
++    "${PROJECT_SOURCE_DIR}/src/common/rt64_wcw_venues.cpp"
  
      "${PROJECT_SOURCE_DIR}/src/gbi/rt64_gbi.cpp"
      "${PROJECT_SOURCE_DIR}/src/gbi/rt64_gbi_f3d.cpp"
-@@ -386,6 +387,9 @@ set (SOURCES
+@@ -386,6 +388,10 @@ set (SOURCES
      "${PROJECT_SOURCE_DIR}/src/render/rt64_transform_processor.cpp"
      "${PROJECT_SOURCE_DIR}/src/render/rt64_upscaler.cpp"
      "${PROJECT_SOURCE_DIR}/src/render/rt64_vertex_processor.cpp"
 +    "${PROJECT_SOURCE_DIR}/src/render/rt64_wcw_raytracer.cpp"
++    "${PROJECT_SOURCE_DIR}/src/render/rt64_wcw_lighting_editor.cpp"
 +    "${PROJECT_SOURCE_DIR}/src/render/rt64_crt_filter.cpp"
 +    "${PROJECT_SOURCE_DIR}/src/render/rt64_hdr_output.cpp"
      "${PROJECT_SOURCE_DIR}/src/render/rt64_vi_renderer.cpp"
  
      "${PROJECT_SOURCE_DIR}/src/preset/rt64_preset.cpp"
-@@ -442,6 +446,28 @@ target_link_libraries(rt64 nfd)
+@@ -442,6 +448,30 @@ target_link_libraries(rt64 nfd)
  target_link_libraries(rt64 libzstd_static)
  target_link_libraries(rt64 plume)
  
@@ -41,7 +43,9 @@ index 2fb01e5..40d1eca 100644
 +if (RT64_WCW_TESTS AND NOT CMAKE_CROSSCOMPILING)
 +    add_executable(rt64_wcw_tests
 +        "${PROJECT_SOURCE_DIR}/tests/wcw/rt64_wcw_logic_tests.cpp"
++        "${PROJECT_SOURCE_DIR}/tests/wcw/rt64_wcw_venues_tests.cpp"
 +        "${PROJECT_SOURCE_DIR}/src/common/rt64_wcw_logic.cpp"
++        "${PROJECT_SOURCE_DIR}/src/common/rt64_wcw_venues.cpp"
 +    )
 +    target_include_directories(rt64_wcw_tests PRIVATE "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/tests/wcw")
 +    set(RT64_WCW_TESTS_STAMP "${CMAKE_CURRENT_BINARY_DIR}/rt64_wcw_tests.passed")
@@ -60,7 +64,7 @@ index 2fb01e5..40d1eca 100644
  # Add tools.
  add_subdirectory(src/tools/texture_hasher)
  add_subdirectory(src/tools/texture_packer)
-@@ -527,6 +553,12 @@ build_pixel_shader(  rt64 "src/shaders/PostBlendDitherNoisePS.hlsl" "src/shaders
+@@ -527,6 +557,12 @@ build_pixel_shader(  rt64 "src/shaders/PostBlendDitherNoisePS.hlsl" "src/shaders
  build_compute_shader(rt64 "src/shaders/RSPModifyCS.hlsl")
  build_compute_shader(rt64 "src/shaders/RSPProcessCS.hlsl")
  build_compute_shader(rt64 "src/shaders/RSPWorldCS.hlsl")
@@ -73,7 +77,7 @@ index 2fb01e5..40d1eca 100644
  build_compute_shader(rt64 "src/shaders/RSPSmoothNormalCS.hlsl")
  build_compute_shader(rt64 "src/shaders/RSPVertexTestZCS.hlsl")
  build_compute_shader(rt64 "src/shaders/RSPVertexTestZCS.hlsl" "src/shaders/RSPVertexTestZCSMS.hlsl" "-D MULTISAMPLING")
-@@ -545,6 +577,8 @@ build_pixel_shader(  rt64 "src/shaders/TextureResolvePS.hlsl" "src/shaders/Textu
+@@ -545,6 +581,8 @@ build_pixel_shader(  rt64 "src/shaders/TextureResolvePS.hlsl" "src/shaders/Textu
  build_pixel_shader(  rt64 "src/shaders/TextureResolvePS.hlsl" "src/shaders/TextureResolveSamples8XPS.hlsl" "-D SAMPLES_8X")
  build_pixel_shader(  rt64 "src/shaders/VideoInterfacePS.hlsl" "src/shaders/VideoInterfacePSRegular.hlsl")
  build_pixel_shader(  rt64 "src/shaders/VideoInterfacePS.hlsl" "src/shaders/VideoInterfacePSPixel.hlsl" "-D PIXEL_ANTIALIASING")
@@ -810,6 +814,875 @@ index 0000000..fa5238f
 +        std::unordered_map<uint32_t, uint32_t> identities;
 +        std::mutex identitiesMutex;
 +    };
++};
+diff --git a/src/common/rt64_wcw_venues.cpp b/src/common/rt64_wcw_venues.cpp
+new file mode 100644
+index 0000000..c2cf4d3
+--- /dev/null
++++ b/src/common/rt64_wcw_venues.cpp
+@@ -0,0 +1,612 @@
++//
++// RT64
++//
++
++#include "rt64_wcw_venues.h"
++
++#include <algorithm>
++#include <cinttypes>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++
++#include "contrib/json/json.hpp"
++
++namespace RT64::WcwLogic {
++    using Json = nlohmann::ordered_json;
++
++    static uint32_t presentFields(const Json &j) {
++        static const std::pair<const char *, uint32_t> keys[] = {
++            { "center", FieldCenter }, { "spread", FieldSpread }, { "fills", FieldFills }, { "keyWeight", FieldKeyWeight },
++            { "lights", FieldLights }, { "size", FieldSize }, { "radius", FieldRadius }, { "clearance", FieldClearance },
++            { "falloff", FieldFalloff }, { "glows", FieldGlows }, { "anchor", FieldAnchor }, { "shadow", FieldShadow },
++            { "characterShadow", FieldCharacterShadow }, { "outsideDarkness", FieldOutsideDarkness }, { "outsideEdge", FieldOutsideEdge },
++            { "color", FieldColor }, { "keyColor", FieldKeyColor }, { "fillColor", FieldFillColor }, { "litAreas", FieldLitAreas }
++        };
++
++        uint32_t fields = 0;
++        for (const auto &k : keys) {
++            fields |= j.contains(k.first) ? k.second : 0u;
++        }
++
++        return fields;
++    }
++
++    static bool readColor(const Json &j, const char *key, LightColor &color) {
++        if (!j.contains(key) || !j[key].is_array() || (j[key].size() < 3)) {
++            return false;
++        }
++
++        color = { j[key][0].get<float>(), j[key][1].get<float>(), j[key][2].get<float>() };
++        return true;
++    }
++
++    LightColor presetLightColor(const LightPreset &preset, size_t lightIndex) {
++        if ((lightIndex < preset.lightOwnColor.size()) && (lightIndex < preset.lightColors.size()) && (preset.lightOwnColor[lightIndex] != 0)) {
++            return preset.lightColors[lightIndex];
++        }
++
++        return preset.color;
++    }
++
++    LightColor presetGlowColor(const LightPreset &preset, size_t glowIndex) {
++        return (glowIndex < preset.glowColors.size()) ? preset.glowColors[glowIndex] : WhiteLight;
++    }
++
++    float presetGlowFlicker(const LightPreset &preset, size_t glowIndex) {
++        return (glowIndex < preset.glowFlicker.size()) ? preset.glowFlicker[glowIndex] : 0.0f;
++    }
++
++    static uint32_t flickerHash(uint32_t a, uint32_t b) {
++        uint32_t h = a * 0x9E3779B1u ^ (b + 0x7F4A7C15u + (a << 6) + (a >> 2));
++        h ^= h >> 16;
++        h *= 0x85EBCA6Bu;
++        h ^= h >> 13;
++        h *= 0xC2B2AE35u;
++        h ^= h >> 16;
++        return h;
++    }
++
++    float glowFlicker(double timeSeconds, uint32_t seed) {
++        if (timeSeconds < 0.0) {
++            timeSeconds = 0.0;
++        }
++
++        // 2 s windows; about a third hold an event: one to three quick blinks off (70 ms each, 80 ms apart). The
++        // tube is on the rest of the time (the owner wanted mostly on, flickering off occasionally).
++        const uint32_t window = uint32_t(timeSeconds / 2.0);
++        const uint32_t windowHash = flickerHash(seed, window);
++        if ((windowHash % 100u) >= 33u) {
++            return 1.0f;
++        }
++
++        const double start = double((windowHash >> 8) % 100u) / 100.0 * 1.5;
++        const uint32_t blinks = 1u + ((windowHash >> 16) % 3u);
++        const double offset = timeSeconds - double(window) * 2.0 - start;
++        if (offset < 0.0) {
++            return 1.0f;
++        }
++
++        const double period = 0.15;
++        const uint32_t blink = uint32_t(offset / period);
++        if (blink >= blinks) {
++            return 1.0f;
++        }
++
++        return ((offset - double(blink) * period) < 0.07) ? 0.0f : 1.0f;
++    }
++
++    float glowFlickerScale(double timeSeconds, uint32_t seed, float amount) {
++        amount = std::clamp(amount, 0.0f, 1.0f);
++        return 1.0f - amount * (1.0f - glowFlicker(timeSeconds, seed));
++    }
++
++    void syncColorLists(LightPreset &preset) {
++        preset.lightColors.resize(preset.lights.size(), preset.color);
++        preset.lightOwnColor.resize(preset.lights.size(), 0);
++        preset.glowColors.resize(preset.glows.size(), WhiteLight);
++        preset.glowFlicker.resize(preset.glows.size(), 0.0f);
++    }
++
++    static LightPreset parsePreset(const Json &j, const LightPreset &base) {
++        LightPreset p = base;
++        p.setFields = presentFields(j);
++        p.name = j.value("name", std::string());
++        p.match.clear();
++        p.uniqueMatch.clear();
++        if (j.contains("match")) {
++            for (const auto &h : j["match"]) {
++                p.match.push_back(strtoull(h.get<std::string>().c_str(), nullptr, 16));
++            }
++        }
++
++        if (j.contains("center")) {
++            for (uint32_t i = 0; i < 3; i++) {
++                p.center[i] = j["center"][i].get<float>();
++            }
++        }
++
++        p.spread = j.value("spread", p.spread);
++        p.fills = j.value("fills", p.fills);
++        p.keyWeight = j.value("keyWeight", p.keyWeight);
++        p.size = j.value("size", p.size);
++        p.radius = j.value("radius", p.radius);
++        p.clearance = j.value("clearance", p.clearance);
++        p.falloff = j.value("falloff", p.falloff);
++        // Colors: keyColor / fillColor default to this preset's color when it sets one, else to the base's.
++        const bool ownColor = readColor(j, "color", p.color);
++        if (!readColor(j, "keyColor", p.keyColor) && ownColor) {
++            p.keyColor = p.color;
++        }
++
++        if (!readColor(j, "fillColor", p.fillColor) && ownColor) {
++            p.fillColor = p.color;
++        }
++
++        if (j.contains("glows")) {
++            p.glows.clear();
++            p.glowColors.clear();
++            p.glowFlicker.clear();
++            for (const auto &g : j["glows"]) {
++                p.glows.push_back({ g[0].get<float>(), g[1].get<float>(), g[2].get<float>(), g[3].get<float>(), g[4].get<float>() });
++                p.glowColors.push_back((g.size() >= 8) ? LightColor{ g[5].get<float>(), g[6].get<float>(), g[7].get<float>() } : WhiteLight);
++                p.glowFlicker.push_back((g.size() >= 9) ? std::clamp(g[8].get<float>(), 0.0f, 1.0f) : 0.0f);
++            }
++        }
++
++        p.shadow = j.value("shadow", p.shadow);
++        p.characterShadow = j.value("characterShadow", p.characterShadow);
++        p.outsideDarkness = std::clamp(j.value("outsideDarkness", p.outsideDarkness), 0.0f, 1.0f);
++        p.outsideEdge = std::max(j.value("outsideEdge", p.outsideEdge), 0.0f);
++        if (j.contains("litAreas")) {
++            p.litAreas.clear();
++            for (const auto &a : j["litAreas"]) {
++                if ((a.size() >= 4) && (p.litAreas.size() < MaxLitAreas)) {
++                    p.litAreas.push_back({ a[0].get<float>(), a[1].get<float>(), std::max(a[2].get<float>(), 0.0f), std::max(a[3].get<float>(), 0.0f) });
++                }
++            }
++        }
++        p.anchorScene = (j.value("anchor", std::string(p.anchorScene ? "scene" : "world")) == "scene");
++        if (j.contains("lights")) {
++            p.lights.clear();
++            p.lightColors.clear();
++            p.lightOwnColor.clear();
++            for (const auto &l : j["lights"]) {
++                p.lights.push_back({ l[0].get<float>(), l[1].get<float>(), l[2].get<float>(), (l.size() > 3) ? l[3].get<float>() : 1.0f });
++                const bool own = (l.size() >= 7);
++                p.lightColors.push_back(own ? LightColor{ l[4].get<float>(), l[5].get<float>(), l[6].get<float>() } : p.color);
++                p.lightOwnColor.push_back(own ? 1 : 0);
++            }
++        }
++
++        syncColorLists(p);
++        return p;
++    }
++
++    LightPresetFile parseLightPresets(const std::string &text) {
++        const Json root = Json::parse(text, nullptr, true, true);
++        LightPresetFile file;
++        if (root.contains("debugMode")) {
++            file.hasDebugMode = true;
++            file.debugMode = root["debugMode"].get<uint32_t>();
++        }
++
++        if (root.contains("default")) {
++            file.defaultPreset = parsePreset(root["default"], LightPreset());
++        }
++
++        file.defaultPreset.name = "default";
++        if (root.contains("room")) {
++            const Json &room = root["room"];
++            file.roomPreset = parsePreset(room, file.defaultPreset);
++            file.roomPreset.anchorScene = false;
++            file.roomMaxExtent = room.value("maxExtent", file.roomMaxExtent);
++            file.roomCount = std::clamp(room.value("count", file.roomCount), 1u, 8u);
++            file.roomHeight = room.value("height", file.roomHeight);
++            file.roomEnabled = true;
++        }
++
++        file.roomPreset.name = "room (fallback)";
++        if (root.contains("venues")) {
++            for (const auto &v : root["venues"]) {
++                file.venues.push_back(parsePreset(v, file.defaultPreset));
++            }
++        }
++
++        computeUniqueMatches(file.venues);
++        return file;
++    }
++
++    std::string formatTextureHash(uint64_t hash) {
++        char text[17];
++        snprintf(text, sizeof(text), "%016" PRIX64, hash);
++        return text;
++    }
++
++    // Numbers are written with 6 significant digits, so a float read from the file writes back unchanged.
++    static Json number(float value) {
++        char text[32];
++        snprintf(text, sizeof(text), "%.6g", double(value));
++        const double parsed = strtod(text, nullptr);
++        if (parsed == double(int64_t(parsed))) {
++            return Json(int64_t(parsed));
++        }
++
++        return Json(parsed);
++    }
++
++    // Writes the fields p sets itself, plus (for "default") any that differ from base.
++    static Json writePreset(const LightPreset &p, const LightPreset &base, bool writeName, bool writeMatch, bool writeChanged) {
++        auto wanted = [&](uint32_t field, bool changed) { return ((p.setFields & field) != 0) || (writeChanged && changed); };
++        Json j = Json::object();
++        if (writeName) {
++            j["name"] = p.name;
++        }
++
++        if (writeMatch && !p.match.empty()) {
++            Json m = Json::array();
++            for (uint64_t h : p.match) {
++                m.push_back(formatTextureHash(h));
++            }
++
++            j["match"] = m;
++        }
++
++        if (wanted(FieldCenter, (p.center[0] != base.center[0]) || (p.center[1] != base.center[1]) || (p.center[2] != base.center[2]))) {
++            j["center"] = Json::array({ number(p.center[0]), number(p.center[1]), number(p.center[2]) });
++        }
++
++        auto color = [&](const char *key, uint32_t bit, const LightColor &value, const LightColor &baseValue) {
++            if (wanted(bit, value != baseValue)) {
++                j[key] = Json::array({ number(value[0]), number(value[1]), number(value[2]) });
++            }
++        };
++
++        color("color", FieldColor, p.color, base.color);
++        color("keyColor", FieldKeyColor, p.keyColor, base.keyColor);
++        color("fillColor", FieldFillColor, p.fillColor, base.fillColor);
++        if (wanted(FieldLights, (p.lights != base.lights) || (p.lightOwnColor != base.lightOwnColor) || (p.lightColors != base.lightColors))) {
++            Json l = Json::array();
++            for (size_t i = 0; i < p.lights.size(); i++) {
++                const auto &light = p.lights[i];
++                Json entry = Json::array({ number(light[0]), number(light[1]), number(light[2]), number(light[3]) });
++                if ((i < p.lightOwnColor.size()) && (p.lightOwnColor[i] != 0)) {
++                    const LightColor c = presetLightColor(p, i);
++                    entry.push_back(number(c[0]));
++                    entry.push_back(number(c[1]));
++                    entry.push_back(number(c[2]));
++                }
++
++                l.push_back(entry);
++            }
++
++            j["lights"] = l;
++        }
++
++        auto field = [&](const char *key, uint32_t bit, float value, float baseValue) {
++            if (wanted(bit, value != baseValue)) {
++                j[key] = number(value);
++            }
++        };
++
++        field("spread", FieldSpread, p.spread, base.spread);
++        if (wanted(FieldFills, p.fills != base.fills)) {
++            j["fills"] = p.fills;
++        }
++
++        field("keyWeight", FieldKeyWeight, p.keyWeight, base.keyWeight);
++        field("size", FieldSize, p.size, base.size);
++        field("radius", FieldRadius, p.radius, base.radius);
++        field("shadow", FieldShadow, p.shadow, base.shadow);
++        field("characterShadow", FieldCharacterShadow, p.characterShadow, base.characterShadow);
++        field("clearance", FieldClearance, p.clearance, base.clearance);
++        field("falloff", FieldFalloff, p.falloff, base.falloff);
++        field("outsideDarkness", FieldOutsideDarkness, p.outsideDarkness, base.outsideDarkness);
++        field("outsideEdge", FieldOutsideEdge, p.outsideEdge, base.outsideEdge);
++        if (wanted(FieldLitAreas, p.litAreas != base.litAreas)) {
++            Json a = Json::array();
++            for (const auto &area : p.litAreas) {
++                a.push_back(Json::array({ number(area[0]), number(area[1]), number(area[2]), number(area[3]) }));
++            }
++
++            j["litAreas"] = a;
++        }
++        if (wanted(FieldGlows, (p.glows != base.glows) || (p.glowColors != base.glowColors) || (p.glowFlicker != base.glowFlicker))) {
++            Json g = Json::array();
++            for (size_t i = 0; i < p.glows.size(); i++) {
++                const auto &glow = p.glows[i];
++                Json entry = Json::array({ number(glow[0]), number(glow[1]), number(glow[2]), number(glow[3]), number(glow[4]) });
++                const LightColor c = presetGlowColor(p, i);
++                const float flicker = presetGlowFlicker(p, i);
++                if ((c != WhiteLight) || (flicker > 0.0f)) {
++                    entry.push_back(number(c[0]));
++                    entry.push_back(number(c[1]));
++                    entry.push_back(number(c[2]));
++                }
++
++                if (flicker > 0.0f) {
++                    entry.push_back(number(flicker));
++                }
++
++                g.push_back(entry);
++            }
++
++            j["glows"] = g;
++        }
++
++        if (wanted(FieldAnchor, p.anchorScene != base.anchorScene)) {
++            j["anchor"] = p.anchorScene ? "scene" : "world";
++        }
++
++        return j;
++    }
++
++    std::string writeLightPresets(const LightPresetFile &file) {
++        Json root = Json::object();
++        if (file.hasDebugMode) {
++            root["debugMode"] = file.debugMode;
++        }
++
++        root["default"] = writePreset(file.defaultPreset, LightPreset(), false, false, true);
++        if (file.roomEnabled) {
++            Json room = writePreset(file.roomPreset, file.defaultPreset, false, false, false);
++            room.erase("anchor");
++            room["maxExtent"] = number(file.roomMaxExtent);
++            room["count"] = file.roomCount;
++            room["height"] = number(file.roomHeight);
++            root["room"] = room;
++        }
++
++        Json venues = Json::array();
++        for (const LightPreset &v : file.venues) {
++            venues.push_back(writePreset(v, file.defaultPreset, true, true, false));
++        }
++
++        root["venues"] = venues;
++        return "// Ray tracing light presets, written by the RT64 Lighting editor (WCW_INSPECTOR, F1).\n"
++            "// Venues inherit every field they don't set from \"default\". Earlier comments are in the .bak copy.\n" +
++            root.dump(4) + "\n";
++    }
++
++    static void inheritInto(LightPreset &p, const LightPreset &d) {
++        const uint32_t s = p.setFields;
++        if (!(s & FieldCenter)) { p.center[0] = d.center[0]; p.center[1] = d.center[1]; p.center[2] = d.center[2]; }
++        if (!(s & FieldSpread)) { p.spread = d.spread; }
++        if (!(s & FieldFills)) { p.fills = d.fills; }
++        if (!(s & FieldKeyWeight)) { p.keyWeight = d.keyWeight; }
++        if (!(s & FieldColor)) { p.color = d.color; }
++        if (!(s & FieldKeyColor)) { p.keyColor = (s & FieldColor) ? p.color : d.keyColor; }
++        if (!(s & FieldFillColor)) { p.fillColor = (s & FieldColor) ? p.color : d.fillColor; }
++        if (!(s & FieldLights)) { p.lights = d.lights; p.lightColors = d.lightColors; p.lightOwnColor = d.lightOwnColor; }
++        if (!(s & FieldSize)) { p.size = d.size; }
++        if (!(s & FieldRadius)) { p.radius = d.radius; }
++        if (!(s & FieldClearance)) { p.clearance = d.clearance; }
++        if (!(s & FieldFalloff)) { p.falloff = d.falloff; }
++        if (!(s & FieldGlows)) { p.glows = d.glows; p.glowColors = d.glowColors; p.glowFlicker = d.glowFlicker; }
++        if (!(s & FieldAnchor)) { p.anchorScene = d.anchorScene; }
++        if (!(s & FieldShadow)) { p.shadow = d.shadow; }
++        if (!(s & FieldCharacterShadow)) { p.characterShadow = d.characterShadow; }
++        if (!(s & FieldOutsideDarkness)) { p.outsideDarkness = d.outsideDarkness; }
++        if (!(s & FieldOutsideEdge)) { p.outsideEdge = d.outsideEdge; }
++        if (!(s & FieldLitAreas)) { p.litAreas = d.litAreas; }
++        syncColorLists(p);
++    }
++
++    void inheritDefault(LightPresetFile &file) {
++        // "default"'s own key / fill colors follow its color unless it sets them (an edited color reaches its rig).
++        LightPreset &d = file.defaultPreset;
++        if (!(d.setFields & FieldKeyColor)) { d.keyColor = d.color; }
++        if (!(d.setFields & FieldFillColor)) { d.fillColor = d.color; }
++        syncColorLists(d);
++        inheritInto(file.roomPreset, file.defaultPreset);
++        file.roomPreset.anchorScene = false;
++        for (LightPreset &v : file.venues) {
++            inheritInto(v, file.defaultPreset);
++        }
++    }
++
++    void computeUniqueMatches(std::vector<LightPreset> &venues) {
++        for (LightPreset &p : venues) {
++            p.uniqueMatch.clear();
++            for (uint64_t h : p.match) {
++                bool shared = false;
++                for (const LightPreset &o : venues) {
++                    if ((&o != &p) && (std::find(o.match.begin(), o.match.end(), h) != o.match.end())) {
++                        shared = true;
++                        break;
++                    }
++                }
++
++                if (!shared) {
++                    p.uniqueMatch.push_back(h);
++                }
++            }
++        }
++    }
++
++    float venueMatchScore(const LightPreset &venue, const std::function<bool(uint64_t)> &seen) {
++        const std::vector<uint64_t> &scored = venue.uniqueMatch.empty() ? venue.match : venue.uniqueMatch;
++        if (scored.empty()) {
++            return 0.0f;
++        }
++
++        uint32_t count = 0;
++        for (uint64_t h : scored) {
++            count += seen(h) ? 1 : 0;
++        }
++
++        return float(count) / float(scored.size());
++    }
++
++    int bestVenue(const std::vector<LightPreset> &venues, const std::function<bool(uint64_t)> &seen, float minScore) {
++        int best = -1;
++        float bestScore = minScore;
++        for (size_t v = 0; v < venues.size(); v++) {
++            if (venues[v].match.empty()) {
++                continue;
++            }
++
++            const float score = venueMatchScore(venues[v], seen);
++            if (score >= bestScore) {
++                bestScore = score;
++                best = int(v);
++            }
++        }
++
++        return best;
++    }
++
++    float outsideDarknessFactor(float receiverDistance, float radius, float edge, float darkness) {
++        if ((darkness <= 0.0f) || (receiverDistance <= radius)) {
++            return 1.0f;
++        }
++
++        float t = 1.0f;
++        if (edge > 0.0f) {
++            t = std::clamp((receiverDistance - radius) / edge, 0.0f, 1.0f);
++            t = t * t * (3.0f - 2.0f * t);
++        }
++
++        return 1.0f - std::min(darkness, 1.0f) * t;
++    }
++
++    float darknessRamp(float distance, float radius, float edge) {
++        if (distance <= radius) {
++            return 0.0f;
++        }
++
++        if (edge <= 0.0f) {
++            return 1.0f;
++        }
++
++        const float t = std::clamp((distance - radius) / edge, 0.0f, 1.0f);
++        return t * t * (3.0f - 2.0f * t);
++    }
++
++    float outsideDarknessAt(float x, float z, float centerX, float centerZ, float radius, float edge, float darkness,
++        const std::vector<std::array<float, 4>> &litAreas)
++    {
++        if (darkness <= 0.0f) {
++            return 1.0f;
++        }
++
++        float ramp = darknessRamp(std::hypot(x - centerX, z - centerZ), radius, edge);
++        for (size_t i = 0; (i < litAreas.size()) && (i < MaxLitAreas); i++) {
++            const auto &a = litAreas[i];
++            ramp = std::min(ramp, darknessRamp(std::hypot(x - a[0], z - a[1]), a[2], a[3]));
++        }
++
++        return 1.0f - std::min(darkness, 1.0f) * ramp;
++    }
++
++    float missFloorDistance(const float origin[3], const float direction[3], float floorY, float centerX, float centerZ) {
++        if (direction[1] >= -1e-4f) {
++            return 1e9f;
++        }
++
++        const float t = (floorY - origin[1]) / direction[1];
++        if (t <= 0.0f) {
++            return 1e9f;
++        }
++
++        const float dx = origin[0] + direction[0] * t - centerX;
++        const float dz = origin[2] + direction[2] * t - centerZ;
++        return std::sqrt(dx * dx + dz * dz);
++    }
++
++    void MissDarkeningPass::finishFrame() {
++        if (bestPass == UINT32_MAX) {
++            return;
++        }
++
++        if ((chosenPass == UINT32_MAX) || (chosenMeshes == 0)) {
++            // Nothing chosen yet, or the chosen pass didn't run: take the busiest one.
++            chosenPass = bestPass;
++            switchStreak = 0;
++            streakPass = UINT32_MAX;
++            return;
++        }
++
++        if ((bestPass != chosenPass) && (float(bestMeshes) >= float(chosenMeshes) * SwitchRatio)) {
++            switchStreak = (streakPass == bestPass) ? (switchStreak + 1) : 1;
++            streakPass = bestPass;
++            if (switchStreak >= SwitchFrames) {
++                chosenPass = bestPass;
++                switchStreak = 0;
++                streakPass = UINT32_MAX;
++            }
++        }
++        else {
++            switchStreak = 0;
++            streakPass = UINT32_MAX;
++        }
++    }
++
++    bool MissDarkening::darkenThisPass(const void *target, uint64_t presentId, size_t meshCount) {
++        Target &t = targets[target];
++        if (presentId != t.present) {
++            t.present = presentId;
++            t.darkened = false;
++            t.recentMax *= MaxDecay;
++        }
++
++        t.recentMax = std::max(t.recentMax, float(meshCount));
++        if (t.darkened || (float(meshCount) < ArenaShare * t.recentMax)) {
++            return false;
++        }
++
++        t.darkened = true;
++        return true;
++    }
++
++    bool MissDarkeningPass::darkenThisPass(uint64_t presentId, uint32_t passIndex, size_t meshCount) {
++        if (presentId != present) {
++            if (present != UINT64_MAX) {
++                finishFrame();
++            }
++
++            present = presentId;
++            bestPass = UINT32_MAX;
++            bestMeshes = 0;
++            chosenMeshes = 0;
++        }
++
++        if ((bestPass == UINT32_MAX) || (meshCount > bestMeshes)) {
++            bestPass = passIndex;
++            bestMeshes = meshCount;
++        }
++
++        if (passIndex == chosenPass) {
++            chosenMeshes = meshCount;
++        }
++
++        return passIndex == chosenPass;
++    }
++
++    std::vector<uint64_t> newVenueMatch(const std::vector<std::pair<uint64_t, uint32_t>> &stableTextures,
++        const std::vector<LightPreset> &venues, size_t maxCount)
++    {
++        std::vector<std::pair<uint64_t, uint32_t>> candidates;
++        for (const auto &t : stableTextures) {
++            bool listed = false;
++            for (const LightPreset &v : venues) {
++                if (std::find(v.match.begin(), v.match.end(), t.first) != v.match.end()) {
++                    listed = true;
++                    break;
++                }
++            }
++
++            if (!listed) {
++                candidates.push_back(t);
++            }
++        }
++
++        std::stable_sort(candidates.begin(), candidates.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
++        std::vector<uint64_t> match;
++        for (size_t i = 0; (i < candidates.size()) && (match.size() < maxCount); i++) {
++            match.push_back(candidates[i].first);
++        }
++
++        return match;
++    }
++};
+diff --git a/src/common/rt64_wcw_venues.h b/src/common/rt64_wcw_venues.h
+new file mode 100644
+index 0000000..e6393c4
+--- /dev/null
++++ b/src/common/rt64_wcw_venues.h
+@@ -0,0 +1,245 @@
++//
++// RT64
++//
++
++#pragma once
++
++#include <array>
++#include <cstdint>
++#include <functional>
++#include <string>
++#include <utility>
++#include <unordered_map>
++#include <vector>
++
++// [wcw rt] Venue light presets (assets/rt_lights.json): the file's data model, parsing and writing, and venue matching.
++// Kept free of renderer state so it can be unit tested (tests/wcw/rt64_wcw_venues_tests.cpp); the ray tracer and the
++// Lighting editor call these.
++namespace RT64::WcwLogic {
++    // The fields a preset sets itself (LightPreset::setFields); the others are inherited from "default".
++    enum PresetField : uint32_t {
++        FieldCenter = 1u << 0,
++        FieldSpread = 1u << 1,
++        FieldFills = 1u << 2,
++        FieldKeyWeight = 1u << 3,
++        FieldLights = 1u << 4,
++        FieldSize = 1u << 5,
++        FieldRadius = 1u << 6,
++        FieldClearance = 1u << 7,
++        FieldFalloff = 1u << 8,
++        FieldGlows = 1u << 9,
++        FieldAnchor = 1u << 10,
++        FieldShadow = 1u << 11,
++        FieldCharacterShadow = 1u << 12,
++        FieldOutsideDarkness = 1u << 13,
++        FieldOutsideEdge = 1u << 14,
++        FieldColor = 1u << 15,
++        FieldKeyColor = 1u << 16,
++        FieldFillColor = 1u << 17,
++        FieldLitAreas = 1u << 18
++    };
++
++    // Lit areas per preset (WCW_RT_MAX_LIT_AREAS in the shader).
++    constexpr size_t MaxLitAreas = 2;
++
++    using LightColor = std::array<float, 3>;
++    constexpr LightColor WhiteLight = { 1.0f, 1.0f, 1.0f };
++
++    // One light preset: "default", "room" or a venue.
++    struct LightPreset {
++        std::string name;
++        // World texture hashes that recognize the venue.
++        std::vector<uint64_t> match;
++        // The match textures no other venue lists (scored instead of match when not empty; derived, never written).
++        std::vector<uint64_t> uniqueMatch;
++        // Lights' center (receiver center on X/Z, key light height on Y).
++        float center[3] = { 0.0f, 460.0f, 0.0f };
++        // Generated rig: a key light at the center plus "fills" lights at center +- spread on X/Z; or an explicit
++        // "lights" list (xyz + relative weight) replacing it.
++        float spread = 200.0f;
++        uint32_t fills = 4;
++        float keyWeight = 0.5f;
++        std::vector<std::array<float, 4>> lights;
++        // Colored light: "color" tints every light (white: no tint; the renderer normalizes light colors to unit
++        // luminance, WcwLogic::normalizedLightColor). The generated rig's key and fills take "keyColor" / "fillColor"
++        // (default: the preset's color). An explicit light [x, y, z, weight, r, g, b] carries its own color
++        // (lightOwnColor), otherwise it follows color, also when the lights are inherited from "default".
++        // keyColor and fillColor always hold the effective colors (resolved when parsed and by inheritDefault).
++        LightColor color = WhiteLight;
++        LightColor keyColor = WhiteLight;
++        LightColor fillColor = WhiteLight;
++        // Parallel to lights: each light's own color, used where lightOwnColor is 1 (syncColorLists keeps the sizes).
++        std::vector<LightColor> lightColors;
++        std::vector<uint8_t> lightOwnColor;
++        float size = 20.0f;
++        float radius = 750.0f;
++        float clearance = 0.0f;
++        float falloff = 0.0f;
++        // "glows": [[x, y, z, intensity, range], ...] (offsets from the anchor like lights).
++        std::vector<std::array<float, 5>> glows;
++        // Parallel to glows: [x, y, z, intensity, range, r, g, b] gives a glow its color (white otherwise; not
++        // normalized, so a color also scales the glow's strength).
++        std::vector<LightColor> glowColors;
++        // Parallel to glows: flicker amount 0..1 (a 9th value, [..., r, g, b, flicker]): 0 steady, 1 a failing fluorescent
++        // tube that drops out completely in its bursts (glowFlicker), 0.5 dims to half.
++        std::vector<float> glowFlicker;
++        // "anchor": "scene": center and explicit lights are offsets from the drawn world geometry's center on X/Z
++        // and its floor (lowest point) on Y, so one preset fits rooms placed anywhere in the world.
++        bool anchorScene = false;
++        float shadow = 0.6f;
++        float characterShadow = 0.35f;
++        // "outsideDarkness" (0..1): how much world geometry beyond the receiver radius (the arena, the crowd) and
++        // the background are darkened, so the ring sits in a pool of light; ramps up over "outsideEdge" world units
++        // past the radius. Wrestlers darken too (an exemption for them made them look spotlit in dim
++        // rooms, so the owner had it removed, 2026-10-11). 0 = off (the arena stays as the game draws it).
++        float outsideDarkness = 0.0f;
++        float outsideEdge = 400.0f;
++        // "litAreas": [[x, z, radius, edge], ...] (offsets from the anchor like lights, at most MaxLitAreas): places with
++        // their own lighting, typically the entrance set, where outside darkness eases off like around the ring (none
++        // within radius, full beyond radius + edge). Without them the set and its titantron (geometry) sank into the
++        // house-lights-down darkness and glows had to fight it.
++        std::vector<std::array<float, 4>> litAreas;
++        // PresetField bits of the fields this preset sets itself (read from the file, or edited).
++        uint32_t setFields = 0;
++    };
++
++    // The whole rt_lights.json.
++    struct LightPresetFile {
++        // "debugMode" (WCW_RT_MODE override) when present.
++        bool hasDebugMode = false;
++        uint32_t debugMode = 0;
++        LightPreset defaultPreset;
++        // "room": fallback for unmatched small scenes (extent on X/Z at most maxExtent): count ceiling lights along
++        // the long axis at height (fraction of floor to ceiling). Its other fields default to "default"'s.
++        bool roomEnabled = false;
++        float roomMaxExtent = 3000.0f;
++        uint32_t roomCount = 3;
++        float roomHeight = 0.85f;
++        LightPreset roomPreset;
++        // Venues inherit every field they don't set from "default".
++        std::vector<LightPreset> venues;
++    };
++
++    // Parses rt_lights.json text (comments allowed). Fills each venue's uniqueMatch. Throws std::exception on
++    // malformed JSON.
++    LightPresetFile parseLightPresets(const std::string &text);
++
++    // An explicit light's effective color: its own, or the preset's color. Out of range: the preset's color.
++    LightColor presetLightColor(const LightPreset &preset, size_t lightIndex);
++
++    // A glow's color (white when it has none).
++    LightColor presetGlowColor(const LightPreset &preset, size_t glowIndex);
++
++    // A glow's flicker amount (0 when it has none).
++    float presetGlowFlicker(const LightPreset &preset, size_t glowIndex);
++
++    // A failing fluorescent tube's brightness (0 or 1) at timeSeconds, deterministic per seed: on almost all the time,
++    // blinking off one to three times (70 ms each) every few seconds. Seeds give each tube its own rhythm.
++    float glowFlicker(double timeSeconds, uint32_t seed);
++
++    // A glow's intensity scale with flicker amount: 1 - amount * (1 - glowFlicker(time, seed)).
++    float glowFlickerScale(double timeSeconds, uint32_t seed, float amount);
++
++    // Pads or trims the color lists to the lights and glows (new entries: no own color, white glow), after an edit
++    // adds or removes lights or glows.
++    void syncColorLists(LightPreset &preset);
++
++    // Writes the file back as JSON that parses to the same presets. Only the fields a preset sets itself are written
++    // (setFields), so later edits to "default" still reach the venues that never overrode them. Comments in the
++    // original are not kept.
++    std::string writeLightPresets(const LightPresetFile &file);
++
++    // Copies "default"'s values into the fields the room and the venues don't set themselves (after editing
++    // "default", so the presets in use match what the file will say).
++    void inheritDefault(LightPresetFile &file);
++
++    // Venue texture hashes are written as 16 uppercase hex digits.
++    std::string formatTextureHash(uint64_t hash);
++
++    // Sets each venue's uniqueMatch: its match textures no other venue lists.
++    void computeUniqueMatches(std::vector<LightPreset> &venues);
++
++    // The fraction (0..1) of a venue's match textures (its unique ones when it has any) for which seen() is true.
++    float venueMatchScore(const LightPreset &venue, const std::function<bool(uint64_t)> &seen);
++
++    // The best scoring venue at or above minScore (-1: none). Ties go to the later venue (the long-standing rule).
++    int bestVenue(const std::vector<LightPreset> &venues, const std::function<bool(uint64_t)> &seen, float minScore = 0.5f);
++
++    // Match textures for a new venue made from the current scene: the stable world textures (hash, max triangles)
++    // that no existing venue lists, largest first, at most maxCount.
++    // How much a world surface at receiverDistance (XZ distance from the lights' center) keeps of its brightness with
++    // outside darkness: 1 inside the radius, easing (smoothstep) to 1 - darkness at radius + edge and beyond.
++    // Wrestlers included. The trace shader (WcwRtTraceCS) mirrors this.
++    float outsideDarknessFactor(float receiverDistance, float radius, float edge, float darkness);
++
++    // How much of the outside darkness applies at a distance from a lit region: 0 within radius, easing (smoothstep)
++    // to 1 at radius + edge and beyond.
++    float darknessRamp(float distance, float radius, float edge);
++
++    // outsideDarknessFactor at a point on the floor plane (x, z), with lit areas: the darkness ramp is the smallest of
++    // the ring's (distance from center, radius, edge) and each lit area's, so the ring and the lit areas are all lit.
++    float outsideDarknessAt(float x, float z, float centerX, float centerZ, float radius, float edge, float darkness,
++        const std::vector<std::array<float, 4>> &litAreas);
++
++    // Outside darkness for a ray miss: misses carry no position, so the ray is projected onto the arena floor plane
++    // (y = floorY) and judged by the XZ distance from the center (centerX, centerZ) where it lands. A miss over the
++    // ring mat (drawn by another pass, so not in this pass's scene) lands inside the radius and stays lit; a ray
++    // that points up or lands far out (the stands, the crowd) counts as infinitely far. Before this, every miss
++    // darkened and the mat went grey.
++    float missFloorDistance(const float origin[3], const float direction[3], float floorY, float centerX, float centerZ);
++
++    // Which traced pass of a frame darkens the ray misses (outside darkness), for one color target. AKI frames are
++    // several passes into one image; misses must darken once, on the arena pass (the one that traces the most
++    // meshes), after the crowd is drawn and before the wrestlers and HUD. Darkening on the first pass instead left
++    // the crowd lit (it is drawn by a later pass). The choice sticks: it only moves to another pass that has had
++    // clearly more meshes (SwitchRatio) for SwitchFrames frames in a row, or when the chosen pass disappears.
++    // Following the frame's busiest pass directly flickered the background: two passes with 44 and 45 meshes
++    // traded places from frame to frame.
++    class MissDarkeningPass {
++    public:
++        static constexpr float SwitchRatio = 1.25f;
++        static constexpr uint32_t SwitchFrames = 15;
++
++        // Called once per traced pass; true for the pass that darkens the misses this frame.
++        bool darkenThisPass(uint64_t presentId, uint32_t passIndex, size_t meshCount);
++
++    private:
++        void finishFrame();
++
++        uint64_t present = UINT64_MAX;
++        uint32_t chosenPass = UINT32_MAX;
++        // This frame: the busiest pass and the chosen pass's mesh count (0 = it didn't run).
++        uint32_t bestPass = UINT32_MAX;
++        size_t bestMeshes = 0;
++        size_t chosenMeshes = 0;
++        uint32_t switchStreak = 0;
++        uint32_t streakPass = UINT32_MAX;
++    };
++
++    // Which pass darkens the misses, per color target: once per target per present, on the first pass that traces at
++    // least ArenaShare of the target's recent largest pass (the arena pass: 130-136 meshes in Raw, against 94 for the
++    // pass before it and under 20 for the rest). Choosing by position flickered the crowd: at 60 fps the real and
++    // interpolated frames go to alternating targets with their passes interleaved, and when a present carried both swap
++    // targets' frames the arena pass moved from pass 3 to pass 8, so whole frames had no darkening pass.
++    class MissDarkening {
++    public:
++        static constexpr float ArenaShare = 0.8f;
++        // The recent maximum decays by this much per present, so a scene change to smaller passes takes over.
++        static constexpr float MaxDecay = 0.98f;
++
++        // Called once per traced pass, in order; true for the pass that darkens the misses on this target.
++        bool darkenThisPass(const void *target, uint64_t presentId, size_t meshCount);
++
++    private:
++        struct Target {
++            uint64_t present = UINT64_MAX;
++            bool darkened = false;
++            float recentMax = 0.0f;
++        };
++
++        std::unordered_map<const void *, Target> targets;
++    };
++
++    std::vector<uint64_t> newVenueMatch(const std::vector<std::pair<uint64_t, uint32_t>> &stableTextures,
++        const std::vector<LightPreset> &venues, size_t maxCount = 15);
 +};
 diff --git a/src/contrib/crt/NOTICE.md b/src/contrib/crt/NOTICE.md
 new file mode 100644
@@ -12961,7 +13834,7 @@ index 16b4b9c..f9156e0 100644
                  break;
              }
 diff --git a/src/hle/rt64_application.cpp b/src/hle/rt64_application.cpp
-index 785de27..b72a257 100644
+index 785de27..6567b29 100644
 --- a/src/hle/rt64_application.cpp
 +++ b/src/hle/rt64_application.cpp
 @@ -4,6 +4,7 @@
@@ -13062,6 +13935,80 @@ index 785de27..b72a257 100644
          screenApiProfiler.logAndRestart();
          state->updateScreen(core.decodeVI(), false);
      }
+@@ -588,6 +634,14 @@ namespace RT64 {
+ #endif
+ 
+     bool Application::sdlEventFilter(SDL_Event *event) {
++        static const bool inspectorLog = getenv("WCW_INSPECTOR_LOG") != nullptr;
++        static int loggedMouse = 0;
++        if (inspectorLog && ((event->type == SDL_MOUSEBUTTONDOWN) || (event->type == SDL_MOUSEMOTION)) && (loggedMouse < 6)) {
++            loggedMouse++;
++            fprintf(stderr, "[wcw][inspector] SDL mouse event %u, developer %d, inspector %p\n", event->type, int(userConfig.developerMode),
++                (presentQueue != nullptr) ? (void *)presentQueue->inspector.get() : nullptr);
++        }
++
+         if (userConfig.developerMode && (presentQueue != nullptr) && (state != nullptr) && !FileDialog::isOpen) {
+             const std::lock_guard lock(presentQueue->inspectorMutex);
+             if ((presentQueue->inspector != nullptr) && presentQueue->inspector->handleSdlEvent(event)) {
+diff --git a/src/hle/rt64_application_window.cpp b/src/hle/rt64_application_window.cpp
+index 86ae197..6a24b1d 100755
+--- a/src/hle/rt64_application_window.cpp
++++ b/src/hle/rt64_application_window.cpp
+@@ -59,15 +59,38 @@ namespace RT64 {
+         windowWrapper = std::make_unique<CocoaWindow>(window.window);
+ #   endif
+ 
+-        if (listener->usesWindowMessageFilter()) {
+-            if ((sdlWindow == nullptr) && SDL_WasInit(SDL_INIT_VIDEO)) {
+-                // We'd normally install the event filter here, but Mupen does not set its own event filter
+-                // until much later. Instead, we delegate this to the first time a screen update is sent.
+-                // FIXME: We attempt to get the first window created by SDL2. This can be improved later
+-                // by actually passing the SDL_Window handle through as a parameter.
++        // [wcw fix] Find the SDL window even when developer mode is off at startup: it is only used for the inspector's
++        // input (the event filter, installed once developer mode turns on) and its ImGui backend. Without it, an
++        // inspector opened later (F1 with developer mode, WCW_INSPECTOR) got the Win32 backend and no input at all.
++        if ((sdlWindow == nullptr) && SDL_WasInit(SDL_INIT_VIDEO)) {
++            // We'd normally install the event filter here, but Mupen does not set its own event filter
++            // until much later. Instead, we delegate this to the first time a screen update is sent.
++#       ifdef _WIN32
++            // [wcw fix] The SDL window RT64 renders into (matched by its HWND), not simply the first one: ImGui's SDL
++            // backend drops mouse button events from any other window ID, so the inspector saw the cursor but never a click.
++            for (Uint32 id = 1; (id <= 64) && (sdlWindow == nullptr); id++) {
++                SDL_Window *candidate = SDL_GetWindowFromID(id);
++                SDL_SysWMinfo wmInfo;
++                SDL_VERSION(&wmInfo.version);
++                if ((candidate != nullptr) && SDL_GetWindowWMInfo(candidate, &wmInfo) && (wmInfo.info.win.window == window)) {
++                    sdlWindow = candidate;
++                }
++            }
++#       endif
++
++            // FIXME: We attempt to get the first window created by SDL2. This can be improved later
++            // by actually passing the SDL_Window handle through as a parameter.
++            if (sdlWindow == nullptr) {
+                 sdlWindow = SDL_GetWindowFromID(1);
+             }
++        }
++
++        if (getenv("WCW_INSPECTOR_LOG") != nullptr) {
++            fprintf(stderr, "[wcw][inspector] window setup: sdl video %d, sdl window %p (id %u), filter now %d\n", int(SDL_WasInit(SDL_INIT_VIDEO) != 0), (void *)sdlWindow,
++                (sdlWindow != nullptr) ? SDL_GetWindowID(sdlWindow) : 0u, int(listener->usesWindowMessageFilter()));
++        }
+ 
++        if (listener->usesWindowMessageFilter()) {
+             if (sdlWindow == nullptr) {
+ #           ifdef _WIN32
+                 assert(HookedApplicationWindow == nullptr);
+@@ -397,6 +420,9 @@ namespace RT64 {
+ 
+             SDL_SetEventFilter(&ApplicationWindow::sdlEventFilter, this);
+             sdlEventFilterInstalled = true;
++            if (getenv("WCW_INSPECTOR_LOG") != nullptr) {
++                fprintf(stderr, "[wcw][inspector] SDL event filter installed (previous filter %p)\n", (void *)sdlEventFilterStored);
++            }
+         }
+     }
+ 
 diff --git a/src/hle/rt64_framebuffer_pair.cpp b/src/hle/rt64_framebuffer_pair.cpp
 index c944393..cd21793 100644
 --- a/src/hle/rt64_framebuffer_pair.cpp
@@ -14942,7 +15889,7 @@ index 8858dac..520519d 100644
          uint32_t interpolatedFramesIndex = 0;
          std::mutex interpolatedMutex;
 diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
-index d249a97..62597ad 100644
+index d249a97..188cbfd 100644
 --- a/src/hle/rt64_state.cpp
 +++ b/src/hle/rt64_state.cpp
 @@ -6,6 +6,7 @@
@@ -15020,6 +15967,20 @@ index d249a97..62597ad 100644
          if (newVI.visible()) {
              // See if there's an existing framebuffer that lines up with the VI. If there is, we support reading 
              // CPU changes directly to it and recreating them in the render thread at low resolution.
+@@ -2568,6 +2615,13 @@ namespace RT64 {
+ 
+         ImGui::End();
+ 
++        // [wcw rt] Lighting editor for the ray tracing venue presets.
++        if ((ext.workloadQueue != nullptr) && (ext.workloadQueue->framebufferRenderer != nullptr) &&
++            (ext.workloadQueue->framebufferRenderer->wcwRaytracer != nullptr))
++        {
++            ext.workloadQueue->framebufferRenderer->wcwRaytracer->drawLightingEditor();
++        }
++
+         if (inspectorMode != InspectorMode::None) {
+             if (ImGui::Begin("Inspector")) {
+                 switch (inspectorMode) {
 diff --git a/src/hle/rt64_vi.cpp b/src/hle/rt64_vi.cpp
 index a870166..ad4c1d8 100644
 --- a/src/hle/rt64_vi.cpp
@@ -18235,12 +19196,441 @@ index 8a3782a..0789a75 100644
      };
  };
 \ No newline at end of file
+diff --git a/src/render/rt64_wcw_lighting_editor.cpp b/src/render/rt64_wcw_lighting_editor.cpp
+new file mode 100644
+index 0000000..29fb84f
+--- /dev/null
++++ b/src/render/rt64_wcw_lighting_editor.cpp
+@@ -0,0 +1,423 @@
++//
++// RT64
++//
++
++// [wcw rt] Lighting editor: a "Lighting" window in the RT64 inspector (developer mode: WCW_INSPECTOR=1 or F1) for
++// rigging the ray tracing lights of each venue while the game runs. Edits apply on the next frame; Save writes
++// rt_lights.json (the previous file is kept as .bak). The presets data model and file format are WcwLogic's
++// (common/rt64_wcw_venues, unit tested).
++
++#include "rt64_wcw_raytracer.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <filesystem>
++#include <fstream>
++
++#include "imgui/imgui.h"
++
++namespace RT64 {
++    std::vector<std::pair<uint64_t, uint32_t>> WcwRaytracer::stableTextures() const {
++        std::vector<std::pair<uint64_t, uint32_t>> stable;
++        for (const auto &it : textureCounts) {
++            if (it.second >= (VenueWindow * 9) / 10) {
++                auto maxTris = textureMaxTris.find(it.first);
++                stable.emplace_back(it.first, (maxTris != textureMaxTris.end()) ? maxTris->second : 0u);
++            }
++        }
++
++        std::sort(stable.begin(), stable.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
++        return stable;
++    }
++
++    bool WcwRaytracer::savePresets() {
++        const std::lock_guard<std::recursive_mutex> lock(presetsMutex);
++        if (presetsPath.empty()) {
++            editorMessage = "No presets path.";
++            return false;
++        }
++
++        std::error_code ec;
++        if (std::filesystem::exists(presetsPath, ec)) {
++            std::filesystem::copy_file(presetsPath, presetsPath + ".bak", std::filesystem::copy_options::overwrite_existing, ec);
++            if (ec) {
++                editorMessage = "Could not write " + presetsPath + ".bak: " + ec.message();
++                return false;
++            }
++        }
++
++        const std::string text = WcwLogic::writeLightPresets(presetFile);
++        {
++            std::ofstream file(presetsPath, std::ios::binary | std::ios::trunc);
++            if (!file) {
++                editorMessage = "Could not write " + presetsPath + ".";
++                return false;
++            }
++
++            file << text;
++        }
++
++        // Don't hot reload what was just written (that would also drop a forced venue).
++        const auto stampTime = std::filesystem::last_write_time(presetsPath, ec);
++        if (!ec) {
++            presetsStamp = int64_t(stampTime.time_since_epoch().count());
++        }
++
++        presetsEdited = false;
++        editorMessage = "Saved " + presetsPath + " (previous file: .bak).";
++        fprintf(stderr, "[wcw rt] lighting editor: saved %s\n", presetsPath.c_str());
++        return true;
++    }
++
++    int WcwRaytracer::newVenueFromScene(const std::string &name) {
++        const std::lock_guard<std::recursive_mutex> lock(presetsMutex);
++        const std::vector<uint64_t> match = WcwLogic::newVenueMatch(stableTextures(), presetFile.venues);
++        if (match.empty()) {
++            editorMessage = "No world textures unique to this scene (is ray tracing on, and the camera steady for 2 s?).";
++            return -1;
++        }
++
++        WcwLogic::LightPreset venue = presetFile.defaultPreset;
++        venue.setFields = 0;
++        venue.name = name.empty() ? ("Venue " + std::to_string(presetFile.venues.size() + 1)) : name;
++        venue.match = match;
++        presetFile.venues.push_back(venue);
++        applyPresetFile();
++        venueOverride = int(presetFile.venues.size()) - 1;
++        presetsEdited = true;
++        editorMessage = "Added \"" + venue.name + "\" with " + std::to_string(match.size()) + " match textures (forced; Save to keep it).";
++        return venueOverride;
++    }
++
++    // Marks a field as set by the preset when its widget changed.
++    static bool edited(bool changed, WcwLogic::LightPreset &p, uint32_t field) {
++        if (changed) {
++            p.setFields |= field;
++        }
++
++        return changed;
++    }
++
++    static const char *fieldMark(const WcwLogic::LightPreset &p, uint32_t field, bool isDefault) {
++        return (isDefault || (p.setFields & field)) ? "" : " (inherited)";
++    }
++
++    void WcwRaytracer::drawLightingEditor() {
++        // The inspector doesn't scale with the display: at 4K its text was unreadably small. 1080 lines = 1x.
++        ImGuiIO &io = ImGui::GetIO();
++        io.FontGlobalScale = std::max(1.0f, std::floor(io.DisplaySize.y / 1080.0f * 4.0f + 0.5f) / 4.0f);
++        ImGui::SetNextWindowPos(ImVec2(16.0f, 16.0f), ImGuiCond_FirstUseEver);
++        ImGui::SetNextWindowSize(ImVec2(480.0f * io.FontGlobalScale, io.DisplaySize.y * 0.8f), ImGuiCond_FirstUseEver);
++        if (!ImGui::Begin("Lighting")) {
++            ImGui::End();
++            return;
++        }
++
++        {
++            static const bool inspectorLog = getenv("WCW_INSPECTOR_LOG") != nullptr;
++            static uint32_t logFrame = 0;
++            if (inspectorLog && (((logFrame++ % 15) == 0) || io.MouseDown[0])) {
++                fprintf(stderr, "[wcw][inspector] imgui mouse (%.0f, %.0f) down %d hovered %d display %.0fx%.0f\n", io.MousePos.x, io.MousePos.y,
++                    int(io.MouseDown[0]), int(ImGui::IsWindowHovered()), io.DisplaySize.x, io.DisplaySize.y);
++            }
++        }
++
++        const std::lock_guard<std::recursive_mutex> lock(presetsMutex);
++
++        // WCW_RT_EDITOR_SAVE_AT=<seconds> (test hook): presses Save once, that long after the editor first drew, so
++        // scripted runs can check the save round-trip (file written, .bak kept, no reload, venue still detected).
++        {
++            static const double saveAt = getenv("WCW_RT_EDITOR_SAVE_AT") ? atof(getenv("WCW_RT_EDITOR_SAVE_AT")) : -1.0;
++            static const auto firstDraw = std::chrono::steady_clock::now();
++            static bool saved = false;
++            if ((saveAt >= 0.0) && !saved && (std::chrono::duration<double>(std::chrono::steady_clock::now() - firstDraw).count() >= saveAt)) {
++                saved = true;
++                fprintf(stderr, "[wcw rt] lighting editor: test save (WCW_RT_EDITOR_SAVE_AT): %s\n", savePresets() ? "ok" : editorMessage.c_str());
++            }
++        }
++
++        if (!active() || !supported) {
++            ImGui::TextWrapped("Ray tracing is %s. Turn on Graphics > Ray Tracing (needs D3D12 and DirectX Raytracing) to see the lights.",
++                supported ? "off" : "not supported here");
++        }
++
++        const char *detected = roomActive ? "room (fallback)" : ((activeVenue >= 0) ? venuePresets[activeVenue].name.c_str() : "default");
++        ImGui::Text("Detected venue: %s", detected);
++        ImGui::TextDisabled("Presets: %s%s", presetsPath.c_str(), presetsEdited ? "  (unsaved changes)" : "");
++
++        // Which preset is in use and edited: detection, or a forced one.
++        std::string current = (venueOverride == -2) ? ("Detected (" + std::string(detected) + ")") :
++            ((venueOverride == -1) ? std::string("default") : presetFile.venues[venueOverride].name);
++        if (ImGui::BeginCombo("Preset", current.c_str())) {
++            if (ImGui::Selectable("Detected", venueOverride == -2)) {
++                venueOverride = -2;
++            }
++
++            if (ImGui::Selectable("default", venueOverride == -1)) {
++                venueOverride = -1;
++            }
++
++            for (int v = 0; v < int(presetFile.venues.size()); v++) {
++                ImGui::PushID(v);
++                if (ImGui::Selectable(presetFile.venues[v].name.c_str(), venueOverride == v)) {
++                    venueOverride = v;
++                }
++
++                ImGui::PopID();
++            }
++
++            ImGui::EndCombo();
++        }
++
++        // The preset the sliders edit.
++        WcwLogic::LightPreset *preset = nullptr;
++        bool isDefault = false;
++        bool isRoom = false;
++        if (venueOverride >= 0) {
++            preset = &presetFile.venues[venueOverride];
++        }
++        else if ((venueOverride == -2) && (activeVenue >= 0)) {
++            preset = &presetFile.venues[activeVenue];
++        }
++        else if ((venueOverride == -2) && roomActive) {
++            preset = &presetFile.roomPreset;
++            isRoom = true;
++        }
++        else {
++            preset = &presetFile.defaultPreset;
++            isDefault = true;
++        }
++
++        ImGui::Separator();
++        bool changed = false;
++        WcwLogic::LightPreset &p = *preset;
++        if (!isDefault && !isRoom) {
++            char name[64];
++            snprintf(name, sizeof(name), "%s", p.name.c_str());
++            if (ImGui::InputText("Name", name, sizeof(name))) {
++                p.name = name;
++                changed = true;
++            }
++
++            ImGui::TextDisabled("%zu match textures (%zu unique to this venue)", p.match.size(), p.uniqueMatch.size());
++        }
++        else if (isRoom) {
++            ImGui::TextWrapped("Room fallback: its lights are generated from the room's bounds (count, height).");
++            changed |= ImGui::SliderInt("Count", reinterpret_cast<int *>(&presetFile.roomCount), 1, WCW_RT_MAX_LIGHTS);
++            changed |= ImGui::SliderFloat("Height", &presetFile.roomHeight, 0.1f, 1.0f);
++            changed |= ImGui::DragFloat("Max extent", &presetFile.roomMaxExtent, 10.0f, 100.0f, 20000.0f);
++        }
++
++        // Colored light (WcwLogic::LightPreset::color): the preset's light color, and the generated rig's key / fill.
++        if (ImGui::CollapsingHeader("Color", ImGuiTreeNodeFlags_DefaultOpen)) {
++            ImGui::TextDisabled("Tints the light inside the receiver radius, more with a stronger Shadow; brightness stays the same.");
++            changed |= edited(ImGui::ColorEdit3((std::string("Light color") + fieldMark(p, WcwLogic::FieldColor, isDefault)).c_str(), p.color.data(), ImGuiColorEditFlags_Float), p, WcwLogic::FieldColor);
++            if (!isRoom && p.lights.empty()) {
++                changed |= edited(ImGui::ColorEdit3((std::string("Key color") + fieldMark(p, WcwLogic::FieldKeyColor, isDefault)).c_str(), p.keyColor.data(), ImGuiColorEditFlags_Float), p, WcwLogic::FieldKeyColor);
++                changed |= edited(ImGui::ColorEdit3((std::string("Fill color") + fieldMark(p, WcwLogic::FieldFillColor, isDefault)).c_str(), p.fillColor.data(), ImGuiColorEditFlags_Float), p, WcwLogic::FieldFillColor);
++            }
++        }
++
++        // Lights: explicit list, or the generated rig (center + fills).
++        if (!isRoom && ImGui::CollapsingHeader("Lights", ImGuiTreeNodeFlags_DefaultOpen)) {
++            ImGui::TextDisabled("Positions are world units%s.%s", p.anchorScene ? ", relative to the scene's center and floor" : "",
++                fieldMark(p, WcwLogic::FieldLights, isDefault));
++            if (p.lights.empty()) {
++                ImGui::TextWrapped("Generated rig: a key light at the center and fill lights around it.");
++                changed |= edited(ImGui::DragFloat3("Center", p.center, 5.0f), p, WcwLogic::FieldCenter);
++                changed |= edited(ImGui::DragFloat("Spread", &p.spread, 5.0f, 0.0f, 5000.0f), p, WcwLogic::FieldSpread);
++                changed |= edited(ImGui::SliderInt("Fills", reinterpret_cast<int *>(&p.fills), 0, WCW_RT_MAX_LIGHTS - 1), p, WcwLogic::FieldFills);
++                changed |= edited(ImGui::SliderFloat("Key weight", &p.keyWeight, 0.0f, 1.0f), p, WcwLogic::FieldKeyWeight);
++                if (ImGui::Button("Switch to explicit lights")) {
++                    p.lights.push_back({ p.center[0], p.center[1], p.center[2], 2.0f });
++                    WcwLogic::syncColorLists(p);
++                    p.setFields |= WcwLogic::FieldLights;
++                    changed = true;
++                }
++            }
++            else {
++                int remove = -1;
++                for (int i = 0; i < int(p.lights.size()); i++) {
++                    ImGui::PushID(i);
++                    ImGui::Text("Light %d", i + 1);
++                    ImGui::SameLine();
++                    if (ImGui::SmallButton("Remove")) {
++                        remove = i;
++                    }
++
++                    changed |= edited(ImGui::DragFloat3("Position", p.lights[i].data(), 5.0f), p, WcwLogic::FieldLights);
++                    changed |= edited(ImGui::SliderFloat("Weight", &p.lights[i][3], 0.0f, 4.0f), p, WcwLogic::FieldLights);
++                    WcwLogic::syncColorLists(p);
++                    bool own = (p.lightOwnColor[i] != 0);
++                    if (edited(ImGui::Checkbox("Own color", &own), p, WcwLogic::FieldLights)) {
++                        p.lightOwnColor[i] = own ? 1 : 0;
++                        p.lightColors[i] = p.color;
++                        changed = true;
++                    }
++
++                    if (own) {
++                        ImGui::SameLine();
++                        changed |= edited(ImGui::ColorEdit3("##color", p.lightColors[i].data(), ImGuiColorEditFlags_Float | ImGuiColorEditFlags_NoInputs), p, WcwLogic::FieldLights);
++                    }
++
++                    ImGui::PopID();
++                }
++
++                if (remove >= 0) {
++                    WcwLogic::syncColorLists(p);
++                    p.lights.erase(p.lights.begin() + remove);
++                    p.lightColors.erase(p.lightColors.begin() + remove);
++                    p.lightOwnColor.erase(p.lightOwnColor.begin() + remove);
++                    p.setFields |= WcwLogic::FieldLights;
++                    changed = true;
++                }
++
++                if ((p.lights.size() < WCW_RT_MAX_LIGHTS) && ImGui::Button("Add light")) {
++                    const auto &last = p.lights.back();
++                    p.lights.push_back({ last[0] + 100.0f, last[1], last[2], 1.0f });
++                    WcwLogic::syncColorLists(p);
++                    p.setFields |= WcwLogic::FieldLights;
++                    changed = true;
++                }
++
++                ImGui::SameLine();
++                changed |= edited(ImGui::DragFloat3("Center", p.center, 5.0f), p, WcwLogic::FieldCenter);
++            }
++        }
++
++        if (ImGui::CollapsingHeader("Shadows", ImGuiTreeNodeFlags_DefaultOpen)) {
++            ImGui::TextDisabled("Shadow strength on the world and on the wrestlers; receiver radius = how far from the center shadows land.");
++            changed |= edited(ImGui::SliderFloat((std::string("Shadow") + fieldMark(p, WcwLogic::FieldShadow, isDefault)).c_str(), &p.shadow, 0.0f, 1.0f), p, WcwLogic::FieldShadow);
++            changed |= edited(ImGui::SliderFloat((std::string("Wrestler shadow") + fieldMark(p, WcwLogic::FieldCharacterShadow, isDefault)).c_str(), &p.characterShadow, 0.0f, 1.0f), p, WcwLogic::FieldCharacterShadow);
++            changed |= edited(ImGui::DragFloat((std::string("Light size") + fieldMark(p, WcwLogic::FieldSize, isDefault)).c_str(), &p.size, 0.5f, 0.0f, 500.0f), p, WcwLogic::FieldSize);
++            if (!isRoom) {
++                changed |= edited(ImGui::DragFloat((std::string("Receiver radius") + fieldMark(p, WcwLogic::FieldRadius, isDefault)).c_str(), &p.radius, 10.0f, 0.0f, 20000.0f), p, WcwLogic::FieldRadius);
++            }
++
++            if (!isRoom) {
++                ImGui::TextDisabled("Outside darkness: dims everything beyond the receiver radius, wrestlers included.");
++                changed |= edited(ImGui::SliderFloat((std::string("Outside darkness") + fieldMark(p, WcwLogic::FieldOutsideDarkness, isDefault)).c_str(), &p.outsideDarkness, 0.0f, 1.0f), p, WcwLogic::FieldOutsideDarkness);
++                changed |= edited(ImGui::DragFloat((std::string("Darkness edge") + fieldMark(p, WcwLogic::FieldOutsideEdge, isDefault)).c_str(), &p.outsideEdge, 10.0f, 0.0f, 5000.0f), p, WcwLogic::FieldOutsideEdge);
++                ImGui::TextDisabled("Lit areas%s: places with their own lighting (the entrance set) stay out of the darkness.", fieldMark(p, WcwLogic::FieldLitAreas, isDefault));
++                int removeArea = -1;
++                for (int i = 0; i < int(p.litAreas.size()); i++) {
++                    ImGui::PushID(2000 + i);
++                    changed |= edited(ImGui::DragFloat4("X Z radius edge", p.litAreas[i].data(), 10.0f), p, WcwLogic::FieldLitAreas);
++                    ImGui::SameLine();
++                    if (ImGui::SmallButton("Remove")) {
++                        removeArea = i;
++                    }
++
++                    ImGui::PopID();
++                }
++
++                if (removeArea >= 0) {
++                    p.litAreas.erase(p.litAreas.begin() + removeArea);
++                    p.setFields |= WcwLogic::FieldLitAreas;
++                    changed = true;
++                }
++
++                if ((p.litAreas.size() < WcwLogic::MaxLitAreas) && ImGui::Button("Add lit area")) {
++                    p.litAreas.push_back({ p.center[0], p.center[2], 500.0f, 400.0f });
++                    p.setFields |= WcwLogic::FieldLitAreas;
++                    changed = true;
++                }
++            }
++
++            changed |= edited(ImGui::DragFloat((std::string("Clearance") + fieldMark(p, WcwLogic::FieldClearance, isDefault)).c_str(), &p.clearance, 1.0f, 0.0f, 1000.0f), p, WcwLogic::FieldClearance);
++            changed |= edited(ImGui::DragFloat((std::string("Falloff") + fieldMark(p, WcwLogic::FieldFalloff, isDefault)).c_str(), &p.falloff, 5.0f, 0.0f, 10000.0f), p, WcwLogic::FieldFalloff);
++            if (!isRoom) {
++                bool anchor = p.anchorScene;
++                if (edited(ImGui::Checkbox((std::string("Anchor to scene") + fieldMark(p, WcwLogic::FieldAnchor, isDefault)).c_str(), &anchor), p, WcwLogic::FieldAnchor)) {
++                    p.anchorScene = anchor;
++                    changed = true;
++                }
++            }
++        }
++
++        if (!isRoom && ImGui::CollapsingHeader("Glows")) {
++            int remove = -1;
++            for (int i = 0; i < int(p.glows.size()); i++) {
++                ImGui::PushID(1000 + i);
++                ImGui::Text("Glow %d", i + 1);
++                ImGui::SameLine();
++                if (ImGui::SmallButton("Remove")) {
++                    remove = i;
++                }
++
++                changed |= edited(ImGui::DragFloat3("Position", p.glows[i].data(), 5.0f), p, WcwLogic::FieldGlows);
++                changed |= edited(ImGui::SliderFloat("Intensity", &p.glows[i][3], 0.0f, 4.0f), p, WcwLogic::FieldGlows);
++                changed |= edited(ImGui::DragFloat("Range", &p.glows[i][4], 10.0f, 0.0f, 20000.0f), p, WcwLogic::FieldGlows);
++                WcwLogic::syncColorLists(p);
++                changed |= edited(ImGui::ColorEdit3("Color", p.glowColors[i].data(), ImGuiColorEditFlags_Float), p, WcwLogic::FieldGlows);
++                changed |= edited(ImGui::SliderFloat("Flicker", &p.glowFlicker[i], 0.0f, 1.0f), p, WcwLogic::FieldGlows);
++                ImGui::PopID();
++            }
++
++            if (remove >= 0) {
++                WcwLogic::syncColorLists(p);
++                p.glows.erase(p.glows.begin() + remove);
++                p.glowColors.erase(p.glowColors.begin() + remove);
++                p.glowFlicker.erase(p.glowFlicker.begin() + remove);
++                p.setFields |= WcwLogic::FieldGlows;
++                changed = true;
++            }
++
++            if ((p.glows.size() < WCW_RT_MAX_GLOWS) && ImGui::Button("Add glow")) {
++                p.glows.push_back({ p.center[0], p.center[1], p.center[2], 1.0f, 500.0f });
++                WcwLogic::syncColorLists(p);
++                p.setFields |= WcwLogic::FieldGlows;
++                changed = true;
++            }
++        }
++
++        if (changed) {
++            // Inheritance and the effective key / fill colors follow every edit (a venue's color reaches its rig).
++            WcwLogic::inheritDefault(presetFile);
++
++            applyPresetFile();
++            presetsEdited = true;
++        }
++
++        if (ImGui::CollapsingHeader("View", ImGuiTreeNodeFlags_DefaultOpen)) {
++            static const char *modeNames[] = { "Hit normal", "Hit depth", "Shadows (normal)", "Hit mesh", "Shadow occluder",
++                "Hit position", "Shadow distance", "Ambient occlusion", "Light map (light positions)", "Raw AO" };
++            int modeIndex = int(std::min<uint32_t>(mode, uint32_t(std::size(modeNames) - 1)));
++            if (ImGui::Combo("Debug view", &modeIndex, modeNames, int(std::size(modeNames)))) {
++                mode = uint32_t(modeIndex);
++            }
++
++            static int split = -1;
++            bool splitOn = splitScreen();
++            if (ImGui::Checkbox("Split screen (ray tracing on the right half)", &splitOn)) {
++                split = splitOn ? 1 : 0;
++                setSplitScreenOverride(split);
++            }
++        }
++
++        ImGui::Separator();
++        if (ImGui::Button("Save")) {
++            savePresets();
++        }
++
++        ImGui::SameLine();
++        if (ImGui::Button("Reload file")) {
++            presetsStamp = INT64_MIN + 2;
++            loadPresets(true);
++            editorMessage = "Reloaded " + presetsPath + ".";
++        }
++
++        ImGui::InputText("##newvenue", editorNewVenueName, sizeof(editorNewVenueName));
++        ImGui::SameLine();
++        if (ImGui::Button("New venue from current scene")) {
++            newVenueFromScene(editorNewVenueName);
++        }
++
++        if (!editorMessage.empty()) {
++            ImGui::TextWrapped("%s", editorMessage.c_str());
++        }
++
++        ImGui::End();
++    }
++};
 diff --git a/src/render/rt64_wcw_raytracer.cpp b/src/render/rt64_wcw_raytracer.cpp
 new file mode 100644
-index 0000000..068854b
+index 0000000..2a5bf44
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.cpp
-@@ -0,0 +1,1240 @@
+@@ -0,0 +1,1220 @@
 +//
 +// RT64
 +//
@@ -18257,6 +19647,7 @@ index 0000000..068854b
 +#include <cstring>
 +#include <filesystem>
 +#include <fstream>
++#include <sstream>
 +
 +#include <json/json.hpp>
 +
@@ -18421,63 +19812,6 @@ index 0000000..068854b
 +        workloadCounter++;
 +    }
 +
-+    static WcwRaytracer::LightPreset parsePreset(const nlohmann::json &j, const WcwRaytracer::LightPreset &base) {
-+        WcwRaytracer::LightPreset p = base;
-+        p.name = j.value("name", std::string());
-+        p.match.clear();
-+        if (j.contains("match")) {
-+            for (const auto &h : j["match"]) {
-+                p.match.push_back(strtoull(h.get<std::string>().c_str(), nullptr, 16));
-+            }
-+        }
-+
-+        if (j.contains("center")) {
-+            for (uint32_t i = 0; i < 3; i++) {
-+                p.center[i] = j["center"][i].get<float>();
-+            }
-+        }
-+
-+        p.spread = j.value("spread", p.spread);
-+        p.fills = j.value("fills", p.fills);
-+        p.keyWeight = j.value("keyWeight", p.keyWeight);
-+        p.size = j.value("size", p.size);
-+        p.radius = j.value("radius", p.radius);
-+        p.clearance = j.value("clearance", p.clearance);
-+        p.falloff = j.value("falloff", p.falloff);
-+        auto readColor = [&](const char *key, std::array<float, 3> fallback) {
-+            if (j.contains(key) && (j[key].size() >= 3)) {
-+                return std::array<float, 3>{ j[key][0].get<float>(), j[key][1].get<float>(), j[key][2].get<float>() };
-+            }
-+
-+            return fallback;
-+        };
-+
-+        p.color = readColor("color", p.color);
-+        p.keyColor = readColor("keyColor", p.color);
-+        p.fillColor = readColor("fillColor", p.color);
-+        if (j.contains("glows")) {
-+            p.glows.clear();
-+            p.glowColors.clear();
-+            for (const auto &g : j["glows"]) {
-+                p.glows.push_back({ g[0].get<float>(), g[1].get<float>(), g[2].get<float>(), g[3].get<float>(), g[4].get<float>() });
-+                p.glowColors.push_back((g.size() >= 8) ? std::array<float, 3>{ g[5].get<float>(), g[6].get<float>(), g[7].get<float>() } : std::array<float, 3>{ 1.0f, 1.0f, 1.0f });
-+            }
-+        }
-+        p.shadow = j.value("shadow", p.shadow);
-+        p.characterShadow = j.value("characterShadow", p.characterShadow);
-+        p.anchorScene = (j.value("anchor", std::string(p.anchorScene ? "scene" : "world")) == "scene");
-+        if (j.contains("lights")) {
-+            p.lights.clear();
-+            p.lightColors.clear();
-+            for (const auto &l : j["lights"]) {
-+                p.lights.push_back({ l[0].get<float>(), l[1].get<float>(), l[2].get<float>(), (l.size() > 3) ? l[3].get<float>() : 1.0f });
-+                p.lightColors.push_back((l.size() >= 7) ? std::array<float, 3>{ l[4].get<float>(), l[5].get<float>(), l[6].get<float>() } : p.color);
-+            }
-+        }
-+
-+        return p;
-+    }
-+
 +    void WcwRaytracer::loadPresets(bool force) {
 +        if (presetsPath.empty()) {
 +            const char *pathText = getenv("WCW_RT_LIGHTS_FILE");
@@ -18491,73 +19825,69 @@ index 0000000..068854b
 +            return;
 +        }
 +
++        const std::lock_guard<std::recursive_mutex> lock(presetsMutex);
 +        presetsStamp = stamp;
-+        defaultPreset = LightPreset();
-+        venuePresets.clear();
++        presetFile = WcwLogic::LightPresetFile();
 +        mode = envMode;
 +        activeVenue = -1;
 +        candidateVenue = -1;
 +        candidateFrames = 0;
++        presetsEdited = false;
 +        if (ec) {
++            applyPresetFile();
 +            return;
 +        }
 +
 +        try {
-+            std::ifstream file(presetsPath);
-+            const nlohmann::json root = nlohmann::json::parse(file, nullptr, true, true);
-+            if (root.contains("debugMode")) {
-+                mode = root["debugMode"].get<uint32_t>();
++            std::ifstream file(presetsPath, std::ios::binary);
++            std::stringstream text;
++            text << file.rdbuf();
++            presetFile = WcwLogic::parseLightPresets(text.str());
++            if (presetFile.hasDebugMode) {
++                mode = presetFile.debugMode;
 +            }
 +
-+            if (root.contains("default")) {
-+                defaultPreset = parsePreset(root["default"], LightPreset());
-+                defaultPreset.name = "default";
-+            }
-+
-+            roomEnabled = false;
-+            if (root.contains("room")) {
-+                const nlohmann::json &room = root["room"];
-+                roomPreset = parsePreset(room, defaultPreset);
-+                roomPreset.name = "room (fallback)";
-+                roomPreset.anchorScene = false;
-+                roomMaxExtent = room.value("maxExtent", 3000.0f);
-+                roomCount = std::clamp(room.value("count", 3u), 1u, uint32_t(WCW_RT_MAX_LIGHTS));
-+                roomHeight = room.value("height", 0.85f);
-+                roomEnabled = true;
-+            }
-+
-+            if (root.contains("venues")) {
-+                for (const auto &v : root["venues"]) {
-+                    venuePresets.push_back(parsePreset(v, defaultPreset));
-+                }
-+            }
-+
-+            // Textures listed by several venues (shared arena parts) can't tell them apart.
-+            for (LightPreset &p : venuePresets) {
-+                p.uniqueMatch.clear();
-+                for (uint64_t h : p.match) {
-+                    bool shared = false;
-+                    for (const LightPreset &o : venuePresets) {
-+                        if ((&o != &p) && (std::find(o.match.begin(), o.match.end(), h) != o.match.end())) {
-+                            shared = true;
-+                            break;
-+                        }
-+                    }
-+
-+                    if (!shared) {
-+                        p.uniqueMatch.push_back(h);
-+                    }
-+                }
-+            }
-+
++            applyPresetFile();
 +            fprintf(stderr, "[wcw rt] light presets loaded from %s: %zu venue(s)\n", presetsPath.c_str(), venuePresets.size());
 +        }
 +        catch (const std::exception &e) {
++            presetFile = WcwLogic::LightPresetFile();
++            applyPresetFile();
 +            fprintf(stderr, "[wcw rt] light presets %s failed to parse: %s\n", presetsPath.c_str(), e.what());
 +        }
 +    }
 +
++    void WcwRaytracer::applyPresetFile() {
++        const std::lock_guard<std::recursive_mutex> lock(presetsMutex);
++        WcwLogic::computeUniqueMatches(presetFile.venues);
++        defaultPreset = presetFile.defaultPreset;
++        defaultPreset.name = "default";
++        roomEnabled = presetFile.roomEnabled;
++        roomPreset = presetFile.roomPreset;
++        roomPreset.name = "room (fallback)";
++        roomMaxExtent = presetFile.roomMaxExtent;
++        roomCount = std::clamp(presetFile.roomCount, 1u, uint32_t(WCW_RT_MAX_LIGHTS));
++        roomHeight = presetFile.roomHeight;
++        venuePresets = presetFile.venues;
++        if (activeVenue >= int(venuePresets.size())) {
++            activeVenue = -1;
++        }
++
++        if (venueOverride >= int(venuePresets.size())) {
++            venueOverride = -2;
++        }
++
++        // The room rig is generated from the scene bounds every present.
++        updateRoomPreset();
++    }
++
++    WcwRaytracer::LightPreset WcwRaytracer::activePresetCopy() {
++        const std::lock_guard<std::recursive_mutex> lock(presetsMutex);
++        return activePreset();
++    }
++
 +    void WcwRaytracer::finishPresent() {
++        const std::lock_guard<std::recursive_mutex> lock(presetsMutex);
 +        // Textures drawn by world geometry this present, kept for the last VenueWindow presents.
 +        std::vector<uint64_t> hashes;
 +        hashes.reserve(frameTextureTris.size());
@@ -18598,26 +19928,7 @@ index 0000000..068854b
 +        }
 +
 +        // Best venue: the largest fraction of its match textures seen in the window (at least half).
-+        int best = -1;
-+        float bestScore = 0.5f;
-+        for (size_t v = 0; v < venuePresets.size(); v++) {
-+            const LightPreset &p = venuePresets[v];
-+            if (p.match.empty()) {
-+                continue;
-+            }
-+
-+            const std::vector<uint64_t> &scored = p.uniqueMatch.empty() ? p.match : p.uniqueMatch;
-+            uint32_t seen = 0;
-+            for (uint64_t h : scored) {
-+                seen += textureCounts.count(h) ? 1 : 0;
-+            }
-+
-+            const float score = float(seen) / float(scored.size());
-+            if (score >= bestScore) {
-+                bestScore = score;
-+                best = int(v);
-+            }
-+        }
++        const int best = WcwLogic::bestVenue(venuePresets, [this](uint64_t h) { return textureCounts.count(h) > 0; });
 +
 +        // Switch only after the choice held for a few presents (no flapping on cut scenes).
 +        if (best != activeVenue) {
@@ -18687,6 +19998,7 @@ index 0000000..068854b
 +        const float height = sceneMin[1] + (sceneMax[1] - sceneMin[1]) * roomHeight;
 +        roomPreset.lights.clear();
 +        roomPreset.lightColors.clear();
++        roomPreset.lightOwnColor.clear();
 +        for (uint32_t i = 0; i < roomCount; i++) {
 +            const float along = longMin + longLen * (float(i) + 0.5f) / float(roomCount);
 +            roomPreset.lights.push_back(alongX ? std::array<float, 4>{ along, height, shortCenter, 1.0f } : std::array<float, 4>{ shortCenter, height, along, 1.0f });
@@ -18702,6 +20014,14 @@ index 0000000..068854b
 +    }
 +
 +    const WcwRaytracer::LightPreset &WcwRaytracer::activePreset() const {
++        // The Lighting editor can force a preset.
++        if ((venueOverride >= 0) && (venueOverride < int(venuePresets.size()))) {
++            return venuePresets[venueOverride];
++        }
++        else if (venueOverride == -1) {
++            return defaultPreset;
++        }
++
 +        if (activeVenue >= 0) {
 +            return venuePresets[activeVenue];
 +        }
@@ -18781,9 +20101,16 @@ index 0000000..068854b
 +        return supported && active() && !sceneActive;
 +    }
 +
++    static std::atomic<int> wcwRtSplitOverride = -1;
++
++    void WcwRaytracer::setSplitScreenOverride(int split) {
++        wcwRtSplitOverride = split;
++    }
++
 +    bool WcwRaytracer::splitScreen() {
 +        static const bool split = getenv("WCW_RT_SPLIT") != nullptr;
-+        return split;
++        const int forced = wcwRtSplitOverride;
++        return (forced >= 0) ? (forced != 0) : split;
 +    }
 +
 +    bool WcwRaytracer::replacesBlobShadows() const {
@@ -18804,7 +20131,7 @@ index 0000000..068854b
 +            loadPresets(true);
 +        }
 +
-+        const LightPreset &preset = activePreset();
++        const LightPreset preset = activePresetCopy();
 +        receiverRadius = std::max(envFloat(getenv("WCW_RT_RADIUS"), preset.radius), 0.0f);
 +        float origin[3];
 +        presetOrigin(preset, origin);
@@ -19137,7 +20464,7 @@ index 0000000..068854b
 +        const hlslpp::float4x4 invView = hlslpp::inverse(viewMatrix);
 +        params.invViewProj = hlslpp::inverse(viewProj);
 +        params.eyePosition = hlslpp::float4(invView[3].xyz, 1.0f);
-+        const LightPreset &preset = activePreset();
++        const LightPreset preset = activePresetCopy();
 +        float origin[3];
 +        presetOrigin(preset, origin);
 +        const float centerX = envFloat(getenv("WCW_RT_LIGHT_X"), origin[0] + preset.center[0]);
@@ -19185,12 +20512,15 @@ index 0000000..068854b
 +        }
 +        params.glowPadding0 = params.glowPadding1 = params.glowPadding2 = 0.0f;
 +        params.glowIntensity = { 0.0f, 0.0f, 0.0f, 0.0f };
++        // Flickering glows (WcwLogic::glowFlickerScale) run on the wall clock since the ray tracer started.
++        static const auto flickerStart = std::chrono::steady_clock::now();
++        const double flickerTime = std::chrono::duration<double>(std::chrono::steady_clock::now() - flickerStart).count();
 +        for (const auto &g : preset.glows) {
 +            if (params.glowCount < WCW_RT_MAX_GLOWS) {
-+                params.glows[params.glowCount] = { origin[0] + g[0], origin[1] + g[1], origin[2] + g[2], std::max(g[4], 1.0f) };
-+                params.glowIntensity[params.glowCount] = g[3];
 +                const size_t glowIndex = size_t(&g - preset.glows.data());
-+                const std::array<float, 3> glowColor = (glowIndex < preset.glowColors.size()) ? preset.glowColors[glowIndex] : std::array<float, 3>{ 1.0f, 1.0f, 1.0f };
++                params.glows[params.glowCount] = { origin[0] + g[0], origin[1] + g[1], origin[2] + g[2], std::max(g[4], 1.0f) };
++                params.glowIntensity[params.glowCount] = g[3] * WcwLogic::glowFlickerScale(flickerTime, uint32_t(glowIndex) * 7919u + 17u, WcwLogic::presetGlowFlicker(preset, glowIndex));
++                const std::array<float, 3> glowColor = WcwLogic::presetGlowColor(preset, glowIndex);
 +                params.glowColors[params.glowCount] = { std::max(glowColor[0], 0.0f), std::max(glowColor[1], 0.0f), std::max(glowColor[2], 0.0f), 0.0f };
 +                params.glowCount++;
 +            }
@@ -19204,7 +20534,7 @@ index 0000000..068854b
 +            for (const auto &l : preset.lights) {
 +                if (params.lightListCount < WCW_RT_MAX_LIGHTS) {
 +                    const size_t lightIndex = size_t(&l - preset.lights.data());
-+                    setLightColor(params.lightListCount, (lightIndex < preset.lightColors.size()) ? preset.lightColors[lightIndex] : preset.color);
++                    setLightColor(params.lightListCount, WcwLogic::presetLightColor(preset, lightIndex));
 +                    params.lights[params.lightListCount++] = { origin[0] + l[0], origin[1] + l[1], origin[2] + l[2], l[3] / std::max(weightSum, 1e-6f) };
 +                }
 +            }
@@ -19263,10 +20593,50 @@ index 0000000..068854b
 +        }
 +        params.traceScale = float(traceWidth) / float(outputWidth);
 +
++        // [wcw rt] Outside darkness (the preset's outsideDarkness; WCW_RT_DARKNESS overrides): the arena and crowd
++        // beyond the receiver radius fall into shadow. Misses (the crowd and background, never in the traced scene)
++        // darken once per frame, on the arena pass (WcwLogic::MissDarkening).
++        const float outsideDarkness = std::clamp(envFloat(getenv("WCW_RT_DARKNESS"), preset.outsideDarkness), 0.0f, 1.0f);
++        params.outsideDarkness = outsideDarkness;
++        params.outsideEdge = std::max(envFloat(getenv("WCW_RT_DARKNESS_EDGE"), preset.outsideEdge), 0.0f);
++        // Misses land on the arena floor: the lowest point of the scene's world geometry.
++        params.missFloorY = sceneBoundsValid ? sceneMin[1] : 0.0f;
++        // Lit areas (offsets from the anchor like lights and glows): where outside darkness eases off.
++        {
++            float litOrigin[3];
++            presetOrigin(preset, litOrigin);
++            float *litFields[WCW_RT_MAX_LIT_AREAS][4] = {
++                { &params.litArea0X, &params.litArea0Z, &params.litArea0Radius, &params.litArea0Edge },
++                { &params.litArea1X, &params.litArea1Z, &params.litArea1Radius, &params.litArea1Edge }
++            };
++
++            params.litAreaCount = 0;
++            for (uint32_t a = 0; a < WCW_RT_MAX_LIT_AREAS; a++) {
++                const bool used = a < preset.litAreas.size();
++                *litFields[a][0] = used ? litOrigin[0] + preset.litAreas[a][0] : 0.0f;
++                *litFields[a][1] = used ? litOrigin[2] + preset.litAreas[a][1] : 0.0f;
++                *litFields[a][2] = used ? preset.litAreas[a][2] : 0.0f;
++                *litFields[a][3] = used ? preset.litAreas[a][3] : 0.0f;
++                params.litAreaCount += used ? 1u : 0u;
++            }
++        }
++        const bool darkenMisses = missDarkening.darkenThisPass(colorTarget, lastPresentId, meshes.size());
++        params.darkenMisses = ((outsideDarkness > 0.0f) && darkenMisses) ? 1u : 0u;
++
++        {
++            static const bool darknessLog = getenv("WCW_RT_DARKNESS_LOG") != nullptr;
++            static uint32_t darknessLogCount = 0;
++            if (darknessLog && ((darknessLogCount++ % 97) < 6)) {
++                fprintf(stderr, "[wcw rt darkness] present %llu workload %u target %p %ux%u darkness %.2f misses %u meshes %zu preset %s\n",
++                    (unsigned long long)lastPresentId, workloadInFrame, (void *)colorTarget, colorTarget->width, colorTarget->height,
++                    outsideDarkness, params.darkenMisses, meshes.size(), preset.name.c_str());
++            }
++        }
++
 +        // Trace only this workload's screen footprint (plus a margin for the bilinear upsample
-+        // and the resolve filters' neighborhoods).
++        // and the resolve filters' neighborhoods); the whole screen with outside darkness.
 +        const float margin = float(std::max({ 3u, params.shadowFilterRadius + 1, params.aoFilterRadius + 1, params.filterRadius + 1 }));
-+        if (boundsFullScreen) {
++        if (boundsFullScreen || (outsideDarkness > 0.0f)) {
 +            traceRect[0] = traceRect[1] = 0;
 +            traceRect[2] = traceWidth;
 +            traceRect[3] = traceHeight;
@@ -19483,10 +20853,10 @@ index 0000000..068854b
 +};
 diff --git a/src/render/rt64_wcw_raytracer.h b/src/render/rt64_wcw_raytracer.h
 new file mode 100644
-index 0000000..156d931
+index 0000000..565819a
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.h
-@@ -0,0 +1,299 @@
+@@ -0,0 +1,295 @@
 +//
 +// RT64
 +//
@@ -19499,11 +20869,13 @@ index 0000000..156d931
 +#include <cfloat>
 +#include <deque>
 +#include <string>
++#include <mutex>
 +#include <unordered_map>
 +#include <vector>
 +
 +#include "common/rt64_common.h"
 +#include "common/rt64_plume.h"
++#include "common/rt64_wcw_venues.h"
 +#include "shared/rt64_wcw_rt.h"
 +
 +namespace RT64 {
@@ -19673,40 +21045,9 @@ index 0000000..156d931
 +        // most of which must have been drawn in the last VenueWindow presents). The file is
 +        // reloaded when it changes, so presets can be tuned while the game runs. WCW_RT_VENUE_LOG=1
 +        // prints the current scene's stable world textures to build a match list from.
-+        struct LightPreset {
-+            std::string name;
-+            std::vector<uint64_t> match;
-+            // The match textures no other venue lists (scored instead of match when not empty).
-+            std::vector<uint64_t> uniqueMatch;
-+            // Lights' center (receiver center on X/Z, key light height on Y).
-+            float center[3] = { 0.0f, 460.0f, 0.0f };
-+            // Generated rig: a key light at the center plus "fills" lights at center +- spread
-+            // on X/Z; or an explicit "lights" list (xyz + relative weight) replacing it.
-+            float spread = 200.0f;
-+            uint32_t fills = 4;
-+            float keyWeight = 0.5f;
-+            std::vector<std::array<float, 4>> lights;
-+            // Colored light: "color" is every light's RGB by default (white); the generated rig's key and fills can
-+            // differ ("keyColor", "fillColor"), and an explicit light can carry its own as [x, y, z, weight, r, g, b].
-+            std::array<float, 3> color = { 1.0f, 1.0f, 1.0f };
-+            std::array<float, 3> keyColor = { 1.0f, 1.0f, 1.0f };
-+            std::array<float, 3> fillColor = { 1.0f, 1.0f, 1.0f };
-+            std::vector<std::array<float, 3>> lightColors;
-+            float size = 20.0f;
-+            float radius = 750.0f;
-+            float clearance = 0.0f;
-+            float falloff = 0.0f;
-+            // "glows": [[x, y, z, intensity, range], ...] (offsets from the anchor like lights), optionally with
-+            // [..., r, g, b] for a colored glow (white otherwise; not normalized, so the color scales the intensity).
-+            std::vector<std::array<float, 5>> glows;
-+            std::vector<std::array<float, 3>> glowColors;
-+            // "anchor": "scene": center and explicit lights are offsets from the drawn world
-+            // geometry's center on X/Z and its floor (lowest point) on Y, so one preset fits rooms
-+            // placed anywhere in the world (backstage zones).
-+            bool anchorScene = false;
-+            float shadow = 0.6f;
-+            float characterShadow = 0.35f;
-+        };
++        // The preset data model, its parsing/writing and venue matching live in WcwLogic (common/rt64_wcw_venues,
++        // unit tested); the Lighting editor (rt64_wcw_lighting_editor.cpp) edits presetFile.
++        using LightPreset = WcwLogic::LightPreset;
 +
 +        static const uint32_t VenueWindow = 60;
 +        LightPreset defaultPreset;
@@ -19744,6 +21085,29 @@ index 0000000..156d931
 +        void finishPresent();
 +        const LightPreset &activePreset() const;
 +
++        // [wcw rt] Lighting editor (rt64_wcw_lighting_editor.cpp, a "Lighting" window in the RT64 inspector).
++        // presetFile is the parsed rt_lights.json and the source of truth for the presets in use (defaultPreset,
++        // roomPreset, venuePresets), which applyPresetFile() refreshes. presetsMutex guards both against the
++        // inspector thread; the render side reads presets through activePresetCopy().
++        std::recursive_mutex presetsMutex;
++        WcwLogic::LightPresetFile presetFile;
++        // Forced preset: -2 none (detection), -1 "default", >= 0 a venue.
++        int venueOverride = -2;
++        bool presetsEdited = false;
++        // Outside darkness: per color target, which traced pass of the frame darkens the misses.
++        WcwLogic::MissDarkening missDarkening;
++        std::string editorMessage;
++        char editorNewVenueName[64] = {};
++        void applyPresetFile();
++        LightPreset activePresetCopy();
++        // The current scene's stable world textures (hash, max triangles), seen in >= 90% of the venue window.
++        std::vector<std::pair<uint64_t, uint32_t>> stableTextures() const;
++        // Writes presetFile to the presets path (the previous file is kept as <path>.bak).
++        bool savePresets();
++        // A new venue matched by the current scene's textures no other venue lists, inheriting "default"; forced.
++        int newVenueFromScene(const std::string &name);
++        void drawLightingEditor();
++
 +        // Runtime settings from the frontend's graphics menu. Quality (WcwLogic::RtQuality / rtPreset): 0 Performance
 +        // (reduced resolution, 1 shadow ray per light, no AO), 1 Balanced (reduced resolution, 2, Subtle AO), 2 Quality
 +        // (full resolution, 2, Subtle AO), 3 Ultra (full resolution, 4, Strong AO with 8 rays). WCW_RT forces it on;
@@ -19764,6 +21128,8 @@ index 0000000..156d931
 +        bool replacesBlobShadows() const;
 +        // WCW_RT_SPLIT: ray tracing only on the right half of the screen (before/after comparisons).
 +        static bool splitScreen();
++        // The Lighting editor's split toggle (-1: WCW_RT_SPLIT decides).
++        static void setSplitScreenOverride(int split);
 +        void beginScene(const hlslpp::float4x4 &view, const hlslpp::float4x4 &proj, const RenderViewport &viewport,
 +            const RenderBuffer *worldPosBuffer, uint64_t worldPosSize, const RenderBuffer *worldNormBuffer, uint64_t worldNormSize,
 +            const RenderBuffer *faceIndicesBuffer, uint64_t faceIndicesSize,
@@ -19873,10 +21239,10 @@ index 0000000..334836e
 +}
 diff --git a/src/shaders/WcwRtResolveCS.hlsl b/src/shaders/WcwRtResolveCS.hlsl
 new file mode 100644
-index 0000000..a961cbd
+index 0000000..aabcdc6
 --- /dev/null
 +++ b/src/shaders/WcwRtResolveCS.hlsl
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,148 @@
 +//
 +// RT64
 +//
@@ -19939,8 +21305,10 @@ index 0000000..a961cbd
 +
 +    const float4 current = gCurrent[pixel];
 +    if (current.w <= 0.0f) {
++        // No hit: the trace's factor for the background (1, or outside darkness), stored at half scale.
 +        gHistoryOut[pixel] = float4(1.0f, 1.0f, 1.0f, 1.0f);
-+        gOutput[pixel] = float4(0.5f, 0.5f, 0.5f, 0.0f);
++        const float3 missFactor = 0.5f * current.rgb;
++        gOutput[pixel] = float4(missFactor, 0.0f);
 +        return;
 +    }
 +
@@ -20025,10 +21393,10 @@ index 0000000..a961cbd
 +}
 diff --git a/src/shaders/WcwRtTraceCS.hlsl b/src/shaders/WcwRtTraceCS.hlsl
 new file mode 100644
-index 0000000..a13eae7
+index 0000000..8004a27
 --- /dev/null
 +++ b/src/shaders/WcwRtTraceCS.hlsl
-@@ -0,0 +1,601 @@
+@@ -0,0 +1,660 @@
 +//
 +// RT64
 +//
@@ -20162,9 +21530,56 @@ index 0000000..a13eae7
 +    return (gParams.mode == WCW_RT_MODE_SHADOW) || (gParams.mode == WCW_RT_MODE_AO);
 +}
 +
-+void writeNoHit(uint2 pixel) {
++// How much outside darkness applies at a distance from a lit region (WcwLogic::darknessRamp).
++float darknessRamp(float distance, float radius, float edge) {
++    if (distance <= radius) {
++        return 0.0f;
++    }
++
++    if (edge <= 0.0f) {
++        return 1.0f;
++    }
++
++    const float t = saturate((distance - radius) / edge);
++    return t * t * (3.0f - 2.0f * t);
++}
++
++// Outside darkness of a world surface at a floor point (WcwLogic::outsideDarknessAt): the smallest darkness ramp of
++// the ring's and the lit areas' (the entrance set has its own lighting).
++float outsideFactorAt(float2 xz) {
++    if (gParams.outsideDarkness <= 0.0f) {
++        return 1.0f;
++    }
++
++    float ramp = darknessRamp(length(xz - gParams.lightPosition.xz), gParams.receiverRadius, gParams.outsideEdge);
++    if (gParams.litAreaCount > 0) {
++        ramp = min(ramp, darknessRamp(length(xz - float2(gParams.litArea0X, gParams.litArea0Z)), gParams.litArea0Radius, gParams.litArea0Edge));
++    }
++
++    if (gParams.litAreaCount > 1) {
++        ramp = min(ramp, darknessRamp(length(xz - float2(gParams.litArea1X, gParams.litArea1Z)), gParams.litArea1Radius, gParams.litArea1Edge));
++    }
++
++    return 1.0f - saturate(gParams.outsideDarkness) * ramp;
++}
++
++void writeNoHit(uint2 pixel, RayDesc ray) {
 +    if (resolvedMode()) {
-+        gCurrent[pixel] = float4(1.0f, 1.0f, 1.0f, 0.0f);
++        // Background (on the frame's arena pass only; see darkenMisses), judged where the ray lands on the arena
++        // floor (WcwLogic::missFloorDistance): the mat drawn by another pass stays lit, the stands darken.
++        float missFactor = 1.0f;
++        if ((gParams.darkenMisses != 0) && (gParams.outsideDarkness > 0.0f)) {
++            // Rays that point up or never reach the floor count as infinitely far: full darkness.
++            missFactor = 1.0f - saturate(gParams.outsideDarkness);
++            if (ray.Direction.y < -1e-4f) {
++                const float t = (gParams.missFloorY - ray.Origin.y) / ray.Direction.y;
++                if (t > 0.0f) {
++                    missFactor = outsideFactorAt(ray.Origin.xz + ray.Direction.xz * t);
++                }
++            }
++        }
++
++        gCurrent[pixel] = float4(missFactor, missFactor, missFactor, 0.0f);
 +        gCurrentAo[pixel] = 1.0f;
 +    }
 +    else {
@@ -20302,7 +21717,13 @@ index 0000000..a13eae7
 +    const float2 pixelCenter = (float2(pixel) + 0.5f) / gParams.traceScale;
 +    const float2 local = (pixelCenter - gParams.viewport.xy) / gParams.viewport.zw;
 +    if (any(local < 0.0f) || any(local > 1.0f)) {
-+        writeNoHit(pixel);
++        // Outside the game's viewport: no ray; counts as far background.
++        RayDesc outsideRay;
++        outsideRay.Origin = float3(0.0f, 0.0f, 0.0f);
++        outsideRay.Direction = float3(0.0f, 1.0f, 0.0f);
++        outsideRay.TMin = 0.0f;
++        outsideRay.TMax = 0.0f;
++        writeNoHit(pixel, outsideRay);
 +        return;
 +    }
 +
@@ -20340,7 +21761,7 @@ index 0000000..a13eae7
 +    }
 +
 +    if (primary.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {
-+        writeNoHit(pixel);
++        writeNoHit(pixel, ray);
 +        return;
 +    }
 +
@@ -20428,7 +21849,13 @@ index 0000000..a13eae7
 +    if (resolvedMode() && (gParams.receiverRadius > 0.0f)) {
 +        const float receiverDist = length(hitPos.xz - gParams.lightPosition.xz);
 +        if (receiverDist >= gParams.receiverRadius) {
-+            gCurrent[pixel] = float4(1.0f + glowLight(hitPos, normal, pixel), hitT);
++            // Outside darkness (mirrors WcwLogic::outsideDarknessAt): the arena, the crowd and wrestlers out there fall into
++            // shadow; glows still brighten what they reach.
++            const float outside = outsideFactorAt(hitPos.xz);
++
++            // Glows add light on top of the darkened surface (not scaled by it), so a lamp's pool reaches full
++            // brightness under the lamp even in a dark room: the darkness is the missing ambient light.
++            gCurrent[pixel] = float4(outside + glowLight(hitPos, normal, pixel), hitT);
 +            gCurrentAo[pixel] = 1.0f;
 +            return;
 +        }
@@ -20646,10 +22073,10 @@ index b51cf09..19048ae 100644
  };
 diff --git a/src/shared/rt64_wcw_rt.h b/src/shared/rt64_wcw_rt.h
 new file mode 100644
-index 0000000..673513d
+index 0000000..22a556e
 --- /dev/null
 +++ b/src/shared/rt64_wcw_rt.h
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,193 @@
 +//
 +// RT64
 +//
@@ -20683,6 +22110,7 @@ index 0000000..673513d
 +
 +#define WCW_RT_MAX_LIGHTS 8
 +#define WCW_RT_MAX_GLOWS 4
++#define WCW_RT_MAX_LIT_AREAS 2
 +
 +// Bit 31 of a mesh index start: N64 face culling is on for that draw.
 +#define WCW_RT_MESH_CULLED 0x80000000u
@@ -20811,6 +22239,27 @@ index 0000000..673513d
 +        float sheenRimPower;
 +        // WCW_RT_SHEEN_SPLIT=1: no sheen on the left half of the screen (same-moment comparisons).
 +        uint sheenSplit;
++        // [wcw rt] Outside darkness (the venue preset's outsideDarkness / outsideEdge; WcwLogic::outsideDarknessFactor):
++        // surfaces beyond receiverRadius (wrestlers too) darken by up to outsideDarkness over outsideEdge units.
++        // darkenMisses: ray misses (background, crowd sprites) darken too, on the arena pass of a target only
++        // (WcwLogic::MissDarkening), so other passes over the same image don't darken it again.
++        float outsideDarkness;
++        float outsideEdge;
++        uint darkenMisses;
++        // Misses are judged where their ray lands on the arena floor plane at this height (WcwLogic::missFloorDistance).
++        float missFloorY;
++        // Lit areas (the preset's litAreas, WcwLogic::outsideDarknessAt): world X/Z center, radius and edge of up to
++        // WCW_RT_MAX_LIT_AREAS places where outside darkness eases off like around the ring. Scalars, so the C++ and
++        // HLSL layouts can't disagree on padding.
++        uint litAreaCount;
++        float litArea0X;
++        float litArea0Z;
++        float litArea0Radius;
++        float litArea0Edge;
++        float litArea1X;
++        float litArea1Z;
++        float litArea1Radius;
++        float litArea1Edge;
 +    };
 +
 +    struct WcwRtCompositeCB {
@@ -21364,6 +22813,560 @@ index 0000000..21680fe
 +
 +int main() {
 +    return WcwTest::runAll("rt64 wcw tests");
++}
+diff --git a/tests/wcw/rt64_wcw_venues_tests.cpp b/tests/wcw/rt64_wcw_venues_tests.cpp
+new file mode 100644
+index 0000000..fd174d3
+--- /dev/null
++++ b/tests/wcw/rt64_wcw_venues_tests.cpp
+@@ -0,0 +1,548 @@
++//
++// RT64
++//
++
++// [wcw rt] Unit tests for common/rt64_wcw_venues (venue light presets: parsing, writing, matching). Built and run with
++// the other wcw tests on every rt64 build.
++
++#include "common/rt64_wcw_venues.h"
++
++#include <set>
++#include <string>
++
++#include "wcw_test.h"
++
++using namespace RT64::WcwLogic;
++
++// The shape of No Mercy's assets/rt_lights.json: comments, a default with explicit lights, a room fallback, venues
++// that inherit from default and venues that override fields, glows and a scene anchor.
++static const char *SampleFile = R"json(
++{
++    // Default: TV lighting.
++    "default": {
++        "center": [0, 650, 0],
++        "lights": [[0, 650, 0, 2], [-320, 600, -320, 1], [320, 600, -320, 1]],
++        "size": 20,
++        "radius": 900,
++        "shadow": 0.6,
++        "characterShadow": 0.35
++    },
++    "room": { "maxExtent": 3000, "count": 3, "height": 0.85, "falloff": 300, "size": 40, "shadow": 0.8 },
++    "venues": [
++        { "name": "Raw", "match": ["B1E01BE92A6F5BE1", "5581B2F76A29CE38", "00000000000000AA"],
++          "glows": [[0, 300, 2900, 0.8, 900]] },
++        { "name": "No Mercy", "match": ["66578B3E4816988B", "00000000000000AA"] },
++        { "name": "Backstage hallway", "match": ["EF135CC7C26673E5"], "anchor": "scene",
++          "lights": [[0, 400, 0, 1], [0, 400, 600, 1]], "radius": 1500, "shadow": 0.75 }
++    ]
++}
++)json";
++
++// Same effective colors: the preset's, the rig's, each explicit light's (own or followed) and each glow's.
++static bool sameColors(const LightPreset &a, const LightPreset &b) {
++    if ((a.color != b.color) || (a.keyColor != b.keyColor) || (a.fillColor != b.fillColor) || (a.lightOwnColor != b.lightOwnColor)) {
++        return false;
++    }
++
++    for (size_t i = 0; i < a.lights.size(); i++) {
++        if (presetLightColor(a, i) != presetLightColor(b, i)) {
++            return false;
++        }
++    }
++
++    for (size_t i = 0; i < a.glows.size(); i++) {
++        if (presetGlowColor(a, i) != presetGlowColor(b, i)) {
++            return false;
++        }
++    }
++
++    return true;
++}
++
++static bool samePreset(const LightPreset &a, const LightPreset &b) {
++    return (a.name == b.name) && (a.match == b.match) && (a.center[0] == b.center[0]) && (a.center[1] == b.center[1]) &&
++        (a.center[2] == b.center[2]) && (a.spread == b.spread) && (a.fills == b.fills) && (a.keyWeight == b.keyWeight) &&
++        (a.lights == b.lights) && (a.size == b.size) && (a.radius == b.radius) && (a.clearance == b.clearance) &&
++        (a.falloff == b.falloff) && (a.glows == b.glows) && (a.anchorScene == b.anchorScene) && (a.shadow == b.shadow) &&
++        (a.characterShadow == b.characterShadow) && sameColors(a, b);
++}
++
++TEST_CASE("venues: parsing applies default to venues that don't override it") {
++    const LightPresetFile file = parseLightPresets(SampleFile);
++    CHECK_EQ(file.venues.size(), size_t(3));
++    CHECK((file.venues[1].name) == std::string("No Mercy"));
++    CHECK_EQ(file.venues[1].lights.size(), size_t(3));
++    CHECK_NEAR(file.venues[1].radius, 900.0f, 1e-6f);
++    CHECK_NEAR(file.venues[2].radius, 1500.0f, 1e-6f);
++    CHECK(file.venues[2].anchorScene);
++    CHECK_EQ(file.venues[0].glows.size(), size_t(1));
++    CHECK(file.roomEnabled);
++    CHECK_EQ(file.roomCount, 3u);
++    CHECK_NEAR(file.roomPreset.size, 40.0f, 1e-6f);
++    CHECK_NEAR(file.roomPreset.radius, 900.0f, 1e-6f);
++}
++
++TEST_CASE("venues: write then parse gives back the same presets") {
++    const LightPresetFile file = parseLightPresets(SampleFile);
++    const LightPresetFile again = parseLightPresets(writeLightPresets(file));
++    CHECK(samePreset(again.defaultPreset, file.defaultPreset));
++    CHECK(samePreset(again.roomPreset, file.roomPreset));
++    CHECK_EQ(again.roomMaxExtent, file.roomMaxExtent);
++    CHECK_EQ(again.roomHeight, file.roomHeight);
++    CHECK_EQ(again.venues.size(), file.venues.size());
++    for (size_t i = 0; i < file.venues.size(); i++) {
++        CHECK(samePreset(again.venues[i], file.venues[i]));
++    }
++}
++
++TEST_CASE("venues: writing leaves out inherited fields, so editing default still reaches those venues") {
++    LightPresetFile file = parseLightPresets(SampleFile);
++    const std::string text = writeLightPresets(file);
++    // "No Mercy" sets nothing but its name and match list.
++    const size_t at = text.find("\"No Mercy\"");
++    CHECK(at != std::string::npos);
++    const size_t end = text.find('}', at);
++    CHECK(text.substr(at, end - at).find("radius") == std::string::npos);
++
++    file.defaultPreset.radius = 1200.0f;
++    const LightPresetFile edited = parseLightPresets(writeLightPresets(file));
++    CHECK_NEAR(edited.venues[1].radius, 1200.0f, 1e-6f);
++    CHECK_NEAR(edited.venues[2].radius, 1500.0f, 1e-6f);
++
++    // In memory, inheritDefault brings the presets in use in line with the file.
++    inheritDefault(file);
++    CHECK_NEAR(file.venues[1].radius, 1200.0f, 1e-6f);
++    CHECK_NEAR(file.venues[2].radius, 1500.0f, 1e-6f);
++    CHECK_NEAR(file.roomPreset.radius, 1200.0f, 1e-6f);
++}
++
++TEST_CASE("venues: a field edited on a venue is written even when it equals default") {
++    LightPresetFile file = parseLightPresets(SampleFile);
++    file.venues[1].radius = 900.0f;
++    file.venues[1].setFields |= FieldRadius;
++    file.defaultPreset.radius = 1200.0f;
++    const LightPresetFile again = parseLightPresets(writeLightPresets(file));
++    CHECK_NEAR(again.venues[1].radius, 900.0f, 1e-6f);
++}
++
++TEST_CASE("venues: an edited light position round-trips at file precision") {
++    LightPresetFile file = parseLightPresets(SampleFile);
++    file.venues[2].lights[1][2] = 612.25f;
++    file.venues[2].shadow = 0.7f;
++    const LightPresetFile again = parseLightPresets(writeLightPresets(file));
++    CHECK_NEAR(again.venues[2].lights[1][2], 612.25f, 1e-4f);
++    CHECK_NEAR(again.venues[2].shadow, 0.7f, 1e-6f);
++}
++
++TEST_CASE("venues: texture hashes are written as 16 uppercase hex digits") {
++    CHECK((formatTextureHash(0xAAull)) == std::string("00000000000000AA"));
++    CHECK((formatTextureHash(0xB1E01BE92A6F5BE1ull)) == std::string("B1E01BE92A6F5BE1"));
++}
++
++TEST_CASE("venues: textures listed by two venues don't count towards either") {
++    const LightPresetFile file = parseLightPresets(SampleFile);
++    CHECK_EQ(file.venues[0].uniqueMatch.size(), size_t(2));
++    CHECK_EQ(file.venues[1].uniqueMatch.size(), size_t(1));
++}
++
++TEST_CASE("venues: the best venue needs half its unique textures, later venues win ties") {
++    const LightPresetFile file = parseLightPresets(SampleFile);
++    const std::set<uint64_t> raw = { 0xB1E01BE92A6F5BE1ull, 0xAAull };
++    auto seenRaw = [&](uint64_t h) { return raw.count(h) > 0; };
++    CHECK_NEAR(venueMatchScore(file.venues[0], seenRaw), 0.5f, 1e-6f);
++    CHECK_EQ(bestVenue(file.venues, seenRaw), 0);
++
++    // Only the shared texture: no venue reaches half of its unique textures.
++    auto seenShared = [](uint64_t h) { return h == 0xAAull; };
++    CHECK_EQ(bestVenue(file.venues, seenShared), -1);
++
++    // Raw and No Mercy both fully seen: the later one wins, as before.
++    const std::set<uint64_t> both = { 0xB1E01BE92A6F5BE1ull, 0x5581B2F76A29CE38ull, 0x66578B3E4816988Bull };
++    CHECK_EQ(bestVenue(file.venues, [&](uint64_t h) { return both.count(h) > 0; }), 1);
++}
++
++TEST_CASE("outside darkness: none inside the radius, eases over the edge, full beyond it") {
++    CHECK_NEAR(outsideDarknessFactor(800.0f, 900.0f, 400.0f, 0.8f), 1.0f, 1e-6f);
++    CHECK_NEAR(outsideDarknessFactor(900.0f, 900.0f, 400.0f, 0.8f), 1.0f, 1e-6f);
++    CHECK_NEAR(outsideDarknessFactor(1100.0f, 900.0f, 400.0f, 0.8f), 0.6f, 1e-6f);
++    CHECK_NEAR(outsideDarknessFactor(1300.0f, 900.0f, 400.0f, 0.8f), 0.2f, 1e-6f);
++    CHECK_NEAR(outsideDarknessFactor(5000.0f, 900.0f, 400.0f, 0.8f), 0.2f, 1e-6f);
++    // No edge: a hard cut at the radius.
++    CHECK_NEAR(outsideDarknessFactor(901.0f, 900.0f, 0.0f, 0.5f), 0.5f, 1e-6f);
++}
++
++TEST_CASE("outside darkness: 0 is off") {
++    CHECK_NEAR(outsideDarknessFactor(3000.0f, 900.0f, 400.0f, 0.0f), 1.0f, 1e-6f);
++}
++
++TEST_CASE("outside darkness: set per venue, inherited from default otherwise, and round-trips") {
++    LightPresetFile file = parseLightPresets(SampleFile);
++    CHECK_NEAR(file.venues[1].outsideDarkness, 0.0f, 1e-6f);
++    file.defaultPreset.outsideDarkness = 0.7f;
++    file.defaultPreset.setFields |= FieldOutsideDarkness;
++    file.venues[0].outsideDarkness = 0.3f;
++    file.venues[0].setFields |= FieldOutsideDarkness;
++    inheritDefault(file);
++    CHECK_NEAR(file.venues[1].outsideDarkness, 0.7f, 1e-6f);
++    const LightPresetFile again = parseLightPresets(writeLightPresets(file));
++    CHECK_NEAR(again.venues[0].outsideDarkness, 0.3f, 1e-6f);
++    CHECK_NEAR(again.venues[1].outsideDarkness, 0.7f, 1e-6f);
++    CHECK_NEAR(again.venues[1].outsideEdge, 400.0f, 1e-6f);
++}
++
++TEST_CASE("outside darkness: a miss over the ring mat stays lit, a miss towards the stands darkens (mat went grey)") {
++    // Camera 600 up, 1500 back from the ring center, floor at 0.
++    const float eye[3] = { 0.0f, 600.0f, -1500.0f };
++    // Looking down at the ring center: lands at the center.
++    const float atRing[3] = { 0.0f, -0.371391f, 0.928477f };
++    CHECK_NEAR(missFloorDistance(eye, atRing, 0.0f, 0.0f, 0.0f), 0.0f, 1.0f);
++    CHECK_NEAR(outsideDarknessFactor(missFloorDistance(eye, atRing, 0.0f, 0.0f, 0.0f), 650.0f, 500.0f, 0.55f), 1.0f, 1e-6f);
++    // Level or upward rays (the stands across the arena) never reach the floor: fully dark.
++    const float level[3] = { 0.0f, 0.0f, 1.0f };
++    const float up[3] = { 0.0f, 0.3f, 0.95f };
++    CHECK_NEAR(outsideDarknessFactor(missFloorDistance(eye, level, 0.0f, 0.0f, 0.0f), 650.0f, 500.0f, 0.55f), 0.45f, 1e-6f);
++    CHECK_NEAR(outsideDarknessFactor(missFloorDistance(eye, up, 0.0f, 0.0f, 0.0f), 650.0f, 500.0f, 0.55f), 0.45f, 1e-6f);
++    // A shallow downward ray landing beyond the ring and the edge: fully dark.
++    const float shallow[3] = { 0.0f, -0.1f, 0.995f };
++    CHECK(missFloorDistance(eye, shallow, 0.0f, 0.0f, 0.0f) > 1150.0f);
++}
++
++TEST_CASE("outside darkness: misses darken on last frame's arena pass, not the first pass (crowd stayed lit)") {
++    MissDarkeningPass passes;
++    // Frame 1 (No Mercy shape): passes 0..4 with 4, 8, 9, 76, 3 meshes. No choice yet.
++    const size_t meshes[] = { 4, 8, 9, 76, 3 };
++    for (uint32_t i = 0; i < 5; i++) {
++        CHECK(!passes.darkenThisPass(100, i, meshes[i]));
++    }
++
++    // Frame 2: only the arena pass (3) darkens.
++    for (uint32_t i = 0; i < 5; i++) {
++        CHECK_EQ(passes.darkenThisPass(101, i, meshes[i]), i == 3);
++    }
++}
++
++TEST_CASE("outside darkness: two near-equal passes don't trade the darkening frame to frame (background flickered)") {
++    MissDarkeningPass passes;
++    uint32_t switches = 0;
++    bool lastFirst = false;
++    for (uint64_t frame = 0; frame < 120; frame++) {
++        // Pass 1 and pass 3 alternate between 44 and 45 meshes.
++        const size_t a = (frame % 2) ? 44 : 45;
++        const size_t b = (frame % 2) ? 45 : 44;
++        const bool first = passes.darkenThisPass(frame, 1, a);
++        const bool second = passes.darkenThisPass(frame, 3, b);
++        CHECK(!(first && second));
++        if ((frame > 1) && (first != lastFirst)) {
++            switches++;
++        }
++
++        lastFirst = first;
++    }
++
++    CHECK_EQ(switches, 0u);
++}
++
++TEST_CASE("outside darkness: the arena pass follows a real scene change after a short delay") {
++    MissDarkeningPass passes;
++    passes.darkenThisPass(1, 0, 50);
++    passes.darkenThisPass(1, 1, 10);
++    CHECK(passes.darkenThisPass(2, 0, 50));
++    // The scene changes: pass 1 becomes the arena pass. The choice holds for SwitchFrames frames, then moves.
++    uint64_t frame = 3;
++    for (uint32_t i = 0; i < MissDarkeningPass::SwitchFrames; i++, frame++) {
++        passes.darkenThisPass(frame, 0, 5);
++        passes.darkenThisPass(frame, 1, 60);
++    }
++
++    CHECK(!passes.darkenThisPass(frame, 0, 5));
++    CHECK(passes.darkenThisPass(frame, 1, 60));
++}
++
++TEST_CASE("outside darkness: when the chosen pass stops running, the busiest pass takes over next frame") {
++    MissDarkeningPass passes;
++    passes.darkenThisPass(1, 2, 80);
++    CHECK(passes.darkenThisPass(2, 2, 80));
++    passes.darkenThisPass(3, 0, 30);
++    CHECK(passes.darkenThisPass(4, 0, 30));
++}
++
++TEST_CASE("venues: a new venue from the scene uses its largest textures no venue lists") {
++    const LightPresetFile file = parseLightPresets(SampleFile);
++    const std::vector<std::pair<uint64_t, uint32_t>> stable = {
++        { 0x1ull, 40 }, { 0xB1E01BE92A6F5BE1ull, 500 }, { 0x2ull, 300 }, { 0x3ull, 120 }, { 0xAAull, 900 }
++    };
++
++    const std::vector<uint64_t> match = newVenueMatch(stable, file.venues, 2);
++    CHECK_EQ(match.size(), size_t(2));
++    CHECK_EQ(match[0], 0x2ull);
++    CHECK_EQ(match[1], 0x3ull);
++}
++
++TEST_CASE("outside darkness: a present carrying both swap targets' frames keeps each target's arena pass (background flickered)") {
++    // Raw's pattern: each frame is 94, 17, 9, 130, 2 meshes, on targets A and B in turn. Usually one frame per
++    // present, but sometimes a present carries two frames (the second target's passes are then its 6th..10th).
++    MissDarkening darkening;
++    const int targets[2] = { 0, 0 };
++    const size_t frame[] = { 94, 17, 9, 130, 2 };
++    uint32_t gameFrame = 0;
++    uint32_t framesWithoutDarkening = 0;
++    for (uint64_t present = 0; present < 200; present++) {
++        const int frames = ((present % 7) == 3) ? 2 : 1;
++        for (int f = 0; f < frames; f++, gameFrame++) {
++            uint32_t darkened = 0;
++            for (size_t meshes : frame) {
++                darkened += darkening.darkenThisPass(&targets[gameFrame % 2], present, meshes) ? 1 : 0;
++            }
++
++            CHECK(darkened <= 1u);
++            if ((gameFrame > 4) && (darkened == 0)) {
++                framesWithoutDarkening++;
++            }
++        }
++    }
++
++    CHECK_EQ(framesWithoutDarkening, 0u);
++}
++
++// Colored light (rt-color): "color", "keyColor", "fillColor", [x, y, z, weight, r, g, b] lights and
++// [x, y, z, intensity, range, r, g, b] glows.
++
++static const char *ColorFile = R"json(
++{
++    "default": {
++        "color": [1, 0.9, 0.75],
++        "lights": [[0, 650, 0, 2], [-320, 600, -320, 1, 1, 0, 0]]
++    },
++    "venues": [
++        { "name": "Blue", "match": ["0000000000000001"], "color": [0.6, 0.7, 1] },
++        { "name": "Plain", "match": ["0000000000000002"] },
++        { "name": "Rig", "match": ["0000000000000003"], "lights": [], "keyColor": [1, 0.2, 0.2] },
++        { "name": "Glow", "match": ["0000000000000004"], "glows": [[0, 500, 2700, 1, 1400], [0, 300, 0, 0.5, 900, 0.2, 0.4, 1]] }
++    ]
++}
++)json";
++
++TEST_CASE("colored light: presets without colors stay white and write no colors") {
++    const LightPresetFile file = parseLightPresets(SampleFile);
++    CHECK(file.defaultPreset.color == WhiteLight);
++    CHECK(file.venues[0].keyColor == WhiteLight);
++    CHECK(presetLightColor(file.venues[2], 1) == WhiteLight);
++    CHECK(presetGlowColor(file.venues[0], 0) == WhiteLight);
++    const std::string text = writeLightPresets(file);
++    CHECK(text.find("olor") == std::string::npos);
++    // Explicit lights without a color are written as [x, y, z, weight], as before.
++    CHECK(parseLightPresets(text).defaultPreset.lightOwnColor == std::vector<uint8_t>({ 0, 0, 0 }));
++}
++
++TEST_CASE("colored light: a venue's color reaches its key and fill lights unless it sets them") {
++    const LightPresetFile file = parseLightPresets(ColorFile);
++    const LightColor warm = { 1.0f, 0.9f, 0.75f };
++    const LightColor blue = { 0.6f, 0.7f, 1.0f };
++    CHECK(file.defaultPreset.keyColor == warm);
++    CHECK(file.venues[0].color == blue);
++    CHECK(file.venues[0].keyColor == blue);
++    CHECK(file.venues[0].fillColor == blue);
++    CHECK(file.venues[1].color == warm);
++    CHECK(file.venues[1].keyColor == warm);
++    // Sets only its key color: the fills keep the inherited (warm) color.
++    CHECK(file.venues[2].keyColor == LightColor({ 1.0f, 0.2f, 0.2f }));
++    CHECK(file.venues[2].fillColor == warm);
++}
++
++TEST_CASE("colored light: explicit lights use their own color or follow the preset's, also when inherited") {
++    const LightPresetFile file = parseLightPresets(ColorFile);
++    const LightColor red = { 1.0f, 0.0f, 0.0f };
++    CHECK(presetLightColor(file.defaultPreset, 0) == LightColor({ 1.0f, 0.9f, 0.75f }));
++    CHECK(presetLightColor(file.defaultPreset, 1) == red);
++    // "Blue" inherits default's lights: the one without its own color takes Blue's color, the red one stays red.
++    CHECK(presetLightColor(file.venues[0], 0) == LightColor({ 0.6f, 0.7f, 1.0f }));
++    CHECK(presetLightColor(file.venues[0], 1) == red);
++    // Out of range (generated rig, room lights): the preset's color.
++    CHECK(presetLightColor(file.venues[0], 7) == file.venues[0].color);
++}
++
++TEST_CASE("colored light: glows are white unless they carry a color") {
++    const LightPresetFile file = parseLightPresets(ColorFile);
++    const LightPreset &g = file.venues[3];
++    CHECK_EQ(g.glows.size(), size_t(2));
++    CHECK(presetGlowColor(g, 0) == WhiteLight);
++    CHECK(presetGlowColor(g, 1) == LightColor({ 0.2f, 0.4f, 1.0f }));
++    CHECK(presetGlowColor(g, 5) == WhiteLight);
++}
++
++TEST_CASE("colored light: write then parse keeps every color, and only the colors a preset sets are written") {
++    const LightPresetFile file = parseLightPresets(ColorFile);
++    const std::string text = writeLightPresets(file);
++    const LightPresetFile again = parseLightPresets(text);
++    CHECK(samePreset(again.defaultPreset, file.defaultPreset));
++    CHECK_EQ(again.venues.size(), file.venues.size());
++    for (size_t i = 0; i < file.venues.size(); i++) {
++        CHECK(samePreset(again.venues[i], file.venues[i]));
++        CHECK_EQ(again.venues[i].setFields, file.venues[i].setFields);
++    }
++
++    // "Plain" inherits its colors, so its entry has none and a later edit to default's color still reaches it.
++    const size_t plain = text.find("\"Plain\"");
++    const size_t rig = text.find("\"Rig\"");
++    CHECK(text.substr(plain, rig - plain).find("olor") == std::string::npos);
++}
++
++TEST_CASE("colored light: editing default's color reaches the venues that don't set one (inheritDefault)") {
++    LightPresetFile file = parseLightPresets(ColorFile);
++    file.defaultPreset.color = { 0.5f, 1.0f, 0.5f };
++    inheritDefault(file);
++    CHECK(file.defaultPreset.keyColor == LightColor({ 0.5f, 1.0f, 0.5f }));
++    CHECK(file.venues[1].keyColor == LightColor({ 0.5f, 1.0f, 0.5f }));
++    CHECK(presetLightColor(file.venues[1], 0) == LightColor({ 0.5f, 1.0f, 0.5f }));
++    CHECK(file.venues[0].keyColor == LightColor({ 0.6f, 0.7f, 1.0f }));
++}
++
++TEST_CASE("colored light: adding lights and glows pads the color lists (no own color, white glow)") {
++    LightPreset p;
++    p.color = { 1.0f, 0.5f, 0.5f };
++    p.lights.push_back({ 0.0f, 600.0f, 0.0f, 1.0f });
++    p.glows.push_back({ 0.0f, 0.0f, 0.0f, 1.0f, 100.0f });
++    syncColorLists(p);
++    CHECK_EQ(p.lightOwnColor.size(), size_t(1));
++    CHECK_EQ(p.lightOwnColor[0], uint8_t(0));
++    CHECK(presetLightColor(p, 0) == p.color);
++    CHECK(presetGlowColor(p, 0) == WhiteLight);
++}
++
++// Lit areas: the entrance set keeps its own lighting under outside darkness.
++
++TEST_CASE("lit areas: no darkness inside a lit area, the ring rule elsewhere") {
++    const std::vector<std::array<float, 4>> areas = { { 0.0f, 2700.0f, 600.0f, 400.0f } };
++    // The entrance set (far from the ring, inside the lit area) keeps its brightness.
++    CHECK_NEAR(outsideDarknessAt(0.0f, 2700.0f, 0.0f, 0.0f, 650.0f, 500.0f, 0.55f, areas), 1.0f, 1e-6f);
++    // Halfway through the lit area's edge: half way (smoothstep 0.5) into the darkness.
++    CHECK_NEAR(outsideDarknessAt(0.0f, 2700.0f - 800.0f, 0.0f, 0.0f, 650.0f, 500.0f, 0.55f, areas), 1.0f - 0.55f * 0.5f, 1e-5f);
++    // The stands at the side: full darkness, as without lit areas.
++    CHECK_NEAR(outsideDarknessAt(1800.0f, 0.0f, 0.0f, 0.0f, 650.0f, 500.0f, 0.55f, areas), 0.45f, 1e-6f);
++}
++
++TEST_CASE("lit areas: without any, the darkness matches outsideDarknessFactor") {
++    for (float d = 0.0f; d < 2000.0f; d += 37.0f) {
++        CHECK_NEAR(outsideDarknessAt(d, 0.0f, 0.0f, 0.0f, 650.0f, 500.0f, 0.6f, {}), outsideDarknessFactor(d, 650.0f, 500.0f, 0.6f), 1e-6f);
++    }
++}
++
++TEST_CASE("lit areas: parse (at most two), inherit from default, and round-trip") {
++    const char *text = R"json({
++        "default": { "outsideDarkness": 0.55, "litAreas": [[0, 2700, 600, 400]] },
++        "venues": [
++            { "name": "A", "match": ["0000000000000001"] },
++            { "name": "B", "match": ["0000000000000002"], "litAreas": [[1, 2, 3, 4], [5, 6, 7, 8], [9, 9, 9, 9]] },
++            { "name": "C", "match": ["0000000000000003"], "litAreas": [] }
++        ]
++    })json";
++    const LightPresetFile file = parseLightPresets(text);
++    CHECK_EQ(file.venues[0].litAreas.size(), size_t(1));
++    CHECK_EQ(file.venues[1].litAreas.size(), MaxLitAreas);
++    CHECK(file.venues[2].litAreas.empty());
++    const LightPresetFile again = parseLightPresets(writeLightPresets(file));
++    for (size_t i = 0; i < file.venues.size(); i++) {
++        CHECK(again.venues[i].litAreas == file.venues[i].litAreas);
++        CHECK_EQ(again.venues[i].setFields, file.venues[i].setFields);
++    }
++}
++
++// Flickering glows: a failing fluorescent tube.
++
++TEST_CASE("flicker: deterministic, within 0..1, mostly on, with dropouts") {
++    uint32_t on = 0, off = 0, total = 0;
++    for (double t = 0.0; t < 60.0; t += 0.01, total++) {
++        const float v = glowFlicker(t, 3);
++        CHECK(v >= 0.0f && v <= 1.0f);
++        CHECK_EQ(v, glowFlicker(t, 3));
++        on += (v == 1.0f) ? 1 : 0;
++        off += (v == 0.0f) ? 1 : 0;
++    }
++
++    // Mostly on (the owner's ask), blinking off occasionally within a minute.
++    CHECK(on > total * 9 / 10);
++    CHECK(off > 0u);
++}
++
++TEST_CASE("flicker: amount 0 is steady, tubes get their own rhythm") {
++    bool differ = false;
++    for (double t = 0.0; t < 30.0; t += 0.05) {
++        CHECK_EQ(glowFlickerScale(t, 5, 0.0f), 1.0f);
++        const float half = glowFlickerScale(t, 5, 0.5f);
++        CHECK(half >= 0.5f && half <= 1.0f);
++        differ = differ || (glowFlicker(t, 1) != glowFlicker(t, 2));
++    }
++
++    CHECK(differ);
++}
++
++TEST_CASE("flicker: parsed as a 9th glow value and written back (colors written too)") {
++    const char *text = R"json({
++        "venues": [ { "name": "Hall", "match": ["0000000000000001"],
++            "glows": [[0, 300, 0, 2, 480], [0, 300, 400, 2, 480, 1, 1, 1, 0.8]] } ]
++    })json";
++    const LightPresetFile file = parseLightPresets(text);
++    CHECK_EQ(presetGlowFlicker(file.venues[0], 0), 0.0f);
++    CHECK_NEAR(presetGlowFlicker(file.venues[0], 1), 0.8f, 1e-6f);
++    const LightPresetFile again = parseLightPresets(writeLightPresets(file));
++    CHECK(again.venues[0].glowFlicker == file.venues[0].glowFlicker);
++    CHECK(again.venues[0].glowColors == file.venues[0].glowColors);
++}
++
++TEST_CASE("outside darkness: at 60 fps (interleaved targets, presents cutting through frames) every frame darkens once, on the arena pass (crowd flickered)") {
++    // Raw at 60 fps (from the WCW_RT_DARKNESS_LOG): each game frame is 94, 9, 9, 136, 2 meshes, drawn to two targets
++    // (real and interpolated) with their passes interleaved, and presents begin part way through frames, so a target's
++    // 94-mesh pass can be in one present and its arena pass in the next.
++    MissDarkening darkening;
++    const int targets[4] = { 0, 0, 0, 0 };
++    const size_t frame[] = { 94, 9, 9, 136, 2 };
++    uint32_t wrongPass = 0, undarkened = 0, doubled = 0;
++    uint64_t present = 0;
++    uint32_t passInPresent = 0;
++    const uint32_t presentLengths[] = { 7, 10, 6, 9, 11, 8 };
++    uint32_t lengthIndex = 0;
++    for (uint32_t gameFrame = 0; gameFrame < 120; gameFrame++) {
++        const void *pair[2] = { &targets[(gameFrame * 2) % 4], &targets[(gameFrame * 2 + 1) % 4] };
++        uint32_t dark[2] = { 0, 0 };
++        for (size_t meshes : frame) {
++            for (int k = 0; k < 2; k++) {
++                const bool d = darkening.darkenThisPass(pair[k], present, meshes);
++                dark[k] += d ? 1 : 0;
++                wrongPass += ((gameFrame > 1) && d && (meshes != 136)) ? 1 : 0;
++                if (++passInPresent >= presentLengths[lengthIndex]) {
++                    passInPresent = 0;
++                    lengthIndex = (lengthIndex + 1) % 6;
++                    present++;
++                }
++            }
++        }
++
++        if (gameFrame > 1) {
++            for (int k = 0; k < 2; k++) {
++                undarkened += (dark[k] == 0) ? 1 : 0;
++                doubled += (dark[k] > 1) ? 1 : 0;
++            }
++        }
++    }
++
++    CHECK_EQ(undarkened, 0u);
++    CHECK_EQ(doubled, 0u);
++    CHECK_EQ(wrongPass, 0u);
++}
++
++TEST_CASE("outside darkness: a scene change to smaller passes still darkens (the recent maximum decays)") {
++    MissDarkening darkening;
++    const int target = 0;
++    uint64_t present = 0;
++    for (int i = 0; i < 10; i++, present++) {
++        darkening.darkenThisPass(&target, present, 130);
++    }
++
++    // A backstage room: its biggest pass is 40 meshes. It may take a while, but it must darken again.
++    bool darkenedAgain = false;
++    for (int i = 0; i < 200; i++, present++) {
++        darkenedAgain = darkening.darkenThisPass(&target, present, 40);
++    }
++
++    CHECK(darkenedAgain);
 +}
 diff --git a/tests/wcw/wcw_test.h b/tests/wcw/wcw_test.h
 new file mode 100644
