@@ -1,0 +1,19 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "WCW vs. nWo: World Tour",
+  "project": "WCW vs. nWo World Tour: Recompiled",
+  "system": "N64",
+  "type": "recomp",
+  "status": "released",
+  "targets": [
+    "Windows"
+  ],
+  "toolchain": [
+    "N64Recomp",
+    "RT64"
+  ],
+  "original": {
+    "region": "USA",
+    "sha1": "5ad2d8359058c8bb71f08e3d3433b7a50d3bb645"
+  }
+}
