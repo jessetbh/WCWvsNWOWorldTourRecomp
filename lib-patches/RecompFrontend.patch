@@ -312,10 +312,10 @@ index b9c5458..4c5926e 100644
 +    add_dependencies(recompui recompui_wcw_tests_run)
 +endif()
 diff --git a/recompui/include/recompui/config.h b/recompui/include/recompui/config.h
-index 38b84f5..4b057d0 100644
+index 38b84f5..09edc6f 100644
 --- a/recompui/include/recompui/config.h
 +++ b/recompui/include/recompui/config.h
-@@ -61,11 +61,26 @@ namespace recompui {
+@@ -61,11 +61,28 @@ namespace recompui {
                  inline const std::string hpfb_option = "hpfb_option";
                  inline const std::string rr_manual_value = "rr_manual_value";
                  inline const std::string ds_option = "ds_option";
@@ -329,7 +329,8 @@ index 38b84f5..4b057d0 100644
 +                inline const std::string crt_beam_option = "crt_beam_option";
 +                // [wcw hdr] HDR output (RT64 HdrOutput).
 +                inline const std::string hdr_option = "hdr_option";
-+                inline const std::string hdr_brightness = "hdr_brightness";
++                inline const std::string hdr_picture = "hdr_picture";
++                inline const std::string hdr_custom_nits = "hdr_custom_nits";
              }
      
              void update_msaa_supported(bool supported);
@@ -337,7 +338,8 @@ index 38b84f5..4b057d0 100644
              void toggle_fullscreen();
 +            // [wcw hdr] Hands the saved HDR settings to RT64; called before the renderer creates its swap chain.
 +            void apply_hdr_settings();
-+            // [wcw hdr] Shows in the HDR option whether HDR output actually started.
++            // [wcw hdr] Shows in the HDR option whether HDR output actually started, and in HDR Picture the
++            // display's figures and what the choice gives.
 +            void update_hdr_status(bool requested, bool active);
          }
  
@@ -515,7 +517,7 @@ index 0000000..80cf16b
 +    void apply_choice(ultramodern::renderer::RefreshRate &option, int &manual_value, uint32_t smooth_rate);
 +};
 diff --git a/recompui/src/config/ui_config_tab_graphics.cpp b/recompui/src/config/ui_config_tab_graphics.cpp
-index 4fdf81f..b7fba45 100644
+index 4fdf81f..d516a57 100644
 --- a/recompui/src/config/ui_config_tab_graphics.cpp
 +++ b/recompui/src/config/ui_config_tab_graphics.cpp
 @@ -1,7 +1,12 @@
@@ -531,7 +533,7 @@ index 4fdf81f..b7fba45 100644
  
  static bool created_graphics_config = false;
  
-@@ -64,6 +69,100 @@ namespace recompui {
+@@ -64,6 +69,117 @@ namespace recompui {
          #endif
          };
  
@@ -609,6 +611,23 @@ index 4fdf81f..b7fba45 100644
 +            {HdrOption::On, "On", "On"},
 +        };
 +
++        // Same values as RT64::WcwLogic::HdrPicture.
++        enum class HdrPictureOption {
++            Auto = 0,
++            Brighter = 1,
++            Balanced = 2,
++            CrtDetail = 3,
++            Custom = 4
++        };
++
++        static EnumOptionVector hdr_picture_options = {
++            {HdrPictureOption::Auto, "Auto", "Auto"},
++            {HdrPictureOption::Brighter, "Brighter", "Brighter"},
++            {HdrPictureOption::Balanced, "Balanced", "Balanced"},
++            {HdrPictureOption::CrtDetail, "CrtDetail", "CRT Detail"},
++            {HdrPictureOption::Custom, "Custom", "Custom"},
++        };
++
 +        enum class CrtBeamOption {
 +            Off = 0,
 +            On = 1
@@ -632,7 +651,7 @@ index 4fdf81f..b7fba45 100644
          static EnumOptionVector aspect_ratio_options = {
              {ultramodern::renderer::AspectRatio::Original, "Original"},
              {ultramodern::renderer::AspectRatio::Expand, "Expand"},
-@@ -83,6 +182,28 @@ namespace recompui {
+@@ -83,6 +199,28 @@ namespace recompui {
              {ultramodern::renderer::RefreshRate::Manual, "Manual"},
          };
  
@@ -661,7 +680,7 @@ index 4fdf81f..b7fba45 100644
          static EnumOptionVector hpfb_options = {
              {ultramodern::renderer::HighPrecisionFramebuffer::Auto, "Auto"},
              {ultramodern::renderer::HighPrecisionFramebuffer::On, "On"},
-@@ -152,11 +273,12 @@ namespace recompui {
+@@ -152,11 +290,12 @@ namespace recompui {
          }
  
          static std::string get_framerate_text(uint32_t refresh_rate) {
@@ -675,7 +694,7 @@ index 4fdf81f..b7fba45 100644
                  "<br />"
                  "<br />"
                  "<recomp-color primary>Detected display refresh rate: " + std::to_string(refresh_rate) + "hz</recomp-color>";
-@@ -175,9 +297,30 @@ namespace recompui {
+@@ -175,9 +314,30 @@ namespace recompui {
              new_config.hpfb_option = get_graphics_enum_value<ultramodern::renderer::HighPrecisionFramebuffer>(graphics::options::hpfb_option);
              new_config.rr_manual_value = get_graphics_number_value<int>(graphics::options::rr_manual_value);
  
@@ -706,12 +725,93 @@ index 4fdf81f..b7fba45 100644
          }
  
          void graphics::update_msaa_supported(bool supported) {
-@@ -202,11 +345,47 @@ namespace recompui {
+@@ -202,11 +362,124 @@ namespace recompui {
              }
          }
  
++        static const std::string hdr_description =
++            "<recomp-color warning>Experimental:</recomp-color> still being tuned, so expect rough edges. "
++            "Outputs in HDR on displays with Windows HDR turned on. Recommended with the CRT filter: it uses the display's extra "
++            "brightness for a stronger, more authentic phosphor mask without dimming the picture."
++            "<br />"
++            "<br />"
++            "<recomp-color primary>Takes effect after restarting the game.</recomp-color>";
++
++        static const std::string hdr_picture_description =
++            "How bright the game's white is with HDR on. The CRT filter spends the display's brightness above it on the phosphor mask. "
++            "<recomp-color primary>Auto</recomp-color> picks for your display: as bright as your desktop, or with the CRT filter, "
++            "dim enough for a full-strength mask while staying comfortable. "
++            "<recomp-color primary>Brighter</recomp-color> matches your desktop. "
++            "<recomp-color primary>CRT Detail</recomp-color> gives the CRT filter its strongest mask. "
++            "<recomp-color primary>Balanced</recomp-color> sits between the two.";
++
++        static std::string format_nits(float nits) {
++            return std::to_string(int(std::lround(nits))) + " nits";
++        }
++
++        // [wcw hdr] The HDR Picture readout: the display's figures, the resulting game white and CRT mask, and advice
++        // (RT64::WcwLogic::hdrAdvice). Follows the menu's values as they change, before Apply.
++        static void update_hdr_picture_readout(OptionChangeContext change_context = OptionChangeContext::Permanent) {
++            const RT64::HdrOutput::Status status = RT64::HdrOutput::status();
++            std::string readout = "<br /><br />";
++            if (!status.active) {
++                readout += "Turn on HDR and restart the game to see what this gives on your display.";
++            }
++            else {
++                const bool crt_on = get_graphics_enum_value<CrtFilterOption>(graphics::options::crt_filter_option, change_context) == CrtFilterOption::On;
++                const bool beam_setting = get_graphics_enum_value<CrtBeamOption>(graphics::options::crt_beam_option, change_context) == CrtBeamOption::On;
++                RT64::WcwLogic::HdrCrt crt;
++                crt.on = crt_on;
++                crt.baseMaskStrength = status.crt.on ? status.crt.baseMaskStrength : RT64::WcwLogic::HdrCrt().baseMaskStrength;
++                // The beam simulator only runs on a fast enough display; once the filter runs it reports whether it does.
++                crt.beam = crt_on && beam_setting && (status.crt.on ? status.crt.beam : true);
++                const auto picture = RT64::WcwLogic::HdrPicture(get_graphics_enum_value<HdrPictureOption>(graphics::options::hdr_picture, change_context));
++                const float custom_nits = float(get_graphics_number_value<int>(graphics::options::hdr_custom_nits, change_context));
++                const float paper_white = RT64::WcwLogic::hdrPaperWhite(picture, custom_nits, status.display, crt);
++
++                readout += "Your display: ";
++                if (status.display.peakNits > 0.0f) {
++                    readout += format_nits(status.display.peakNits) + " peak";
++                    if (status.display.fullFrameNits > 0.0f) {
++                        readout += ", " + format_nits(status.display.fullFrameNits) + " full-screen";
++                    }
++                }
++                else {
++                    readout += "peak brightness not reported (assuming " + format_nits(RT64::WcwLogic::HdrUnknownPeakNits) + ")";
++                }
++
++                readout += ".<br />Game white: <recomp-color primary>" + format_nits(paper_white) + "</recomp-color>";
++                if (crt_on) {
++                    const RT64::WcwLogic::HdrMask mask = RT64::WcwLogic::hdrMask(paper_white, status.display.peakNits, crt.baseMaskStrength, crt.beam);
++                    readout += ". CRT phosphor mask: <recomp-color primary>" + std::to_string(int(std::lround(mask.strength * 100.0f))) + "%</recomp-color>";
++                    if (mask.strength >= 0.995f) {
++                        readout += " (full strength)";
++                    }
++                }
++
++                readout += ".<br /><br />";
++                switch (RT64::WcwLogic::hdrAdvice(paper_white, status.display, crt)) {
++                case RT64::WcwLogic::HdrAdvice::TooBright:
++                    readout += "<recomp-color warning>Brighter than your display can hold across the whole screen, so bright scenes will dim.</recomp-color> Try Auto.";
++                    break;
++                case RT64::WcwLogic::HdrAdvice::LowHeadroom:
++                    readout += "<recomp-color warning>Little brightness left over for the CRT filter's mask.</recomp-color> Try Auto or CRT Detail.";
++                    break;
++                case RT64::WcwLogic::HdrAdvice::Dim:
++                    readout += "<recomp-color warning>This is quite dim.</recomp-color> Try Auto or Brighter.";
++                    break;
++                case RT64::WcwLogic::HdrAdvice::Good:
++                default:
++                    readout += "<recomp-color success>Good for your display.</recomp-color>";
++                    break;
++                }
++            }
++
++            get_graphics_config().update_option_description(graphics::options::hdr_picture, hdr_picture_description + readout);
++        }
++
 +        // [wcw hdr] On/off takes effect when the renderer next creates its swap chain (a restart);
-+        // the paper white brightness applies immediately.
++        // the picture choice applies immediately.
 +        void graphics::apply_hdr_settings() {
 +            if (!created_graphics_config) {
 +                return;
@@ -719,16 +819,11 @@ index 4fdf81f..b7fba45 100644
 +
 +            RT64::HdrOutput::Settings hdr_settings;
 +            hdr_settings.enabled = get_graphics_enum_value<HdrOption>(graphics::options::hdr_option) == HdrOption::On;
-+            hdr_settings.brightness = float(get_graphics_number_value<int>(graphics::options::hdr_brightness)) / 100.0f;
++            hdr_settings.picture = RT64::WcwLogic::HdrPicture(get_graphics_enum_value<HdrPictureOption>(graphics::options::hdr_picture));
++            hdr_settings.customNits = float(get_graphics_number_value<int>(graphics::options::hdr_custom_nits));
 +            RT64::HdrOutput::setUserSettings(hdr_settings);
++            update_hdr_picture_readout();
 +        }
-+
-+        static const std::string hdr_description =
-+            "<recomp-color warning>Experimental:</recomp-color> still being tuned, so expect rough edges. "
-+            "Outputs in HDR on displays with Windows HDR turned on. The CRT filter uses the extra brightness for a stronger, more authentic phosphor mask."
-+            "<br />"
-+            "<br />"
-+            "<recomp-color primary>Takes effect after restarting the game.</recomp-color>";
 +
 +        void graphics::update_hdr_status(bool requested, bool active) {
 +            std::string status;
@@ -741,6 +836,7 @@ index 4fdf81f..b7fba45 100644
 +            }
 +
 +            get_graphics_config().update_option_description(graphics::options::hdr_option, hdr_description + status);
++            update_hdr_picture_readout();
 +        }
 +
          void graphics::update_refresh_rate(uint32_t refresh_rate) {
@@ -756,7 +852,7 @@ index 4fdf81f..b7fba45 100644
          }
  
          void graphics::toggle_fullscreen() {
-@@ -299,12 +478,17 @@ namespace recompui {
+@@ -299,12 +572,17 @@ namespace recompui {
                  wm_default()
              );
  
@@ -778,7 +874,7 @@ index 4fdf81f..b7fba45 100644
              );
  
              config.add_number_option(
-@@ -314,12 +498,28 @@ namespace recompui {
+@@ -314,12 +592,28 @@ namespace recompui {
                  20.0, 240.0, 1.0, 0, false, 60.0
              );
              {
@@ -813,32 +909,10 @@ index 4fdf81f..b7fba45 100644
              }
  
              config.add_enum_option(
-@@ -359,6 +559,124 @@ namespace recompui {
+@@ -359,6 +653,147 @@ namespace recompui {
                  true
              );
  
-+            config.add_enum_option(
-+                graphics::options::hdr_option,
-+                "HDR (Experimental)",
-+                hdr_description,
-+                hdr_options,
-+                HdrOption::Off
-+            );
-+
-+            config.add_number_option(
-+                graphics::options::hdr_brightness,
-+                "HDR Brightness",
-+                "Brightness of the game and menus with HDR on. 100% matches Windows' SDR content brightness setting, so the game looks as bright as your desktop.",
-+                50, 150, 5, 0, true, 100
-+            );
-+            {
-+                config.add_option_hidden_dependency(
-+                    graphics::options::hdr_brightness,
-+                    graphics::options::hdr_option,
-+                    HdrOption::Off
-+                );
-+            }
-+
 +            config.add_enum_option(
 +                graphics::options::crt_filter_option,
 +                "CRT Filter (Experimental)",
@@ -901,6 +975,51 @@ index 4fdf81f..b7fba45 100644
 +                    graphics::options::crt_filter_option,
 +                    CrtFilterOption::Off
 +                );
++            }
++
++            config.add_enum_option(
++                graphics::options::hdr_option,
++                "HDR (Experimental)",
++                hdr_description,
++                hdr_options,
++                HdrOption::Off
++            );
++
++            config.add_enum_option(
++                graphics::options::hdr_picture,
++                "HDR Picture",
++                hdr_picture_description,
++                hdr_picture_options,
++                HdrPictureOption::Auto
++            );
++
++            config.add_number_option(
++                graphics::options::hdr_custom_nits,
++                "HDR Custom Brightness",
++                "Brightness of the game's white, in nits. Lower leaves more of the display's brightness for the CRT filter's mask.",
++                80, 600, 10, 0, false, 200
++            );
++            {
++                config.add_option_hidden_dependency(
++                    graphics::options::hdr_picture,
++                    graphics::options::hdr_option,
++                    HdrOption::Off
++                );
++                config.add_option_hidden_dependency(
++                    graphics::options::hdr_custom_nits,
++                    graphics::options::hdr_picture,
++                    HdrPictureOption::Auto, HdrPictureOption::Brighter, HdrPictureOption::Balanced, HdrPictureOption::CrtDetail
++                );
++
++                // The readout follows the choices that change it while the menu is open.
++                for (const std::string &option : { graphics::options::hdr_picture, graphics::options::hdr_custom_nits,
++                    graphics::options::crt_filter_option, graphics::options::crt_beam_option }) {
++                    config.add_option_change_callback(option,
++                        [](recomp::config::ConfigValueVariant, recomp::config::ConfigValueVariant, OptionChangeContext change_context) {
++                            update_hdr_picture_readout(change_context);
++                        }
++                    );
++                }
 +            }
 +
 +            config.add_enum_option(

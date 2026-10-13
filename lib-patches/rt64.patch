@@ -247,10 +247,10 @@ index f555048..a9de81e 100644
      }
 diff --git a/src/common/rt64_wcw_logic.cpp b/src/common/rt64_wcw_logic.cpp
 new file mode 100644
-index 0000000..bd83fc2
+index 0000000..05e9d23
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.cpp
-@@ -0,0 +1,329 @@
+@@ -0,0 +1,412 @@
 +//
 +// RT64
 +//
@@ -549,6 +549,89 @@ index 0000000..bd83fc2
 +        display += int64_t(viOriginalRate) * frames;
 +    }
 +
++    // HDR output
++
++    // A full-strength mask passes a third of the light: transmission = 1 - strength * HdrMaskLoss.
++    static const float HdrMaskLoss = 2.0f / 3.0f;
++    // Below this paper white the picture reads as dim.
++    static const float HdrDimNits = 120.0f;
++
++    static float hdrPeakOrDefault(float peakNits) {
++        return (peakNits > 0.0f) ? peakNits : HdrUnknownPeakNits;
++    }
++
++    static float hdrSdrWhiteOrDefault(const HdrDisplay &display) {
++        return (display.sdrWhiteNits > 0.0f) ? display.sdrWhiteNits : HdrUnknownSdrWhiteNits;
++    }
++
++    // Headroom (peak / paper white) at which the mask reaches full strength: the preset's transmission over a full
++    // mask's. With the beam simulator the mask gets the square root of the headroom, so it needs the square.
++    static float hdrFullMaskHeadroom(const HdrCrt &crt) {
++        const float base = std::clamp(crt.baseMaskStrength, 0.0f, 1.0f);
++        const float needed = (1.0f - base * HdrMaskLoss) / (1.0f - HdrMaskLoss);
++        return crt.beam ? (needed * needed) : needed;
++    }
++
++    float hdrPaperWhite(HdrPicture picture, float customNits, const HdrDisplay &display, const HdrCrt &crt) {
++        const float brighter = hdrSdrWhiteOrDefault(display);
++        const float fullMask = hdrPeakOrDefault(display.peakNits) / hdrFullMaskHeadroom(crt);
++        const float crtDetail = std::min(std::max(fullMask, HdrCrtDetailFloorNits), brighter);
++        float paperWhite = brighter;
++        switch (picture) {
++        case HdrPicture::Brighter:
++            paperWhite = brighter;
++            break;
++        case HdrPicture::Balanced:
++            paperWhite = std::sqrt(brighter * crtDetail);
++            break;
++        case HdrPicture::CrtDetail:
++            paperWhite = crtDetail;
++            break;
++        case HdrPicture::Custom:
++            paperWhite = customNits;
++            break;
++        case HdrPicture::Auto:
++        default:
++            paperWhite = crt.on ? std::max(crtDetail, std::min(HdrComfortNits, brighter)) : brighter;
++            break;
++        }
++
++        return std::clamp(paperWhite, HdrMinPaperWhiteNits, HdrMaxPaperWhiteNits);
++    }
++
++    HdrMask hdrMask(float paperWhiteNits, float peakNits, float baseMaskStrength, bool beam) {
++        HdrMask mask;
++        const float base = std::clamp(baseMaskStrength, 0.0f, 1.0f);
++        const float headroom = std::max(hdrPeakOrDefault(peakNits) / std::max(paperWhiteNits, 1.0f), 1.0f);
++        const float maskHeadroom = beam ? std::sqrt(headroom) : headroom;
++        const float baseTransmission = 1.0f - base * HdrMaskLoss;
++        mask.strength = std::clamp((1.0f - baseTransmission / maskHeadroom) / HdrMaskLoss, base, 1.0f);
++        mask.gain = baseTransmission / (1.0f - mask.strength * HdrMaskLoss);
++        mask.beamScale = beam ? std::clamp(headroom / mask.gain, 1.0f, 4.0f) : 1.0f;
++        return mask;
++    }
++
++    HdrAdvice hdrAdvice(float paperWhiteNits, const HdrDisplay &display, const HdrCrt &crt) {
++        // 5% slack: displays round their full-frame figure.
++        if ((display.fullFrameNits > 0.0f) && (paperWhiteNits > display.fullFrameNits * 1.05f)) {
++            return HdrAdvice::TooBright;
++        }
++
++        if (crt.on) {
++            // Less than halfway from the preset's own mask to full strength.
++            const float base = std::clamp(crt.baseMaskStrength, 0.0f, 1.0f);
++            if (hdrMask(paperWhiteNits, display.peakNits, base, crt.beam).strength < (base + (1.0f - base) * 0.5f)) {
++                return HdrAdvice::LowHeadroom;
++            }
++        }
++
++        if (paperWhiteNits < HdrDimNits) {
++            return HdrAdvice::Dim;
++        }
++
++        return HdrAdvice::Good;
++    }
++
 +    bool primeGeneratedTargets(bool primeEnabled, bool generateInterpolatedFrames, bool usingMSAA, uint32_t runLength) {
 +        return primeEnabled && generateInterpolatedFrames && !usingMSAA && (runLength == 1);
 +    }
@@ -582,10 +665,10 @@ index 0000000..bd83fc2
 +};
 diff --git a/src/common/rt64_wcw_logic.h b/src/common/rt64_wcw_logic.h
 new file mode 100644
-index 0000000..fa5238f
+index 0000000..ec2d596
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.h
-@@ -0,0 +1,229 @@
+@@ -0,0 +1,303 @@
 +//
 +// RT64
 +//
@@ -793,6 +876,80 @@ index 0000000..fa5238f
 +        // Skips displayed frames (not rendered).
 +        void skip(uint32_t viOriginalRate, uint32_t frames);
 +    };
++
++    // HDR output
++
++    // The menu's HDR Picture choices. Each sets paper white (the brightness of SDR white: the game picture and menus).
++    // The headroom above it (display peak / paper white) is what the CRT filter spends on a stronger phosphor mask.
++    enum class HdrPicture : uint32_t {
++        // Brighter with the CRT filter off; CrtDetail (but no dimmer than HdrComfortNits) with it on.
++        Auto = 0,
++        // Windows' SDR content brightness: as bright as the desktop.
++        Brighter = 1,
++        // Halfway (geometric mean) between Brighter and CrtDetail.
++        Balanced = 2,
++        // Dim enough that the CRT mask reaches full strength.
++        CrtDetail = 3,
++        // The user's own paper white, in nits.
++        Custom = 4
++    };
++
++    // What the display reports. 0 = unknown.
++    struct HdrDisplay {
++        float peakNits = 0.0f;
++        float fullFrameNits = 0.0f;
++        // Windows' "SDR content brightness".
++        float sdrWhiteNits = 0.0f;
++    };
++
++    // The CRT filter's state: on, its preset's own mask strength (guest-advanced "maskstr"), and whether the beam
++    // simulator shares the headroom.
++    struct HdrCrt {
++        bool on = false;
++        float baseMaskStrength = 0.3f;
++        bool beam = false;
++    };
++
++    constexpr float HdrMinPaperWhiteNits = 80.0f;
++    constexpr float HdrMaxPaperWhiteNits = 1000.0f;
++    // Assumed when the display doesn't report its peak / Windows doesn't report its SDR white.
++    constexpr float HdrUnknownPeakNits = 1000.0f;
++    constexpr float HdrUnknownSdrWhiteNits = 200.0f;
++    // Auto with the CRT filter doesn't go dimmer than this for a stronger mask; CRT detail doesn't go below the floor.
++    constexpr float HdrComfortNits = 160.0f;
++    constexpr float HdrCrtDetailFloorNits = 100.0f;
++
++    // Paper white in nits for a choice, between HdrMinPaperWhiteNits and HdrMaxPaperWhiteNits. Custom only clamps
++    // customNits to that range.
++    float hdrPaperWhite(HdrPicture picture, float customNits, const HdrDisplay &display, const HdrCrt &crt);
++
++    // The CRT filter's adaptive phosphor mask. A full-strength mask passes about a third of the light, so in SDR the
++    // presets use a weak mask; with HDR the headroom pays for a stronger one and gain multiplies the light back in,
++    // so the picture is never dimmer than in SDR. With the beam simulator, mask and beam share the headroom evenly.
++    struct HdrMask {
++        float strength = 0.0f;
++        // Brightness multiplier that makes up for the stronger mask.
++        float gain = 1.0f;
++        // The beam simulator's share of the headroom (1 = none).
++        float beamScale = 1.0f;
++    };
++
++    HdrMask hdrMask(float paperWhiteNits, float peakNits, float baseMaskStrength, bool beam);
++
++    // What the settings readout tells the user.
++    enum class HdrAdvice : uint32_t {
++        // Fine as is.
++        Good = 0,
++        // Brighter than the display can hold across the whole screen (its full-frame brightness): the monitor dims
++        // big bright scenes (No Mercy's white ring mat) and the picture pumps.
++        TooBright = 1,
++        // With the CRT filter: the mask can't get much stronger than in SDR. Lower the brightness.
++        LowHeadroom = 2,
++        // Dimmer than a comfortable picture.
++        Dim = 3
++    };
++
++    HdrAdvice hdrAdvice(float paperWhiteNits, const HdrDisplay &display, const HdrCrt &crt);
 +
 +    // Generated-frame priming: copying the game's buffer into a run's generated targets happens once per run, before
 +    // its first layer draws the blended frame. Priming after the blend applied translucent full-screen layers
@@ -17129,10 +17286,10 @@ index bde2f03..baf269d 100644
          void reset();
 diff --git a/src/render/rt64_crt_filter.cpp b/src/render/rt64_crt_filter.cpp
 new file mode 100644
-index 0000000..9562703
+index 0000000..eddf1b5
 --- /dev/null
 +++ b/src/render/rt64_crt_filter.cpp
-@@ -0,0 +1,841 @@
+@@ -0,0 +1,848 @@
 +//
 +// RT64
 +//
@@ -17606,6 +17763,8 @@ index 0000000..9562703
 +            appliedVersion = version;
 +            settings = next;
 +            if (!settings.enabled || (backend == CrtBackend::None)) {
++                // [wcw hdr] HDR Picture's Auto goes back to desktop brightness without the filter.
++                HdrOutput::setCrtState(WcwLogic::HdrCrt());
 +                return;
 +            }
 +
@@ -17721,34 +17880,38 @@ index 0000000..9562703
 +            return hdrStage.texture.get();
 +        }
 +
-+        // [wcw hdr] Adaptive phosphor mask. A full-strength mask passes roughly a third of the light, so
-+        // in SDR the presets use a weak mask plus guest's brightness boost. With HDR, the display's
-+        // headroom above paper white (peak / paper white) pays for a stronger mask: the mask is raised
-+        // as far as the headroom allows and the compose pass multiplies the light back in, so the
-+        // picture is never dimmer than in SDR. Full strength from about 3x headroom (a 1000-nit display
-+        // at ~330 nits paper white). WCW_HDR_MASK=<0..1> forces the strength.
++        // [wcw hdr] Adaptive phosphor mask (WcwLogic::hdrMask): the display's headroom above paper white pays for a
++        // stronger mask and the compose pass multiplies the light back in, so the picture is never dimmer than in SDR.
++        // The filter's state goes to HdrOutput first: Auto and CRT detail set paper white from it.
++        // WCW_HDR_MASK=<0..1> forces the strength.
 +        void updateHdrMask() {
++            const bool beamOn = settings.beamSimulator && (beamRatio > 0.0);
++            if (baseMaskStrength >= 0.0f) {
++                HdrOutput::setCrtState({ true, baseMaskStrength, beamOn });
++            }
++
 +            if (!HdrOutput::active() || (baseMaskStrength < 0.0f)) {
 +                hdrGain = 1.0f;
 +                return;
 +            }
 +
-+            const float MaskLoss = 2.0f / 3.0f;
 +            const float paperWhite = HdrOutput::paperWhiteNits();
-+            const float peak = (HdrOutput::peakNits() > 0.0f) ? HdrOutput::peakNits() : 1000.0f;
-+            const float headroom = std::max(peak / paperWhite, 1.0f);
-+            // With the beam simulator on, the mask and the beam share the headroom evenly.
-+            const bool beamOn = settings.beamSimulator && (beamRatio > 0.0);
-+            const float maskHeadroom = beamOn ? std::sqrt(headroom) : headroom;
-+            const float baseTransmission = 1.0f - baseMaskStrength * MaskLoss;
-+            float strength = std::clamp((1.0f - baseTransmission / maskHeadroom) / MaskLoss, baseMaskStrength, 1.0f);
++            const float peak = HdrOutput::peakNits();
++            const WcwLogic::HdrMask mask = WcwLogic::hdrMask(paperWhite, peak, baseMaskStrength, beamOn);
++            float strength = mask.strength;
 +            static const float envMask = getenv("WCW_HDR_MASK") ? float(atof(getenv("WCW_HDR_MASK"))) : -1.0f;
 +            if (envMask >= 0.0f) {
 +                strength = std::clamp(envMask, 0.0f, 1.0f);
 +            }
 +
-+            hdrGain = baseTransmission / (1.0f - strength * MaskLoss);
-+            beamHdrScale = beamOn ? std::clamp(headroom / hdrGain, 1.0f, 4.0f) : 1.0f;
++            hdrGain = mask.gain;
++            beamHdrScale = mask.beamScale;
++            if (envMask >= 0.0f) {
++                const float headroom = std::max(((peak > 0.0f) ? peak : WcwLogic::HdrUnknownPeakNits) / paperWhite, 1.0f);
++                hdrGain = (1.0f - baseMaskStrength * 2.0f / 3.0f) / (1.0f - strength * 2.0f / 3.0f);
++                beamHdrScale = beamOn ? std::clamp(headroom / hdrGain, 1.0f, 4.0f) : 1.0f;
++            }
++
 +            if (beamOn && beamChain.ready() && (std::abs(beamHdrScale - appliedBeamHdrScale) > 0.005f)) {
 +                // The beam's input is scaled down so it can run at full brightness (GAIN_VS_BLUR 1.0).
 +                setParameter(beamChain, "INPUT_SCALE", 1.0f / beamHdrScale);
@@ -17756,6 +17919,7 @@ index 0000000..9562703
 +                appliedBeamHdrScale = beamHdrScale;
 +                fprintf(stderr, "[wcw hdr] Beam simulator HDR scale %.2f.\n", beamHdrScale);
 +            }
++
 +            if (std::abs(strength - appliedMaskStrength) > 0.005f) {
 +                setParameter(guestChain, "maskstr", strength);
 +                appliedMaskStrength = strength;
@@ -18545,10 +18709,10 @@ index 3add9c3..eac76ba 100644
              std::unique_ptr<RenderBuffer> paramsBuffer;
 diff --git a/src/render/rt64_hdr_output.cpp b/src/render/rt64_hdr_output.cpp
 new file mode 100644
-index 0000000..0c9fbd9
+index 0000000..5227e08
 --- /dev/null
 +++ b/src/render/rt64_hdr_output.cpp
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,207 @@
 +//
 +// RT64
 +//
@@ -18557,6 +18721,8 @@ index 0000000..0c9fbd9
 +
 +#include <algorithm>
 +#include <atomic>
++#include <cmath>
++#include <cstdio>
 +#include <cstdlib>
 +#include <cstring>
 +#include <mutex>
@@ -18567,14 +18733,12 @@ index 0000000..0c9fbd9
 +#endif
 +
 +namespace RT64 {
-+    // Used when Windows doesn't report an SDR white level.
-+    static const float DefaultSdrWhiteNits = 200.0f;
-+
 +    static std::mutex hdrSettingsMutex;
 +    static HdrOutput::Settings hdrSettings;
-+    static float hdrSdrWhiteNits = DefaultSdrWhiteNits;
++    static WcwLogic::HdrDisplay hdrDisplay;
++    static WcwLogic::HdrCrt hdrCrt;
 +    static std::atomic<bool> hdrActive = false;
-+    static std::atomic<float> hdrPaperWhite = DefaultSdrWhiteNits;
++    static std::atomic<float> hdrPaperWhite = WcwLogic::HdrUnknownSdrWhiteNits;
 +    static std::atomic<float> hdrPeakNits = 0.0f;
 +
 +    static bool envForced() {
@@ -18582,14 +18746,20 @@ index 0000000..0c9fbd9
 +        return (env != nullptr) && (strcmp(env, "force") == 0);
 +    }
 +
-+    // Paper white = Windows' SDR content brightness x the user's HDR Brightness. Call with the lock held.
++    // Paper white from the picture choice, the display and the CRT filter (WcwLogic::hdrPaperWhite). Call with the lock held.
 +    static void updatePaperWhite() {
-+        float paperWhite = hdrSdrWhiteNits * std::clamp(hdrSettings.brightness, 0.25f, 4.0f);
++        float paperWhite = WcwLogic::hdrPaperWhite(hdrSettings.picture, hdrSettings.customNits, hdrDisplay, hdrCrt);
 +        if (const char *env = getenv("WCW_HDR_PAPER")) {
-+            paperWhite = float(atof(env));
++            paperWhite = std::clamp(float(atof(env)), WcwLogic::HdrMinPaperWhiteNits, WcwLogic::HdrMaxPaperWhiteNits);
 +        }
 +
-+        hdrPaperWhite = std::clamp(paperWhite, 80.0f, 1000.0f);
++        if (std::abs(paperWhite - hdrPaperWhite.load()) > 0.5f) {
++            hdrPaperWhite = paperWhite;
++            if (hdrActive) {
++                fprintf(stderr, "[wcw hdr] Paper white %.0f nits (picture %u, CRT %s, beam %s).\n", paperWhite, uint32_t(hdrSettings.picture),
++                    hdrCrt.on ? "on" : "off", hdrCrt.beam ? "on" : "off");
++            }
++        }
 +    }
 +
 +    void HdrOutput::setUserSettings(const Settings &settings) {
@@ -18704,8 +18874,30 @@ index 0000000..0c9fbd9
 +        std::scoped_lock lock(hdrSettingsMutex);
 +        hdrActive = active;
 +        hdrPeakNits = display.maxLuminance;
-+        hdrSdrWhiteNits = (display.sdrWhiteNits > 0.0f) ? display.sdrWhiteNits : DefaultSdrWhiteNits;
++        hdrDisplay.peakNits = display.maxLuminance;
++        hdrDisplay.fullFrameNits = display.maxFullFrameLuminance;
++        hdrDisplay.sdrWhiteNits = display.sdrWhiteNits;
 +        updatePaperWhite();
++    }
++
++    void HdrOutput::setCrtState(const WcwLogic::HdrCrt &crt) {
++        std::scoped_lock lock(hdrSettingsMutex);
++        if ((crt.on == hdrCrt.on) && (crt.beam == hdrCrt.beam) && (std::abs(crt.baseMaskStrength - hdrCrt.baseMaskStrength) < 1e-4f)) {
++            return;
++        }
++
++        hdrCrt = crt;
++        updatePaperWhite();
++    }
++
++    HdrOutput::Status HdrOutput::status() {
++        std::scoped_lock lock(hdrSettingsMutex);
++        Status status;
++        status.active = hdrActive;
++        status.display = hdrDisplay;
++        status.crt = hdrCrt;
++        status.paperWhiteNits = hdrPaperWhite;
++        return status;
 +    }
 +
 +    bool HdrOutput::active() {
@@ -18730,10 +18922,10 @@ index 0000000..0c9fbd9
 +};
 diff --git a/src/render/rt64_hdr_output.h b/src/render/rt64_hdr_output.h
 new file mode 100644
-index 0000000..4ff5129
+index 0000000..2cb4561
 --- /dev/null
 +++ b/src/render/rt64_hdr_output.h
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,74 @@
 +//
 +// RT64
 +//
@@ -18741,19 +18933,21 @@ index 0000000..4ff5129
 +#pragma once
 +
 +#include "common/rt64_plume.h"
++#include "common/rt64_wcw_logic.h"
 +
 +namespace RT64 {
 +    // [wcw hdr] Optional HDR presentation. When enabled (and Windows HDR is on for the window's
 +    // display), the swap chain is created as scRGB: R16G16B16A16_FLOAT, linear, 1.0 = 80 nits.
 +    // Everything drawn to it converts its SDR (sRGB) output to linear light at the paper white
-+    // brightness (sdrScale), which follows Windows' "SDR content brightness" setting for the
-+    // display times the user's HDR Brightness. Turning HDR on or off takes effect on the next
-+    // launch; brightness applies immediately.
++    // brightness (sdrScale), which the user's HDR Picture choice sets from the display's figures and
++    // the CRT filter's state (WcwLogic::hdrPaperWhite). Turning HDR on or off takes effect on the next
++    // launch; the picture choice applies immediately.
 +    struct HdrOutput {
 +        struct Settings {
 +            bool enabled = false;
-+            // Multiplier on Windows' SDR content brightness (1.0 = match the desktop).
-+            float brightness = 1.0f;
++            WcwLogic::HdrPicture picture = WcwLogic::HdrPicture::Auto;
++            // Paper white for HdrPicture::Custom, in nits.
++            float customNits = 200.0f;
 +        };
 +
 +        struct DisplayInfo {
@@ -18764,7 +18958,15 @@ index 0000000..4ff5129
 +            float sdrWhiteNits = 0.0f;
 +        };
 +
-+        // Thread-safe. Test overrides: WCW_HDR=1/0/force, WCW_HDR_PAPER=<nits>.
++        // For the settings readout.
++        struct Status {
++            bool active = false;
++            WcwLogic::HdrDisplay display;
++            WcwLogic::HdrCrt crt;
++            float paperWhiteNits = 0.0f;
++        };
++
++        // Thread-safe. Test overrides: WCW_HDR=1/0/force, WCW_HDR_PAPER=<nits> (replaces the picture choice).
 +        static void setUserSettings(const Settings &settings);
 +        static Settings userSettings();
 +
@@ -18774,6 +18976,13 @@ index 0000000..4ff5129
 +
 +        // Called once the swap chain exists, with the display it was created for.
 +        static void setActive(bool active, const DisplayInfo &display);
++
++        // The CRT filter reports whether it's on, its preset's mask strength and the beam simulator,
++        // which Auto and CRT detail use. Thread-safe; cheap when nothing changed.
++        static void setCrtState(const WcwLogic::HdrCrt &crt);
++
++        // Thread-safe snapshot of the display, CRT state and resulting paper white.
++        static Status status();
 +
 +        // True when the swap chain is scRGB.
 +        static bool active();
@@ -22272,10 +22481,10 @@ index 0000000..22a556e
 +#endif
 diff --git a/tests/wcw/rt64_wcw_logic_tests.cpp b/tests/wcw/rt64_wcw_logic_tests.cpp
 new file mode 100644
-index 0000000..21680fe
+index 0000000..a40409f
 --- /dev/null
 +++ b/tests/wcw/rt64_wcw_logic_tests.cpp
-@@ -0,0 +1,538 @@
+@@ -0,0 +1,642 @@
 +//
 +// RT64
 +//
@@ -22809,6 +23018,110 @@ index 0000000..21680fe
 +    MatrixSlotIdentity identity(0);
 +    CHECK_EQ(identity.canonical(0x80101000), 0x80101000u);
 +    CHECK_EQ(identity.canonical(0x80101040), 0x80101040u);
++}
++
++// HDR output
++
++// The owner's monitor: 455 nits peak, 265 full frame, Windows SDR white 240.
++static const HdrDisplay OwnerHdr = { 455.0f, 265.0f, 240.0f };
++static const HdrDisplay BrightHdr = { 1000.0f, 600.0f, 240.0f };
++static const HdrDisplay Hdr400 = { 400.0f, 400.0f, 300.0f };
++static const HdrCrt CrtOn = { true, 0.3f, false };
++static const HdrCrt CrtBeam = { true, 0.3f, true };
++static const HdrCrt CrtOff = { false, 0.3f, false };
++
++TEST_CASE("hdr mask: unchanged from the original adaptive mask (owner's 150% and 100% logged values)") {
++    // The CRT filter logged 0.55 / gain 1.26 at 360 nits paper white and 0.87 / gain 1.90 at 240 nits.
++    HdrMask at150 = hdrMask(360.0f, 455.0f, 0.3f, false);
++    CHECK_NEAR(at150.strength, 0.55, 0.01);
++    CHECK_NEAR(at150.gain, 1.26, 0.01);
++    HdrMask at100 = hdrMask(240.0f, 455.0f, 0.3f, false);
++    CHECK_NEAR(at100.strength, 0.87, 0.01);
++    CHECK_NEAR(at100.gain, 1.90, 0.01);
++    CHECK_NEAR(at100.beamScale, 1.0, 1e-6);
++}
++
++TEST_CASE("hdr mask: never weaker than the preset, never past full, and the gain keeps the picture as bright as SDR") {
++    for (float paper : { 80.0f, 200.0f, 455.0f, 900.0f }) {
++        for (bool beam : { false, true }) {
++            const HdrMask mask = hdrMask(paper, 455.0f, 0.3f, beam);
++            CHECK(mask.strength >= 0.3f - 1e-6f);
++            CHECK(mask.strength <= 1.0f + 1e-6f);
++            // The stronger mask's light loss times the gain equals the preset's own.
++            CHECK_NEAR((1.0f - mask.strength * 2.0f / 3.0f) * mask.gain, 1.0f - 0.3f * 2.0f / 3.0f, 1e-5);
++            CHECK(mask.beamScale >= 1.0f);
++            CHECK(mask.beamScale <= 4.0f);
++        }
++    }
++
++    // No headroom (paper white at or above peak): the preset as is.
++    CHECK_NEAR(hdrMask(455.0f, 455.0f, 0.3f, false).strength, 0.3, 1e-6);
++    // An unknown peak counts as 1000 nits.
++    CHECK_NEAR(hdrMask(240.0f, 0.0f, 0.3f, false).strength, hdrMask(240.0f, 1000.0f, 0.3f, false).strength, 1e-6);
++}
++
++TEST_CASE("hdr auto: on the owner's monitor with the CRT filter it lands where the owner tuned by eye (80% = 192 nits)") {
++    const float paper = hdrPaperWhite(HdrPicture::Auto, 0.0f, OwnerHdr, CrtOn);
++    CHECK_NEAR(paper, 190.0, 5.0);
++    CHECK(hdrMask(paper, OwnerHdr.peakNits, 0.3f, false).strength > 0.98f);
++    CHECK_EQ(int(hdrAdvice(paper, OwnerHdr, CrtOn)), int(HdrAdvice::Good));
++}
++
++TEST_CASE("hdr auto: without the CRT filter it matches the desktop (Windows SDR white)") {
++    CHECK_NEAR(hdrPaperWhite(HdrPicture::Auto, 0.0f, OwnerHdr, CrtOff), 240.0, 1e-3);
++    CHECK_NEAR(hdrPaperWhite(HdrPicture::Auto, 0.0f, BrightHdr, CrtOff), 240.0, 1e-3);
++    // Windows doesn't report SDR white: 200 nits.
++    CHECK_NEAR(hdrPaperWhite(HdrPicture::Auto, 0.0f, HdrDisplay{ 455.0f, 265.0f, 0.0f }, CrtOff), 200.0, 1e-3);
++}
++
++TEST_CASE("hdr auto: a bright display gets the full mask at desktop brightness, never brighter than the desktop") {
++    const float paper = hdrPaperWhite(HdrPicture::Auto, 0.0f, BrightHdr, CrtOn);
++    CHECK_NEAR(paper, 240.0, 1e-3);
++    CHECK(hdrMask(paper, BrightHdr.peakNits, 0.3f, false).strength > 0.99f);
++}
++
++TEST_CASE("hdr auto: an HDR400 panel with the CRT filter stays at a comfortable brightness instead of chasing the mask") {
++    const float paper = hdrPaperWhite(HdrPicture::Auto, 0.0f, Hdr400, CrtOn);
++    CHECK(paper >= HdrComfortNits - 1e-3f);
++    CHECK(paper <= Hdr400.sdrWhiteNits + 1e-3f);
++}
++
++TEST_CASE("hdr auto: the beam simulator shares the headroom, so Auto holds the comfort floor on the owner's monitor") {
++    CHECK_NEAR(hdrPaperWhite(HdrPicture::Auto, 0.0f, OwnerHdr, CrtBeam), HdrComfortNits, 1e-3);
++    // CRT detail goes as low as its floor for the mask.
++    CHECK_NEAR(hdrPaperWhite(HdrPicture::CrtDetail, 0.0f, OwnerHdr, CrtBeam), HdrCrtDetailFloorNits, 1e-3);
++}
++
++TEST_CASE("hdr picture: Brighter >= Balanced >= CRT detail, on every display") {
++    for (const HdrDisplay &display : { OwnerHdr, BrightHdr, Hdr400, HdrDisplay{} }) {
++        for (const HdrCrt &crt : { CrtOn, CrtBeam, CrtOff }) {
++            const float brighter = hdrPaperWhite(HdrPicture::Brighter, 0.0f, display, crt);
++            const float balanced = hdrPaperWhite(HdrPicture::Balanced, 0.0f, display, crt);
++            const float detail = hdrPaperWhite(HdrPicture::CrtDetail, 0.0f, display, crt);
++            CHECK(brighter >= balanced - 1e-3f);
++            CHECK(balanced >= detail - 1e-3f);
++            CHECK(detail >= HdrMinPaperWhiteNits);
++        }
++    }
++}
++
++TEST_CASE("hdr picture: Custom uses the user's nits, clamped to the valid range") {
++    CHECK_NEAR(hdrPaperWhite(HdrPicture::Custom, 190.0f, OwnerHdr, CrtOn), 190.0, 1e-3);
++    CHECK_NEAR(hdrPaperWhite(HdrPicture::Custom, 10.0f, OwnerHdr, CrtOn), HdrMinPaperWhiteNits, 1e-3);
++    CHECK_NEAR(hdrPaperWhite(HdrPicture::Custom, 5000.0f, OwnerHdr, CrtOn), HdrMaxPaperWhiteNits, 1e-3);
++}
++
++TEST_CASE("hdr advice: the owner's old 150% (360 nits) was brighter than the monitor holds full-screen") {
++    CHECK_EQ(int(hdrAdvice(360.0f, OwnerHdr, CrtOn)), int(HdrAdvice::TooBright));
++    CHECK_EQ(int(hdrAdvice(240.0f, OwnerHdr, CrtOn)), int(HdrAdvice::Good));
++}
++
++TEST_CASE("hdr advice: little headroom with the CRT filter asks for less brightness, and very dim is flagged") {
++    // 1.2x headroom: the mask barely moves.
++    CHECK_EQ(int(hdrAdvice(250.0f, HdrDisplay{ 300.0f, 0.0f, 250.0f }, CrtOn)), int(HdrAdvice::LowHeadroom));
++    // Without the CRT filter headroom doesn't matter.
++    CHECK_EQ(int(hdrAdvice(250.0f, HdrDisplay{ 300.0f, 0.0f, 250.0f }, CrtOff)), int(HdrAdvice::Good));
++    CHECK_EQ(int(hdrAdvice(100.0f, OwnerHdr, CrtOff)), int(HdrAdvice::Dim));
 +}
 +
 +int main() {
