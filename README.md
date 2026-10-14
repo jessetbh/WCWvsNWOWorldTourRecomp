@@ -272,6 +272,9 @@ remove a mod, delete its file.
 A mod is a small C program compiled for the N64's MIPS CPU. The runtime links it into the recompiled game, where it
 can run code when a game function is called (a *hook*) or replace a game function (a *patch*).
 
+The bundled mods are open source in [AKI Mods](https://github.com/jessetbh/AkiMods): working examples, and a
+build script that does everything below for all six games at once.
+
 You need:
 
 - a C compiler with a MIPS backend: [`zig cc`](https://ziglang.org/) works out of the box (the Clang that ships
