@@ -95,7 +95,8 @@ On real hardware this game saves **only** to a Controller Pak and rumbles **only
 with a Rumble Pak — one slot, physically swapped. The port emulates a hybrid pak:
 saves always work and persist automatically, and if you answer the game's "Insert a
 Rumble Pak now" prompt at the title screen, rumble works too, with no risk to your
-save data.
+save data. In multiplayer, players 2-4 get a Rumble Pak in their own port too, so
+every player's gamepad rumbles.
 
 #### Smoother Motion (Experimental)
 
@@ -183,8 +184,6 @@ ROM** again.
 
 ## Known Issues
 
-* **Rumble works for player 1 only** — the emulated pak lives in controller port 1,
-  matching the game's own pak handling.
 * Overlays such as MSI Afterburner and other software such as Wallpaper Engine can
   cause performance issues that prevent the game from rendering correctly. Disabling
   such software is recommended.

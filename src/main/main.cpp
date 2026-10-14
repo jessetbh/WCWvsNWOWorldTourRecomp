@@ -272,11 +272,13 @@ void update_gfx(void*) {
 
 ultramodern::input::connected_device_info_t get_connected_device_info(int controller_num) {
     // All four ports report a controller so the game considers every player slot joinable
-    // (unassigned players read as neutral input, like an idle plugged-in pad). Only port 1
-    // has a pak: the emulated hybrid Controller/Rumble Pak in librecomp si.cpp.
+    // (unassigned players read as neutral input, like an idle plugged-in pad). Every port has
+    // a pak: port 1 the emulated hybrid Controller/Rumble Pak in librecomp si.cpp, ports 2-4 a
+    // plain Rumble Pak (the game probes osMotorInit on all four ports; saves use port 1 only).
+    // The frontend rumbles each assigned player's own pad (multiplayer mode).
+    (void)controller_num;
     return { .connected_device = ultramodern::input::Device::Controller,
-             .connected_pak = (controller_num == 0) ? ultramodern::input::Pak::RumblePak
-                                                    : ultramodern::input::Pak::None };
+             .connected_pak = ultramodern::input::Pak::RumblePak };
 }
 
 // ---------------- audio (minimal: queue as-is, 16-bit stereo) ----------------
