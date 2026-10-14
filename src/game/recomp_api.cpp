@@ -145,3 +145,38 @@ extern "C" void recomp_wcw_rt_camera_view(uint8_t* rdram, recomp_context* ctx) {
         }
     }
 }
+
+// Widescreen cull (aki-roadmap#47 / #5; patches/widescreen_cull.c replaces func_8000252C with a call here).
+// The game's per-object view cull, computed exactly as the original (single-precision divide, double
+// compare against 1.5) on node +0x18 (x), +0x1C (y) and +0x20 (depth): culled when the center is past
+// |x| / (depth + 150) > 1.5 or |y| / (depth + 150) > 1.5. That margin is about 3.8x the 4:3 screen edge;
+// in Expand the screen is wider, so large set pieces whose center is past the line but which reach into
+// the extra width vanished at the edges. Only the horizontal limit is scaled, by how much wider than 4:3
+// the screen is (1 at Original, so 4:3 is unchanged). The projection is untouched: RT64's Expand widens it.
+extern "C" void recomp_wcw_cull_visible(uint8_t* rdram, recomp_context* ctx) {
+    const gpr node = ctx->r4;
+    double scale = 1.0;
+    const ultramodern::renderer::GraphicsConfig& config = ultramodern::renderer::get_graphics_config();
+    if (config.ar_option == ultramodern::renderer::AspectRatio::Expand) {
+        int width = 0, height = 0;
+        recompui::get_window_size(width, height);
+        if (width > 0 && height > 0) {
+            scale = std::max(1.0, (static_cast<double>(width) / height) / (4.0 / 3.0));
+        }
+    }
+
+    const float w = word_float(MEM_W(0x20, node)) + 150.0f;
+    if (w <= 0.0f) {
+        _return<s32>(ctx, 0);
+        return;
+    }
+
+    const float ax = std::fabs(word_float(MEM_W(0x18, node)) / w);
+    if ((1.5 * scale) < static_cast<double>(ax)) {
+        _return<s32>(ctx, 0);
+        return;
+    }
+
+    const float ay = std::fabs(word_float(MEM_W(0x1C, node)) / w);
+    _return<s32>(ctx, (1.5 < static_cast<double>(ay)) ? 0 : 1);
+}

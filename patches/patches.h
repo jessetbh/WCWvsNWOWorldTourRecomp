@@ -25,6 +25,9 @@ f32 recomp_get_target_aspect_ratio(f32 original);
 // Overwrites the 4x4 float `view` with the camera matrix (D_80042C80) x inverse(`proj`),
 // so view x proj matches the matrix the game draws with even when a mod rebuilt it.
 void recomp_wcw_rt_camera_view(f32* view, const f32* proj);
+// The game's per-object view cull (func_8000252C) with the horizontal limit scaled to the screen width:
+// 1 = draw the object, 0 = culled. See patches/widescreen_cull.c.
+s32 recomp_wcw_cull_visible(void* node);
 
 // Project-wide patch declarations for WCW vs. nWo World Tour: Recompiled.
 // Add shared extern declarations for game functions/data you patch here.

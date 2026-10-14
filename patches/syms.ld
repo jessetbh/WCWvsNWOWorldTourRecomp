@@ -34,5 +34,6 @@ osPiStartDma_recomp          = 0x8F00007C;
 /* Game-side host API (src/game/recomp_api.cpp) */
 recomp_get_target_aspect_ratio = 0x8F000084;
 recomp_wcw_rt_camera_view      = 0x8F000088;
+recomp_wcw_cull_visible        = 0x8F00008C;
 
 /* Add more here as patches require them (input, audio, UI callbacks, etc.). */
