@@ -974,10 +974,10 @@ index 0000000..ec2d596
 +};
 diff --git a/src/common/rt64_wcw_venues.cpp b/src/common/rt64_wcw_venues.cpp
 new file mode 100644
-index 0000000..c2cf4d3
+index 0000000..711347b
 --- /dev/null
 +++ b/src/common/rt64_wcw_venues.cpp
-@@ -0,0 +1,612 @@
+@@ -0,0 +1,785 @@
 +//
 +// RT64
 +//
@@ -1436,6 +1436,179 @@ index 0000000..c2cf4d3
 +        return best;
 +    }
 +
++    VenueSelector::Change VenueSelector::update(const std::vector<LightPreset> &venues, const std::vector<uint64_t> &textures, double seconds) {
++        std::vector<uint64_t> unique = textures;
++        std::sort(unique.begin(), unique.end());
++        unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
++        for (uint64_t h : unique) {
++            windowCounts[h]++;
++        }
++
++        window.push_back({ seconds, unique });
++        while (!window.empty() && (window.front().seconds <= seconds - WindowSeconds)) {
++            for (uint64_t h : window.front().textures) {
++                auto it = windowCounts.find(h);
++                if ((it != windowCounts.end()) && (--it->second == 0)) {
++                    windowCounts.erase(it);
++                }
++            }
++
++            window.pop_front();
++        }
++
++        // Frames without world textures (a black frame, a 2D screen) don't count as a cut either way, and the cut rules
++        // only run on a frame that drew some: on a 2D screen the last textured frames go stale, and once the window let
++        // go of their venue they kept cutting back to it (World Tour's title screen flipped every 2.4 s).
++        // A frame left over from before a 2D screen doesn't count either: paired with the first frame of World Tour's
++        // DOA arena (which also draws every WCW texture), a WCW-only menu frame cut to WCW for 13 frames.
++        const bool textured = !unique.empty();
++        if (textured) {
++            recentFrames.push_back({ seconds, std::move(unique) });
++            if (recentFrames.size() > CutFrames) {
++                recentFrames.pop_front();
++            }
++        }
++
++        while (!recentFrames.empty() && (recentFrames.front().seconds < seconds - RecentSeconds)) {
++            recentFrames.pop_front();
++        }
++
++        auto seenRecently = [this](uint64_t h) {
++            for (const Frame &f : recentFrames) {
++                if (std::binary_search(f.textures.begin(), f.textures.end(), h)) {
++                    return true;
++                }
++            }
++
++            return false;
++        };
++
++        // The new venue must show on every recent frame (one stray frame isn't a cut); the old one on none of them.
++        auto seenOnEach = [this](uint64_t h) {
++            for (const Frame &f : recentFrames) {
++                if (!std::binary_search(f.textures.begin(), f.textures.end(), h)) {
++                    return false;
++                }
++            }
++
++            return true;
++        };
++
++        recentVenue = (recentFrames.size() == CutFrames) ? bestVenue(venues, seenOnEach, MinScore) : -1;
++        if (activeVenue >= int(venues.size())) {
++            activeVenue = -1;
++        }
++
++        if (cutsEnabled && textured && (recentVenue >= 0) && (recentVenue != activeVenue) &&
++            ((activeVenue < 0) || (venueMatchScore(venues[activeVenue], seenRecently) <= CutActiveMax)))
++        {
++            restartWindow(seconds);
++            activeVenue = recentVenue;
++            candidateVenue = recentVenue;
++            return Change::Cut;
++        }
++
++        if (cutsEnabled && textured && (activeVenue >= 0) && (recentFrames.size() == CutFrames) && (recentVenue < 0) &&
++            (venueMatchScore(venues[activeVenue], seenRecently) == 0.0f))
++        {
++            const std::pair<uint32_t, uint32_t> fresh = recentNew();
++            if ((fresh.first >= NewSceneMin) && (float(fresh.first) >= NewSceneShare * float(fresh.second))) {
++                restartWindow(seconds);
++                activeVenue = -1;
++                candidateVenue = -1;
++                return Change::Cut;
++            }
++        }
++
++        const int best = bestVenue(venues, [this](uint64_t h) { return windowCounts.count(h) > 0; }, MinScore);
++        if (best == activeVenue) {
++            candidateVenue = best;
++            return Change::None;
++        }
++
++        if (best != candidateVenue) {
++            candidateVenue = best;
++            candidateSince = seconds;
++        }
++
++        if (seconds - candidateSince >= HoldSeconds) {
++            activeVenue = best;
++            return Change::Window;
++        }
++
++        return Change::None;
++    }
++
++    void VenueSelector::restartWindow(double seconds) {
++        // The shot before a cut no longer counts: left in the window, its textures would switch back to the old venue
++        // once the hold ran out. (Both recent frames are after the cut: they show almost none of the old venue.)
++        window.clear();
++        windowCounts.clear();
++        for (const Frame &f : recentFrames) {
++            window.push_back({ seconds, f.textures });
++            for (uint64_t h : f.textures) {
++                windowCounts[h]++;
++            }
++        }
++    }
++
++    std::pair<uint32_t, uint32_t> VenueSelector::recentNew() const {
++        if (recentFrames.empty()) {
++            return { 0, 0 };
++        }
++
++        // Textures on every recent frame; new when the window has them only from those frames.
++        uint32_t onEach = 0;
++        uint32_t fresh = 0;
++        for (uint64_t h : recentFrames.back().textures) {
++            bool everywhere = true;
++            for (const Frame &f : recentFrames) {
++                everywhere = everywhere && std::binary_search(f.textures.begin(), f.textures.end(), h);
++            }
++
++            if (!everywhere) {
++                continue;
++            }
++
++            onEach++;
++            auto it = windowCounts.find(h);
++            fresh += ((it != windowCounts.end()) && (it->second <= recentFrames.size())) ? 1 : 0;
++        }
++
++        return { fresh, onEach };
++    }
++
++    std::pair<int, float> VenueSelector::recentLeader(const std::vector<LightPreset> &venues) const {
++        std::pair<int, float> leader = { -1, 0.0f };
++        for (size_t v = 0; v < venues.size(); v++) {
++            const float score = venueMatchScore(venues[v], [this](uint64_t h) {
++                for (const Frame &f : recentFrames) {
++                    if (!std::binary_search(f.textures.begin(), f.textures.end(), h)) {
++                        return false;
++                    }
++                }
++
++                return !recentFrames.empty();
++            });
++
++            if ((leader.first < 0) || (score > leader.second)) {
++                leader = { int(v), score };
++            }
++        }
++
++        return leader;
++    }
++
++    void VenueSelector::reset() {
++        window.clear();
++        windowCounts.clear();
++        recentFrames.clear();
++        activeVenue = -1;
++        recentVenue = -1;
++        candidateVenue = -1;
++        candidateSince = 0.0;
++    }
++
 +    float outsideDarknessFactor(float receiverDistance, float radius, float edge, float darkness) {
 +        if ((darkness <= 0.0f) || (receiverDistance <= radius)) {
 +            return 1.0f;
@@ -1592,10 +1765,10 @@ index 0000000..c2cf4d3
 +};
 diff --git a/src/common/rt64_wcw_venues.h b/src/common/rt64_wcw_venues.h
 new file mode 100644
-index 0000000..e6393c4
+index 0000000..230932c
 --- /dev/null
 +++ b/src/common/rt64_wcw_venues.h
-@@ -0,0 +1,245 @@
+@@ -0,0 +1,308 @@
 +//
 +// RT64
 +//
@@ -1604,6 +1777,7 @@ index 0000000..e6393c4
 +
 +#include <array>
 +#include <cstdint>
++#include <deque>
 +#include <functional>
 +#include <string>
 +#include <utility>
@@ -1836,6 +2010,68 @@ index 0000000..e6393c4
 +        };
 +
 +        std::unordered_map<const void *, Target> targets;
++    };
++
++    // Which venue's lighting applies, from the world textures each game frame draws (update() once per present, which
++    // is once per game frame: interpolated frames don't come through here). Two ways to switch:
++    // - Window: a venue's score counts its match textures drawn in the last WindowSeconds; the best venue (at least
++    //   MinScore, -1 for none) must hold for HoldSeconds before it takes over. This rides out close-ups that show few
++    //   of a venue's textures. On its own it made every camera cut late: the old venue's textures stay in the window
++    //   with a full score, so the new venue took over only once they aged out, about 70 game frames (2.3 s at 30) after
++    //   the cut. The No Mercy intro cuts faster than that, so most shots were lit with the previous shot's rig.
++    // - Cut: when each of the last CutFrames frames that drew world textures shows another venue (score at least
++    //   MinScore) and together they show at most CutActiveMax of the active venue's textures, the camera cut there:
++    //   switch at once.
++    // - Cut to an unmatched scene: when no venue matches the last CutFrames frames, they show none of the active
++    //   venue's textures, and nearly all the textures they share (at least NewSceneShare, and NewSceneMin of them) were
++    //   drawn nowhere else in the window, the camera cut to a new scene: back to no venue at once. A close-up or a
++    //   camera swing inside a venue still shows textures from the frames before it (the ring, the floor), so it waits
++    //   for the window as before. Without this the No Mercy intro lit its Raw ring shots (no rig recognizes them) with
++    //   the Backlash entrance rig for 2.3 s.
++    // The window and hold are in seconds (they were 60 and 10 presents), so they don't depend on the game's rate.
++    class VenueSelector {
++    public:
++        static constexpr double WindowSeconds = 2.0;
++        static constexpr double HoldSeconds = 1.0 / 3.0;
++        static constexpr uint32_t CutFrames = 2;
++        // Textured frames older than this don't count towards a cut (they are from before a 2D screen or a pause).
++        static constexpr double RecentSeconds = 0.25;
++        static constexpr float CutActiveMax = 0.2f;
++        static constexpr float MinScore = 0.5f;
++        static constexpr float NewSceneShare = 0.8f;
++        static constexpr uint32_t NewSceneMin = 8;
++
++        enum class Change { None, Window, Cut };
++
++        // One game frame's world textures (any order, duplicates allowed) at a time in seconds. Returns how the active
++        // venue changed, if it did.
++        Change update(const std::vector<LightPreset> &venues, const std::vector<uint64_t> &textures, double seconds);
++        void reset();
++        int active() const { return activeVenue; }
++        // The venue the last CutFrames frames point to on their own (-1: none), for logs.
++        int recent() const { return recentVenue; }
++        // For logs: the venue with the highest score on the last frames alone, at any score (-1: no venues).
++        std::pair<int, float> recentLeader(const std::vector<LightPreset> &venues) const;
++        // For logs: of the textures on each of the last frames, how many were drawn nowhere else in the window, of how many.
++        std::pair<uint32_t, uint32_t> recentNew() const;
++        // false: switch only through the window (the behavior before cuts were detected; WCW_RT_VENUE_CUT=0).
++        bool cutsEnabled = true;
++
++    private:
++        void restartWindow(double seconds);
++
++        struct Frame {
++            double seconds;
++            std::vector<uint64_t> textures;
++        };
++
++        std::deque<Frame> window;
++        std::unordered_map<uint64_t, uint32_t> windowCounts;
++        std::deque<Frame> recentFrames;
++        int activeVenue = -1;
++        int recentVenue = -1;
++        int candidateVenue = -1;
++        double candidateSince = 0.0;
 +    };
 +
 +    std::vector<uint64_t> newVenueMatch(const std::vector<std::pair<uint64_t, uint32_t>> &stableTextures,
@@ -19851,10 +20087,10 @@ index 0000000..29fb84f
 +};
 diff --git a/src/render/rt64_wcw_raytracer.cpp b/src/render/rt64_wcw_raytracer.cpp
 new file mode 100644
-index 0000000..2a5bf44
+index 0000000..5853843
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.cpp
-@@ -0,0 +1,1220 @@
+@@ -0,0 +1,1228 @@
 +//
 +// RT64
 +//
@@ -19865,6 +20101,7 @@ index 0000000..2a5bf44
 +
 +#include <algorithm>
 +#include <cfloat>
++#include <chrono>
 +#include <cmath>
 +#include <cstdio>
 +#include <cstdlib>
@@ -20054,8 +20291,7 @@ index 0000000..2a5bf44
 +        presetFile = WcwLogic::LightPresetFile();
 +        mode = envMode;
 +        activeVenue = -1;
-+        candidateVenue = -1;
-+        candidateFrames = 0;
++        venueSelector.reset();
 +        presetsEdited = false;
 +        if (ec) {
 +            applyPresetFile();
@@ -20123,6 +20359,11 @@ index 0000000..2a5bf44
 +        }
 +
 +        frameTextureTris.clear();
++        const double presentSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
++        static const bool venueCuts = (getenv("WCW_RT_VENUE_CUT") == nullptr) || (strcmp(getenv("WCW_RT_VENUE_CUT"), "0") != 0);
++        venueSelector.cutsEnabled = venueCuts;
++        const int recentBefore = venueSelector.recent();
++        const WcwLogic::VenueSelector::Change change = venueSelector.update(venuePresets, hashes, presentSeconds);
 +        textureHistory.push_back(std::move(hashes));
 +        if (presentMin[0] <= presentMax[0]) {
 +            for (uint32_t i = 0; i < 3; i++) {
@@ -20151,21 +20392,24 @@ index 0000000..2a5bf44
 +            loadPresets(false);
 +        }
 +
-+        // Best venue: the largest fraction of its match textures seen in the window (at least half).
-+        const int best = WcwLogic::bestVenue(venuePresets, [this](uint64_t h) { return textureCounts.count(h) > 0; });
-+
-+        // Switch only after the choice held for a few presents (no flapping on cut scenes).
-+        if (best != activeVenue) {
-+            candidateFrames = (best == candidateVenue) ? (candidateFrames + 1) : 0;
-+            candidateVenue = best;
-+            if (candidateFrames >= 10) {
-+                activeVenue = best;
-+                fprintf(stderr, "[wcw rt] venue: %s\n", (best >= 0) ? venuePresets[best].name.c_str() : "default");
-+            }
++        // WCW_RT_VENUE_TRACE: when the last frames start pointing to another venue (a camera cut), to time the switch.
++        static const bool venueTrace = getenv("WCW_RT_VENUE_TRACE") != nullptr;
++        auto venueName = [this](int v) { return (v >= 0) ? venuePresets[v].name.c_str() : "default"; };
++        if (venueTrace && (venueSelector.recent() != recentBefore)) {
++            const std::pair<int, float> leader = venueSelector.recentLeader(venuePresets);
++            const std::pair<uint32_t, uint32_t> fresh = venueSelector.recentNew();
++            fprintf(stderr, "[wcw rt] venue seen: %s (present %d, %.3f s; closest %s %.2f; new textures %u of %u)\n", venueName(venueSelector.recent()), int(wcwRtPresentCounter), presentSeconds,
++                venueName(leader.first), leader.second, fresh.first, fresh.second);
 +        }
-+        else {
-+            candidateVenue = best;
-+            candidateFrames = 0;
++
++        activeVenue = venueSelector.active();
++        if (change != WcwLogic::VenueSelector::Change::None) {
++            // AkiTools' aki-run reads the venue from the last "venue:" line: keep it the bare name.
++            fprintf(stderr, "[wcw rt] venue: %s\n", venueName(activeVenue));
++            if (venueTrace) {
++                fprintf(stderr, "[wcw rt] venue switch: %s (%s, present %d, %.3f s)\n", venueName(activeVenue),
++                    (change == WcwLogic::VenueSelector::Change::Cut) ? "cut" : "window", int(wcwRtPresentCounter), presentSeconds);
++            }
 +        }
 +
 +        updateRoomPreset();
@@ -21077,7 +21321,7 @@ index 0000000..2a5bf44
 +};
 diff --git a/src/render/rt64_wcw_raytracer.h b/src/render/rt64_wcw_raytracer.h
 new file mode 100644
-index 0000000..565819a
+index 0000000..63fa2b7
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.h
 @@ -0,0 +1,295 @@
@@ -21287,9 +21531,9 @@ index 0000000..565819a
 +        LightPreset roomPreset;
 +        void updateRoomPreset();
 +        std::vector<LightPreset> venuePresets;
++        // The venue whose preset applies (-1: none), chosen by venueSelector once per present.
 +        int activeVenue = -1;
-+        int candidateVenue = -1;
-+        uint32_t candidateFrames = 0;
++        WcwLogic::VenueSelector venueSelector;
 +        std::string presetsPath;
 +        int64_t presetsStamp = INT64_MIN;
 +        uint32_t presentCount = 0;
@@ -23144,10 +23388,10 @@ index 0000000..a40409f
 +}
 diff --git a/tests/wcw/rt64_wcw_venues_tests.cpp b/tests/wcw/rt64_wcw_venues_tests.cpp
 new file mode 100644
-index 0000000..fd174d3
+index 0000000..31caedd
 --- /dev/null
 +++ b/tests/wcw/rt64_wcw_venues_tests.cpp
-@@ -0,0 +1,548 @@
+@@ -0,0 +1,759 @@
 +//
 +// RT64
 +//
@@ -23695,6 +23939,217 @@ index 0000000..fd174d3
 +    }
 +
 +    CHECK(darkenedAgain);
++}
++
++// Venue switching (VenueSelector): two venues with their own textures plus a ring texture both list, fed one game frame
++// at a time.
++namespace {
++    const uint64_t Ring = 0x99;
++    const std::vector<uint64_t> ArenaA = { 0xA1, 0xA2, 0xA3, 0xA4, Ring };
++    const std::vector<uint64_t> ArenaB = { 0xB1, 0xB2, 0xB3, 0xB4, Ring };
++
++    std::vector<LightPreset> twoVenues() {
++        std::vector<LightPreset> venues(2);
++        venues[0].name = "A";
++        venues[0].match = ArenaA;
++        venues[1].name = "B";
++        venues[1].match = ArenaB;
++        computeUniqueMatches(venues);
++        return venues;
++    }
++
++    // Feeds frames of one scene for a number of seconds at a game rate; returns the time after the last frame.
++    double feed(VenueSelector &selector, const std::vector<LightPreset> &venues, const std::vector<uint64_t> &textures,
++        double start, double seconds, double rate)
++    {
++        double t = start;
++        for (int i = 0; i < int(seconds * rate + 0.5); i++) {
++            selector.update(venues, textures, t);
++            t += 1.0 / rate;
++        }
++
++        return t;
++    }
++
++    // Seconds from start until the active venue becomes want (feeding textures), or -1 within the limit.
++    double timeUntil(VenueSelector &selector, const std::vector<LightPreset> &venues, const std::vector<uint64_t> &textures,
++        int want, double start, double rate, double limit = 10.0)
++    {
++        for (double t = start; t < start + limit; t += 1.0 / rate) {
++            selector.update(venues, textures, t);
++            if (selector.active() == want) {
++                return t - start + 1.0 / rate;
++            }
++        }
++
++        return -1.0;
++    }
++}
++
++TEST_CASE("venue switching: a camera cut to another venue switches after two frames, not when the old shot ages out") {
++    const std::vector<LightPreset> venues = twoVenues();
++    // Both directions: from the earlier venue in the file to the later one, and back.
++    for (int from = 0; from < 2; from++) {
++        const int to = 1 - from;
++        VenueSelector selector;
++        const double t = feed(selector, venues, from ? ArenaB : ArenaA, 0.0, 3.0, 30.0);
++        CHECK_EQ(selector.active(), from);
++        CHECK_NEAR(timeUntil(selector, venues, to ? ArenaB : ArenaA, to, t, 30.0), 2.0 / 30.0, 1e-6);
++    }
++
++    // Before cuts were detected the old shot kept its full score for the whole window, so a cut to a venue earlier in
++    // the file (ties go to the later one) came over two seconds late. (To a later venue it took the hold, 0.33 s.)
++    VenueSelector windowOnly;
++    windowOnly.cutsEnabled = false;
++    const double t2 = feed(windowOnly, venues, ArenaB, 0.0, 3.0, 30.0);
++    CHECK(timeUntil(windowOnly, venues, ArenaA, 0, t2, 30.0) > VenueSelector::WindowSeconds);
++}
++
++TEST_CASE("venue switching: the cut reports itself, and the old shot can't switch back once the hold runs out") {
++    const std::vector<LightPreset> venues = twoVenues();
++    VenueSelector selector;
++    double t = feed(selector, venues, ArenaA, 0.0, 3.0, 30.0);
++    CHECK(selector.update(venues, ArenaB, t) == VenueSelector::Change::None);
++    CHECK(selector.update(venues, ArenaB, t + 1.0 / 30.0) == VenueSelector::Change::Cut);
++    t += 2.0 / 30.0;
++    bool stayed = true;
++    for (int i = 0; i < 120; i++, t += 1.0 / 30.0) {
++        stayed = stayed && (selector.update(venues, ArenaB, t) == VenueSelector::Change::None) && (selector.active() == 1);
++    }
++
++    CHECK(stayed);
++}
++
++TEST_CASE("venue switching: a close-up showing only the shared ring texture keeps the venue") {
++    const std::vector<LightPreset> venues = twoVenues();
++    VenueSelector selector;
++    double t = feed(selector, venues, ArenaA, 0.0, 3.0, 30.0);
++    t = feed(selector, venues, { Ring }, t, 1.5, 30.0);
++    CHECK_EQ(selector.active(), 0);
++    // Half of the venue's own textures: still the same venue.
++    t = feed(selector, venues, { 0xA1, 0xA2, Ring }, t, 3.0, 30.0);
++    CHECK_EQ(selector.active(), 0);
++}
++
++TEST_CASE("venue switching: a cut to an unmatched scene with few textures waits for the window, at the same time at any game rate") {
++    const std::vector<LightPreset> venues = twoVenues();
++    // Fewer new textures than NewSceneMin: too little to call it a new scene.
++    const std::vector<uint64_t> unmatched = { 0xC1, 0xC2 };
++    double delays[2];
++    const double rates[2] = { 30.0, 60.0 };
++    for (int r = 0; r < 2; r++) {
++        VenueSelector selector;
++        const double t = feed(selector, venues, ArenaA, 0.0, 3.0, rates[r]);
++        delays[r] = timeUntil(selector, venues, unmatched, -1, t, rates[r]);
++        CHECK(delays[r] >= VenueSelector::WindowSeconds);
++        CHECK(delays[r] <= VenueSelector::WindowSeconds + VenueSelector::HoldSeconds + 2.0 / rates[r]);
++    }
++
++    CHECK_NEAR(delays[0], delays[1], 2.0 / 30.0);
++}
++
++TEST_CASE("venue switching: frames without world textures neither make nor break a cut") {
++    const std::vector<LightPreset> venues = twoVenues();
++    VenueSelector selector;
++    double t = feed(selector, venues, ArenaA, 0.0, 3.0, 30.0);
++    t = feed(selector, venues, {}, t, 0.5, 30.0);
++    CHECK_EQ(selector.active(), 0);
++    selector.update(venues, ArenaB, t);
++    selector.update(venues, {}, t + 1.0 / 30.0);
++    CHECK_EQ(selector.active(), 0);
++    selector.update(venues, ArenaB, t + 2.0 / 30.0);
++    CHECK_EQ(selector.active(), 1);
++}
++
++TEST_CASE("venue switching: from no venue, a matched scene takes over after two frames") {
++    const std::vector<LightPreset> venues = twoVenues();
++    VenueSelector selector;
++    double t = feed(selector, venues, { 0xC1 }, 0.0, 1.0, 30.0);
++    CHECK_EQ(selector.active(), -1);
++    CHECK_NEAR(timeUntil(selector, venues, ArenaA, 0, t, 30.0), 2.0 / 30.0, 1e-6);
++}
++
++namespace {
++    // A wide shot of venue A: its own textures, the ring, and floor/barrier textures no venue lists.
++    std::vector<uint64_t> wideShotA() {
++        std::vector<uint64_t> t = ArenaA;
++        for (uint64_t h = 0xF1; h <= 0xF6; h++) {
++            t.push_back(h);
++        }
++
++        return t;
++    }
++}
++
++TEST_CASE("venue switching: a cut to a new unmatched scene goes back to no venue after two frames") {
++    const std::vector<LightPreset> venues = twoVenues();
++    VenueSelector selector;
++    const double t = feed(selector, venues, wideShotA(), 0.0, 3.0, 30.0);
++    CHECK_EQ(selector.active(), 0);
++    std::vector<uint64_t> elsewhere;
++    for (uint64_t h = 0xD0; h < 0xD0 + VenueSelector::NewSceneMin; h++) {
++        elsewhere.push_back(h);
++    }
++
++    CHECK_NEAR(timeUntil(selector, venues, elsewhere, -1, t, 30.0), 2.0 / 30.0, 1e-6);
++
++    VenueSelector windowOnly;
++    windowOnly.cutsEnabled = false;
++    const double t2 = feed(windowOnly, venues, wideShotA(), 0.0, 3.0, 30.0);
++    CHECK(timeUntil(windowOnly, venues, elsewhere, -1, t2, 30.0) > VenueSelector::WindowSeconds);
++}
++
++TEST_CASE("venue switching: a camera swing that hides the venue's textures but keeps the ring and floor keeps the venue") {
++    const std::vector<LightPreset> venues = twoVenues();
++    VenueSelector selector;
++    double t = feed(selector, venues, wideShotA(), 0.0, 3.0, 30.0);
++    // The other side of the arena: eight textures not drawn before, plus the ring and floor from the wide shot.
++    std::vector<uint64_t> swing = { Ring };
++    for (uint64_t h = 0xF1; h <= 0xF6; h++) {
++        swing.push_back(h);
++    }
++
++    for (uint64_t h = 0xE0; h < 0xE8; h++) {
++        swing.push_back(h);
++    }
++
++    t = feed(selector, venues, swing, t, 1.0, 30.0);
++    CHECK_EQ(selector.active(), 0);
++}
++
++TEST_CASE("venue switching: a long 2D screen lets the venue go once, without stale frames cutting back to it") {
++    const std::vector<LightPreset> venues = twoVenues();
++    VenueSelector selector;
++    double t = feed(selector, venues, ArenaA, 0.0, 3.0, 30.0);
++    CHECK_EQ(selector.active(), 0);
++    int switches = 0;
++    for (int i = 0; i < 30 * 10; i++, t += 1.0 / 30.0) {
++        switches += (selector.update(venues, {}, t) != VenueSelector::Change::None) ? 1 : 0;
++    }
++
++    CHECK_EQ(selector.active(), -1);
++    CHECK_EQ(switches, 1);
++}
++
++TEST_CASE("venue switching: a frame from before a 2D screen doesn't pair with the next scene's first frame") {
++    // World Tour: the DOA arena also draws every WCW texture, and the menu before it draws only WCW's. A menu frame
++    // left over from before the VS screen plus the arena's first frame pointed to WCW; the arena is DOA (the later venue
++    // wins the tie when both are fully shown).
++    const std::vector<LightPreset> venues = twoVenues();
++    VenueSelector selector;
++    double t = feed(selector, venues, ArenaA, 0.0, 3.0, 30.0);
++    t = feed(selector, venues, {}, t, 3.0, 30.0);
++    CHECK_EQ(selector.active(), -1);
++    std::vector<uint64_t> both = ArenaA;
++    both.insert(both.end(), ArenaB.begin(), ArenaB.end());
++    bool everA = false;
++    for (int i = 0; i < 30; i++, t += 1.0 / 30.0) {
++        selector.update(venues, both, t);
++        everA = everA || (selector.active() == 0);
++    }
++
++    CHECK(!everA);
++    CHECK_EQ(selector.active(), 1);
 +}
 diff --git a/tests/wcw/wcw_test.h b/tests/wcw/wcw_test.h
 new file mode 100644
