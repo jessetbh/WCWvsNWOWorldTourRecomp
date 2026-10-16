@@ -269,7 +269,7 @@ index c89956e..73c8376 100644
          return profile_index;
      }
 diff --git a/recompui/CMakeLists.txt b/recompui/CMakeLists.txt
-index b9c5458..4c5926e 100644
+index b9c5458..3c86215 100644
 --- a/recompui/CMakeLists.txt
 +++ b/recompui/CMakeLists.txt
 @@ -98,6 +98,7 @@ target_include_directories(recompui PUBLIC
@@ -280,18 +280,22 @@ index b9c5458..4c5926e 100644
  
  target_include_directories(recompui PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include/recompui")
  
-@@ -121,3 +122,30 @@ target_link_libraries(recompui PUBLIC
+@@ -121,3 +122,34 @@ target_link_libraries(recompui PUBLIC
      lunasvg
      miniz
  )
 +
-+# [wcw] Unit tests for the Framerate option's rules (tests/). They build and run as part of every recompui build, so a
-+# failing test fails the game's build. RECOMPUI_WCW_TESTS=OFF skips them.
++# [wcw] Unit tests for the Framerate, resolution and MSAA options' rules and the graphics presets (tests/). They build
++# and run as part of every recompui build, so a failing test fails the game's build. RECOMPUI_WCW_TESTS=OFF skips them.
 +option(RECOMPUI_WCW_TESTS "Build and run the wcw unit tests with recompui" ON)
 +if (RECOMPUI_WCW_TESTS AND NOT CMAKE_CROSSCOMPILING)
 +    add_executable(recompui_wcw_tests
 +        ${CMAKE_CURRENT_SOURCE_DIR}/tests/framerate_rules_tests.cpp
 +        ${CMAKE_CURRENT_SOURCE_DIR}/src/config/framerate_rules.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/tests/graphics_rules_tests.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/src/config/graphics_rules.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/tests/graphics_presets_tests.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/src/config/graphics_presets.cpp
 +    )
 +    target_include_directories(recompui_wcw_tests PRIVATE
 +        ${CMAKE_CURRENT_SOURCE_DIR}/src/config
@@ -312,14 +316,38 @@ index b9c5458..4c5926e 100644
 +    add_dependencies(recompui recompui_wcw_tests_run)
 +endif()
 diff --git a/recompui/include/recompui/config.h b/recompui/include/recompui/config.h
-index 38b84f5..09edc6f 100644
+index 38b84f5..3136b9f 100644
 --- a/recompui/include/recompui/config.h
 +++ b/recompui/include/recompui/config.h
-@@ -61,11 +61,28 @@ namespace recompui {
+@@ -18,7 +18,9 @@ namespace recompui {
+                 inline const std::string mouse_sensitivity = "mouse_sensitivity";
+                 inline const std::string joystick_deadzone = "joystick_deadzone";
+                 inline const std::string background_input_mode = "background_input_mode";
+-        
++                // [wcw saves] An action, not a setting: picking a backup opens a confirmation (aki-roadmap#50).
++                inline const std::string restore_save_backup = "restore_save_backup";
++
+                 inline const std::string debug_mode = "debug_mode";
+             }
+ 
+@@ -51,6 +53,8 @@ namespace recompui {
+     
+             namespace options {
+                 inline const std::string developer_mode = "developer_mode";
++                // [wcw] Graphics presets (src/config/graphics_presets.h).
++                inline const std::string preset = "graphics_preset";
+                 inline const std::string res_option = "res_option";
+                 inline const std::string wm_option = "wm_option";
+                 inline const std::string hr_option = "hr_option";
+@@ -61,11 +65,32 @@ namespace recompui {
                  inline const std::string hpfb_option = "hpfb_option";
                  inline const std::string rr_manual_value = "rr_manual_value";
                  inline const std::string ds_option = "ds_option";
++                // [wcw] Supersampling at Auto resolution (Off / 2x).
++                inline const std::string ss_option = "ss_option";
 +                // [wcw rt] Experimental hybrid ray tracing (RT64 WcwRaytracer).
++                // [wcw] Sharp bilinear for point-sampled 2D art (RT64 WcwTextureEdges).
++                inline const std::string texture_edges_option = "texture_edges_option";
 +                inline const std::string rt_option = "rt_option";
 +                inline const std::string rt_quality_option = "rt_quality_option";
 +                // [wcw crt] CRT presentation filter (RT64 CrtFilter).
@@ -516,21 +544,375 @@ index 0000000..80cf16b
 +    // 2 x smooth_rate, both as a Manual rate; without a smooth rate the framerate stays Original.
 +    void apply_choice(ultramodern::renderer::RefreshRate &option, int &manual_value, uint32_t smooth_rate);
 +};
+diff --git a/recompui/src/config/graphics_presets.cpp b/recompui/src/config/graphics_presets.cpp
+new file mode 100644
+index 0000000..190a4a8
+--- /dev/null
++++ b/recompui/src/config/graphics_presets.cpp
+@@ -0,0 +1,86 @@
++#include "graphics_presets.h"
++
++#include <algorithm>
++
++namespace recompui::config::presets {
++    using ultramodern::renderer::Antialiasing;
++    using ultramodern::renderer::AspectRatio;
++    using ultramodern::renderer::RefreshRate;
++
++    static Antialiasing capped_msaa(Antialiasing msaa, const Limits &limits) {
++        return std::min(msaa, limits.max_msaa);
++    }
++
++    // Twice the smooth rate needs a display that fast (a 119.88 Hz display reports 119).
++    static bool display_allows_smooth2x(const Limits &limits) {
++        return (limits.display_rate == 0) || (limits.display_rate + 2 >= limits.smooth_rate * 2);
++    }
++
++    std::optional<Settings> settings_for(Preset preset, const Limits &limits) {
++        const bool smooth = limits.smooth_rate > 0;
++        Settings settings;
++        switch (preset) {
++        case Preset::Authentic:
++            // The game as it shipped, on a period TV.
++            settings.aspect_ratio = AspectRatio::Original;
++            settings.framerate = RefreshRate::Original;
++            settings.msaa = Antialiasing::None;
++            settings.crt = CrtFilterOption::On;
++            settings.crt_signal = CrtSignalOption::Composite;
++            break;
++        case Preset::Enhanced:
++        case Preset::EnhancedRayTracing:
++            // The default. Enhanced Ray Tracing is the same with ray tracing on.
++            settings.aspect_ratio = AspectRatio::Expand;
++            settings.framerate = smooth ? RefreshRate::Manual : RefreshRate::Original;
++            settings.msaa = Antialiasing::MSAA4X;
++            settings.rt = (preset == Preset::EnhancedRayTracing) ? RayTracingOption::On : RayTracingOption::Off;
++            settings.rt_quality = RayTracingQuality::Balanced;
++            break;
++        case Preset::Max:
++            settings.aspect_ratio = AspectRatio::Expand;
++            settings.framerate = !smooth ? RefreshRate::Original :
++                (display_allows_smooth2x(limits) ? RefreshRate::Display : RefreshRate::Manual);
++            settings.msaa = Antialiasing::MSAA4X;
++            settings.rt = RayTracingOption::On;
++            settings.rt_quality = RayTracingQuality::Ultra;
++            settings.hdr = HdrOption::On;
++            settings.hdr_picture = HdrPictureOption::Auto;
++            break;
++        case Preset::Custom:
++        default:
++            return std::nullopt;
++        }
++
++        settings.msaa = capped_msaa(settings.msaa, limits);
++        return settings;
++    }
++
++    bool matches(Preset preset, const Settings &current, const Limits &limits) {
++        const std::optional<Settings> wanted = settings_for(preset, limits);
++        if (!wanted) {
++            return false;
++        }
++
++        return (current.aspect_ratio == wanted->aspect_ratio) &&
++            ((limits.smooth_rate == 0) || (current.framerate == wanted->framerate)) &&
++            (capped_msaa(current.msaa, limits) == wanted->msaa) &&
++            (current.crt == wanted->crt) &&
++            ((current.crt == CrtFilterOption::Off) || (current.crt_signal == wanted->crt_signal)) &&
++            (current.rt == wanted->rt) &&
++            ((current.rt == RayTracingOption::Off) || (current.rt_quality == wanted->rt_quality)) &&
++            (current.hdr == wanted->hdr) &&
++            ((current.hdr == HdrOption::Off) || (current.hdr_picture == wanted->hdr_picture));
++    }
++
++    Preset matching_preset(const Settings &current, const Limits &limits) {
++        // Enhanced and Enhanced Ray Tracing differ only in ray tracing, so at most one of them matches.
++        for (Preset preset : { Preset::Authentic, Preset::Enhanced, Preset::EnhancedRayTracing, Preset::Max }) {
++            if (matches(preset, current, limits)) {
++                return preset;
++            }
++        }
++
++        return Preset::Custom;
++    }
++};
+diff --git a/recompui/src/config/graphics_presets.h b/recompui/src/config/graphics_presets.h
+new file mode 100644
+index 0000000..3a78930
+--- /dev/null
++++ b/recompui/src/config/graphics_presets.h
+@@ -0,0 +1,101 @@
++#pragma once
++
++#include <cstdint>
++#include <optional>
++
++#include "ultramodern/config.hpp"
++
++namespace recompui::config {
++    // [wcw rt] Experimental hybrid ray tracing.
++    enum class RayTracingOption {
++        Off = 0,
++        On = 1
++    };
++
++    // Matches RT64::WcwLogic::RtQuality. Ambient occlusion comes with the level (none on Performance, Subtle on
++    // Balanced, Strong on Quality and Ultra), so there is no separate AO option.
++    enum class RayTracingQuality {
++        Performance = 0,
++        Balanced = 1,
++        Quality = 2,
++        Ultra = 3
++    };
++
++    // [wcw crt] CRT filter: on/off, the video signal (a preset in crt/presets/ next to the
++    // executable) and the TV's color standard.
++    enum class CrtFilterOption {
++        Off = 0,
++        On = 1
++    };
++
++    enum class CrtSignalOption {
++        Composite = 0,
++        SVideo = 1,
++        RF = 2,
++        RGB = 3
++    };
++
++    // [wcw hdr] HDR output.
++    enum class HdrOption {
++        Off = 0,
++        On = 1
++    };
++
++    // Same values as RT64::WcwLogic::HdrPicture.
++    enum class HdrPictureOption {
++        Auto = 0,
++        Brighter = 1,
++        Balanced = 2,
++        CrtDetail = 3,
++        Custom = 4
++    };
++};
++
++// [wcw] Graphics presets (Graphics > Preset): what each preset sets, and which preset a set of options matches. Kept
++// free of UI state so it can be unit tested (recompui/tests); the graphics tab calls these. A change to a preset
++// belongs here, with a test.
++namespace recompui::config::presets {
++    // Stored values of the Preset option. Custom is never picked: the menu shows it when the options match no preset.
++    enum class Preset {
++        Authentic = 0,
++        Enhanced = 1,
++        EnhancedRayTracing = 2,
++        Max = 3,
++        Custom = 4
++    };
++
++    // The options a preset sets. The CRT signal only counts with the CRT filter on, the ray tracing quality only with
++    // ray tracing on and the HDR picture only with HDR on (the menu hides them otherwise).
++    struct Settings {
++        ultramodern::renderer::AspectRatio aspect_ratio = ultramodern::renderer::AspectRatio::Expand;
++        // The Framerate menu's stored choice (framerate_rules.h): Original, Manual = Smooth, Display = Smooth2x.
++        ultramodern::renderer::RefreshRate framerate = ultramodern::renderer::RefreshRate::Original;
++        ultramodern::renderer::Antialiasing msaa = ultramodern::renderer::Antialiasing::None;
++        CrtFilterOption crt = CrtFilterOption::Off;
++        CrtSignalOption crt_signal = CrtSignalOption::Composite;
++        RayTracingOption rt = RayTracingOption::Off;
++        RayTracingQuality rt_quality = RayTracingQuality::Balanced;
++        HdrOption hdr = HdrOption::Off;
++        HdrPictureOption hdr_picture = HdrPictureOption::Auto;
++    };
++
++    // What the game and the machine allow.
++    struct Limits {
++        // The game's smooth rate (programconfig::get_frame_interpolation); 0 = the framerate is locked to Original.
++        uint32_t smooth_rate = 0;
++        // The display's refresh rate in Hz; 0 = not known yet (taken as fast enough).
++        uint32_t display_rate = 0;
++        // The highest MSAA level the GPU offers.
++        ultramodern::renderer::Antialiasing max_msaa = ultramodern::renderer::Antialiasing::MSAA4X;
++    };
++
++    // The settings a preset applies on this machine; nothing for Custom.
++    std::optional<Settings> settings_for(Preset preset, const Limits &limits);
++
++    // Whether the options are what the preset sets. MSAA is compared as the GPU runs it (capped at max_msaa) and the
++    // framerate is ignored when the game locks it.
++    bool matches(Preset preset, const Settings &current, const Limits &limits);
++
++    // The first preset the options match, or Custom.
++    Preset matching_preset(const Settings &current, const Limits &limits);
++};
+diff --git a/recompui/src/config/graphics_rules.cpp b/recompui/src/config/graphics_rules.cpp
+new file mode 100644
+index 0000000..625382c
+--- /dev/null
++++ b/recompui/src/config/graphics_rules.cpp
+@@ -0,0 +1,24 @@
++#include "graphics_rules.h"
++
++#include <algorithm>
++
++namespace recompui::graphics_rules {
++    using ultramodern::renderer::Antialiasing;
++    using ultramodern::renderer::Resolution;
++
++    int downsample_multiplier(Resolution resolution, int ds_option, int ss_option) {
++        switch (resolution) {
++        case Resolution::Original:
++        case Resolution::Original2x:
++            return std::max(ds_option, 1);
++        case Resolution::Auto:
++        default:
++            // Only 2x: Auto already renders at the window's size, so 4x would be 16 times its pixels.
++            return (ss_option >= 2) ? 2 : 1;
++        }
++    }
++
++    bool msaa_level_supported(Antialiasing level, Antialiasing device_max) {
++        return static_cast<int>(level) <= static_cast<int>(device_max);
++    }
++};
+diff --git a/recompui/src/config/graphics_rules.h b/recompui/src/config/graphics_rules.h
+new file mode 100644
+index 0000000..f3b6c66
+--- /dev/null
++++ b/recompui/src/config/graphics_rules.h
+@@ -0,0 +1,15 @@
++#pragma once
++
++#include "ultramodern/config.hpp"
++
++// [wcw] The Resolution / Downsampling / Supersampling and MSAA options' rules, kept free of UI state so they can be
++// unit tested (recompui/tests). The graphics tab calls these; a change to the rules belongs here, with a test.
++namespace recompui::graphics_rules {
++    // How many times larger than the output the game renders before RT64 box-filters it down (1 = no downsampling).
++    // Original and Original 2x take it from Downsampling Quality (ds_option: Off, 2x, 4x); Auto takes it from
++    // Supersampling (ss_option: Off, 2x), which renders at twice the window's scale. Both options store Off as 0.
++    int downsample_multiplier(ultramodern::renderer::Resolution resolution, int ds_option, int ss_option);
++
++    // Whether an MSAA level can be picked on a device whose highest supported level is device_max.
++    bool msaa_level_supported(ultramodern::renderer::Antialiasing level, ultramodern::renderer::Antialiasing device_max);
++};
+diff --git a/recompui/src/config/ui_config_tab_general.cpp b/recompui/src/config/ui_config_tab_general.cpp
+index 296ce0e..a07145b 100644
+--- a/recompui/src/config/ui_config_tab_general.cpp
++++ b/recompui/src/config/ui_config_tab_general.cpp
+@@ -1,5 +1,7 @@
+ #include "librecomp/config.hpp"
++#include "librecomp/save_backups.hpp"
+ #include "recompui/config.h"
++#include "recompui/recompui.h"
+ #include "util/steam_deck.h"
+ 
+ namespace recompui {
+@@ -25,6 +27,63 @@ namespace config {
+         {BackgroundInputMode::On, "On"},
+     };
+ 
++    // [wcw saves] "Restore Save Backup" (aki-roadmap#50): pick the newest, 2nd newest, ... automatic backup; a prompt
++    // says which file and when, and the restore happens the next time the game starts (librecomp save_backups.hpp).
++    static EnumOptionVector restore_backup_options = {
++        {0u, "None", "Choose..."},
++        {1u, "Newest", "Newest backup"},
++        {2u, "Backup2", "2nd newest"},
++        {3u, "Backup3", "3rd newest"},
++        {4u, "Backup4", "4th newest"},
++        {5u, "Backup5", "5th newest"},
++        {6u, "Backup6", "6th newest"},
++        {7u, "Backup7", "7th newest"},
++        {8u, "Backup8", "8th newest"},
++        {9u, "Backup9", "9th newest"},
++        {10u, "Backup10", "10th newest"},
++    };
++
++    static std::string save_kind(const recomp::save_backups::BackupEntry &entry) {
++        return entry.controller_pak ? "Controller Pak" : "game save";
++    }
++
++    static void reset_restore_choice() {
++        get_general_config().update_option_value(general::options::restore_save_backup, 0u);
++    }
++
++    static void on_restore_backup_chosen(uint32_t choice) {
++        if (choice == 0) {
++            return;
++        }
++
++        const std::filesystem::path main_save = recomp::save_backups::main_save_file();
++        const std::vector<recomp::save_backups::BackupEntry> backups = recomp::save_backups::list_backups(main_save);
++        if ((choice - 1) >= backups.size()) {
++            const std::string text = backups.empty() ?
++                "There are no save backups yet. They're made automatically when the game starts and while you play." :
++                "There are only " + std::to_string(backups.size()) + " save backups.";
++            recompui::open_info_prompt("Restore Save Backup", text, "OK", reset_restore_choice, recompui::ButtonStyle::Primary);
++            return;
++        }
++
++        const recomp::save_backups::BackupEntry entry = backups[choice - 1];
++        std::string text = "Restore the " + save_kind(entry) + " backed up on " + recomp::save_backups::display_time(entry.when) + "?";
++        if (const std::optional<recomp::save_backups::Timestamp> last = recomp::save_backups::last_write_time(entry.save_file)) {
++            text += "<br/><br/>The current " + save_kind(entry) + " was last saved on " + recomp::save_backups::display_time(*last) + ".";
++        }
++        text += "<br/><br/>It will be restored the next time the game starts. The current save is backed up first, so you can undo this.";
++        recompui::open_choice_prompt("Restore Save Backup", text, "Restore", "Cancel",
++            [entry]() {
++                const bool ok = recomp::save_backups::request_restore(entry);
++                reset_restore_choice();
++                recompui::open_notification("Restore Save Backup", ok ?
++                    "Restore scheduled: it happens the next time the game starts." :
++                    "Couldn't schedule the restore (check the save folder's permissions).");
++            },
++            reset_restore_choice,
++            recompui::ButtonStyle::Success, recompui::ButtonStyle::Danger, true);
++    }
++
+     template <typename T = uint32_t>
+     T get_general_config_enum_value(const std::string& option_id) {
+         return static_cast<T>(std::get<uint32_t>(get_general_config().get_option_value(option_id)));
+@@ -139,6 +198,22 @@ namespace config {
+             BackgroundInputMode::On
+         );
+ 
++        config.add_enum_option(
++            general::options::restore_save_backup,
++            "Restore Save Backup",
++            "Your saves are backed up automatically when the game starts and while you play (the last 10 of each, in "
++            "the <b>saves\\backups</b> folder). Pick one to restore it: you'll be asked to confirm, and the restore "
++            "happens the next time the game starts.",
++            restore_backup_options,
++            0u
++        );
++        config.add_option_change_callback(general::options::restore_save_backup,
++            [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant, recomp::config::OptionChangeContext change_context) {
++                if (change_context == recomp::config::OptionChangeContext::Permanent) {
++                    on_restore_backup_chosen(std::get<uint32_t>(cur_value));
++                }
++            });
++
+         return config;
+     }
+ } // namespace config
 diff --git a/recompui/src/config/ui_config_tab_graphics.cpp b/recompui/src/config/ui_config_tab_graphics.cpp
-index 4fdf81f..ac118cc 100644
+index 4fdf81f..b5afc53 100644
 --- a/recompui/src/config/ui_config_tab_graphics.cpp
 +++ b/recompui/src/config/ui_config_tab_graphics.cpp
-@@ -1,7 +1,17 @@
+@@ -1,7 +1,22 @@
  #include "librecomp/config.hpp"
  #include "recompui/config.h"
  #include "recompui/renderer.h"
 +#include "recompui/program_config.h"
 +#include "framerate_rules.h"
++#include "graphics_presets.h"
++#include "graphics_rules.h"
  #include "util/steam_deck.h"
 +#include "render/rt64_crt_filter.h"
 +#include "render/rt64_hdr_output.h"
 +#include "render/rt64_wcw_raytracer.h"
++#include "render/rt64_wcw_texture_edges.h"
 +
++#include <algorithm>
++#include <atomic>
 +#include <chrono>
 +#include <cstdlib>
 +#include <mutex>
@@ -538,25 +920,41 @@ index 4fdf81f..ac118cc 100644
  
  static bool created_graphics_config = false;
  
-@@ -64,6 +74,117 @@ namespace recompui {
+@@ -36,6 +51,17 @@ namespace recompui {
+             {DownsamplingOption::X4, "4x"},
+         };
+ 
++        // [wcw] Supersampling at Auto resolution: renders at twice the window's scale and box-filters it down
++        // (graphics_rules.h). Stored like Downsampling Quality (Off = 0, 2x = 2).
++        enum class SupersamplingOption {
++            Off = 0,
++            X2 = 2,
++        };
++        static EnumOptionVector supersampling_options = {
++            {SupersamplingOption::Off, "Off"},
++            {SupersamplingOption::X2, "2x"},
++        };
++
+         static EnumOptionVector window_mode_options = {
+             {ultramodern::renderer::WindowMode::Windowed, "Windowed"},
+             {ultramodern::renderer::WindowMode::Fullscreen, "Fullscreen"}
+@@ -64,6 +90,89 @@ namespace recompui {
          #endif
          };
  
-+        // [wcw rt] Experimental hybrid ray tracing.
-+        enum class RayTracingOption {
-+            Off = 0,
-+            On = 1
++        // [wcw] 2D texture edges: point-sampled art (crowds, signs, HUD, fonts) as the N64 draws it, or with its texel
++        // edges smoothed (sharp bilinear: texels stay crisp squares, seams blend over one screen pixel).
++        enum class TextureEdgesOption {
++            Original = 0,
++            Smooth = 1
 +        };
 +
-+        // Matches RT64::WcwLogic::RtQuality. Ambient occlusion comes with the level (none on Performance, Subtle on
-+        // Balanced, Strong on Quality and Ultra), so there is no separate AO option.
-+        enum class RayTracingQuality {
-+            Performance = 0,
-+            Balanced = 1,
-+            Quality = 2,
-+            Ultra = 3
++        static EnumOptionVector texture_edges_options = {
++            {TextureEdgesOption::Original, "Original", "Original"},
++            {TextureEdgesOption::Smooth, "Smooth", "Smooth"},
 +        };
 +
++        // [wcw rt] Experimental hybrid ray tracing. The option enums (also used by the presets) are in graphics_presets.h.
 +        static EnumOptionVector ray_tracing_options = {
 +            {RayTracingOption::Off, "Off", "Off"},
 +            {RayTracingOption::On, "On", "On"},
@@ -571,18 +969,6 @@ index 4fdf81f..ac118cc 100644
 +
 +        // [wcw crt] CRT filter: on/off, the video signal (a preset in crt/presets/ next to the
 +        // executable) and the TV's color standard.
-+        enum class CrtFilterOption {
-+            Off = 0,
-+            On = 1
-+        };
-+
-+        enum class CrtSignalOption {
-+            Composite = 0,
-+            SVideo = 1,
-+            RF = 2,
-+            RGB = 3
-+        };
-+
 +        enum class CrtColorsOption {
 +            USA = 0,
 +            Japan = 1
@@ -606,23 +992,9 @@ index 4fdf81f..ac118cc 100644
 +        };
 +
 +        // [wcw hdr] HDR output.
-+        enum class HdrOption {
-+            Off = 0,
-+            On = 1
-+        };
-+
 +        static EnumOptionVector hdr_options = {
 +            {HdrOption::Off, "Off", "Off"},
 +            {HdrOption::On, "On", "On"},
-+        };
-+
-+        // Same values as RT64::WcwLogic::HdrPicture.
-+        enum class HdrPictureOption {
-+            Auto = 0,
-+            Brighter = 1,
-+            Balanced = 2,
-+            CrtDetail = 3,
-+            Custom = 4
 +        };
 +
 +        static EnumOptionVector hdr_picture_options = {
@@ -656,7 +1028,16 @@ index 4fdf81f..ac118cc 100644
          static EnumOptionVector aspect_ratio_options = {
              {ultramodern::renderer::AspectRatio::Original, "Original"},
              {ultramodern::renderer::AspectRatio::Expand, "Expand"},
-@@ -83,6 +204,28 @@ namespace recompui {
+@@ -74,7 +183,7 @@ namespace recompui {
+             {ultramodern::renderer::Antialiasing::None, "None"},
+             {ultramodern::renderer::Antialiasing::MSAA2X, "MSAA2X", "2X"},
+             {ultramodern::renderer::Antialiasing::MSAA4X, "MSAA4X", "4X"},
+-            // {ultramodern::renderer::Antialiasing::MSAA8X, "MSAA8X"},
++            {ultramodern::renderer::Antialiasing::MSAA8X, "MSAA8X", "8X"},
+         };
+ 
+         static EnumOptionVector refresh_rate_options = {
+@@ -83,6 +192,28 @@ namespace recompui {
              {ultramodern::renderer::RefreshRate::Manual, "Manual"},
          };
  
@@ -685,7 +1066,16 @@ index 4fdf81f..ac118cc 100644
          static EnumOptionVector hpfb_options = {
              {ultramodern::renderer::HighPrecisionFramebuffer::Auto, "Auto"},
              {ultramodern::renderer::HighPrecisionFramebuffer::On, "On"},
-@@ -152,16 +295,72 @@ namespace recompui {
+@@ -99,7 +230,7 @@ namespace recompui {
+             switch (res_option) {
+                 default:
+                 case ultramodern::renderer::Resolution::Auto:
+-                    return "Downsampling is not available at auto resolution";
++                    return "";
+                 case ultramodern::renderer::Resolution::Original:
+                     if (ds_option == DownsamplingOption::X2) {
+                         return "Rendered in 480p and scaled to 240p";
+@@ -152,16 +283,179 @@ namespace recompui {
          }
  
          static std::string get_framerate_text(uint32_t refresh_rate) {
@@ -756,20 +1146,134 @@ index 4fdf81f..ac118cc 100644
 +            }).detach();
 +        }
 +
++        // [wcw] Graphics presets (graphics_presets.h). The display's refresh rate and the GPU's MSAA levels arrive once
++        // the renderer runs; until then Max assumes a fast enough display and MSAA 4x.
++        static std::atomic<uint32_t> preset_display_rate = 0;
++        static std::atomic<ultramodern::renderer::Antialiasing> preset_max_msaa = ultramodern::renderer::Antialiasing::MSAA4X;
++        // Set while the tab itself changes the preset or its options, so those changes aren't taken as the player's.
++        static bool syncing_preset = false;
++
++        static EnumOptionVector preset_options = {
++            {presets::Preset::Authentic, "Authentic", "Authentic"},
++            {presets::Preset::Enhanced, "Enhanced", "Enhanced"},
++            {presets::Preset::EnhancedRayTracing, "EnhancedRayTracing", "Enhanced Ray Tracing"},
++            {presets::Preset::Max, "Max", "Max"},
++            {presets::Preset::Custom, "Custom", "Custom"},
++        };
++
++        // The options a preset sets.
++        static const std::vector<std::string> &preset_option_ids() {
++            static const std::vector<std::string> ids = {
++                graphics::options::ar_option, graphics::options::rr_option, graphics::options::msaa_option,
++                graphics::options::crt_filter_option, graphics::options::crt_signal_option,
++                graphics::options::rt_option, graphics::options::rt_quality_option,
++                graphics::options::hdr_option, graphics::options::hdr_picture,
++            };
++            return ids;
++        }
++
++        static presets::Limits preset_limits() {
++            presets::Limits limits;
++            limits.smooth_rate = recompui::programconfig::get_frame_interpolation().smooth_rate;
++            limits.display_rate = preset_display_rate;
++            limits.max_msaa = preset_max_msaa;
++            return limits;
++        }
++
++        static presets::Settings preset_settings(OptionChangeContext change_context) {
++            presets::Settings settings;
++            settings.aspect_ratio = get_graphics_enum_value<ultramodern::renderer::AspectRatio>(graphics::options::ar_option, change_context);
++            settings.framerate = get_graphics_enum_value<ultramodern::renderer::RefreshRate>(graphics::options::rr_option, change_context);
++            settings.msaa = get_graphics_enum_value<ultramodern::renderer::Antialiasing>(graphics::options::msaa_option, change_context);
++            settings.crt = get_graphics_enum_value<CrtFilterOption>(graphics::options::crt_filter_option, change_context);
++            settings.crt_signal = get_graphics_enum_value<CrtSignalOption>(graphics::options::crt_signal_option, change_context);
++            settings.rt = get_graphics_enum_value<RayTracingOption>(graphics::options::rt_option, change_context);
++            settings.rt_quality = get_graphics_enum_value<RayTracingQuality>(graphics::options::rt_quality_option, change_context);
++            settings.hdr = get_graphics_enum_value<HdrOption>(graphics::options::hdr_option, change_context);
++            settings.hdr_picture = get_graphics_enum_value<HdrPictureOption>(graphics::options::hdr_picture, change_context);
++            return settings;
++        }
++
++        // Picking a preset sets its options in the menu through set_option_value, like any change; Apply keeps them.
++        // Sub-options of something the preset turns off (CRT signal, RT quality, HDR picture) keep the player's choice.
++        static void stage_preset(presets::Preset preset) {
++            const presets::Limits limits = preset_limits();
++            const std::optional<presets::Settings> settings = presets::settings_for(preset, limits);
++            if (!settings) {
++                return;
++            }
++
++            recomp::config::Config &config = get_graphics_config();
++            syncing_preset = true;
++            config.update_option_value(graphics::options::ar_option, static_cast<uint32_t>(settings->aspect_ratio));
++            if (limits.smooth_rate > 0) {
++                config.update_option_value(graphics::options::rr_option, static_cast<uint32_t>(settings->framerate));
++            }
++            config.update_option_value(graphics::options::msaa_option, static_cast<uint32_t>(settings->msaa));
++            config.update_option_value(graphics::options::crt_filter_option, static_cast<uint32_t>(settings->crt));
++            if (settings->crt == CrtFilterOption::On) {
++                config.update_option_value(graphics::options::crt_signal_option, static_cast<uint32_t>(settings->crt_signal));
++            }
++            config.update_option_value(graphics::options::rt_option, static_cast<uint32_t>(settings->rt));
++            if (settings->rt == RayTracingOption::On) {
++                config.update_option_value(graphics::options::rt_quality_option, static_cast<uint32_t>(settings->rt_quality));
++            }
++            config.update_option_value(graphics::options::hdr_option, static_cast<uint32_t>(settings->hdr));
++            if (settings->hdr == HdrOption::On) {
++                config.update_option_value(graphics::options::hdr_picture, static_cast<uint32_t>(settings->hdr_picture));
++            }
++            syncing_preset = false;
++        }
++
++        // After the player changes one of the preset's options: the preset shows what the options now match, which is
++        // Custom unless they match a preset again. Following the options (rather than only ever switching to Custom)
++        // also keeps the preset right when Cancel puts every option back.
++        static void follow_preset(OptionChangeContext change_context) {
++            if (syncing_preset || (change_context != OptionChangeContext::Temporary)) {
++                return;
++            }
++
++            const presets::Preset matched = presets::matching_preset(preset_settings(OptionChangeContext::Temporary), preset_limits());
++            if (matched != get_graphics_enum_value<presets::Preset>(graphics::options::preset, OptionChangeContext::Temporary)) {
++                syncing_preset = true;
++                get_graphics_config().update_option_value(graphics::options::preset, static_cast<uint32_t>(matched));
++                syncing_preset = false;
++            }
++        }
++
++        // On load the saved preset is set to what the saved options match (a config from before presets has none, and
++        // the file can be edited by hand), through the same set/apply calls as the fullscreen toggle.
++        static void reconcile_saved_preset() {
++            const presets::Preset matched = presets::matching_preset(preset_settings(OptionChangeContext::Permanent), preset_limits());
++            if (matched != get_graphics_enum_value<presets::Preset>(graphics::options::preset)) {
++                syncing_preset = true;
++                get_graphics_config().set_option_value(graphics::options::preset, static_cast<uint32_t>(matched));
++                get_graphics_config().apply_option_value(graphics::options::preset);
++                syncing_preset = false;
++            }
++        }
++
          static void apply_graphics_config() {
              ultramodern::renderer::GraphicsConfig new_config;
              new_config.developer_mode = get_graphics_bool_value(graphics::options::developer_mode);
-@@ -175,9 +374,33 @@ namespace recompui {
+@@ -175,14 +469,45 @@ namespace recompui {
              new_config.hpfb_option = get_graphics_enum_value<ultramodern::renderer::HighPrecisionFramebuffer>(graphics::options::hpfb_option);
              new_config.rr_manual_value = get_graphics_number_value<int>(graphics::options::rr_manual_value);
  
+-            new_config.ds_option = get_graphics_enum_value<int>(graphics::options::ds_option);
 +            // [wcw hfr] Only Original, the game's fixed smooth rate or twice it (framerate_rules.h).
 +            recompui::framerate::apply_choice(new_config.rr_option, new_config.rr_manual_value,
 +                recompui::programconfig::get_frame_interpolation().smooth_rate);
 +
-             new_config.ds_option = get_graphics_enum_value<int>(graphics::options::ds_option);
++            // [wcw] How many times the output size the game renders at: Downsampling Quality at Original and
++            // Original 2x, Supersampling at Auto (graphics_rules.h).
++            new_config.ds_option = recompui::graphics_rules::downsample_multiplier(new_config.res_option,
++                get_graphics_enum_value<int>(graphics::options::ds_option), get_graphics_enum_value<int>(graphics::options::ss_option));
  
              ultramodern::renderer::set_graphics_config(new_config);
++
++            // [wcw] Takes effect on the next frame.
++            RT64::WcwTextureEdges::setSmooth(get_graphics_enum_value<TextureEdgesOption>(graphics::options::texture_edges_option) == TextureEdgesOption::Smooth);
 +
 +            // [wcw rt] Takes effect on the next frame (no renderer restart needed).
 +            RT64::WcwRaytracer::setUserSettings(
@@ -793,10 +1297,31 @@ index 4fdf81f..ac118cc 100644
          }
  
          void graphics::update_msaa_supported(bool supported) {
-@@ -202,11 +425,124 @@ namespace recompui {
-             }
-         }
- 
+             recomp::config::Config &config = get_graphics_config();
+             if (!supported) {
++                preset_max_msaa = ultramodern::renderer::Antialiasing::None;
+                 config.update_option_enum_details(
+                     graphics::options::msaa_option,
+                     supported ? "Available" : "Not available (missing sample positions support)"
+@@ -192,21 +517,137 @@ namespace recompui {
+                     true
+                 );
+             } else {
+-                auto max_msaa = recompui::renderer::RT64MaxMSAA();
+-                if (max_msaa < RT64::UserConfiguration::Antialiasing::MSAA2X) {
+-                    config.update_enum_option_disabled(graphics::options::msaa_option, static_cast<uint32_t>(ultramodern::renderer::Antialiasing::MSAA2X), true);
++                // [wcw] RT64's levels are listed in the same order as ultramodern's (None, 2X, 4X, 8X).
++                const auto max_msaa = static_cast<ultramodern::renderer::Antialiasing>(recompui::renderer::RT64MaxMSAA());
++                // The presets use up to 4X.
++                preset_max_msaa = std::min(max_msaa, ultramodern::renderer::Antialiasing::MSAA4X);
++                for (auto level : { ultramodern::renderer::Antialiasing::MSAA2X, ultramodern::renderer::Antialiasing::MSAA4X, ultramodern::renderer::Antialiasing::MSAA8X }) {
++                    if (!recompui::graphics_rules::msaa_level_supported(level, max_msaa)) {
++                        config.update_enum_option_disabled(graphics::options::msaa_option, static_cast<uint32_t>(level), true);
++                    }
++                }
++            }
++        }
++
 +        static const std::string hdr_description =
 +            "<recomp-color warning>Experimental:</recomp-color> still being tuned, so expect rough edges. "
 +            "Outputs in HDR on displays with Windows HDR turned on. Recommended with the CRT filter: it uses the display's extra "
@@ -843,10 +1368,12 @@ index 4fdf81f..ac118cc 100644
 +                    if (status.display.fullFrameNits > 0.0f) {
 +                        readout += ", " + format_nits(status.display.fullFrameNits) + " full-screen";
 +                    }
-+                }
+                 }
+-                if (max_msaa < RT64::UserConfiguration::Antialiasing::MSAA4X) {
+-                    config.update_enum_option_disabled(graphics::options::msaa_option, static_cast<uint32_t>(ultramodern::renderer::Antialiasing::MSAA4X), true);
 +                else {
 +                    readout += "peak brightness not reported (assuming " + format_nits(RT64::WcwLogic::HdrUnknownPeakNits) + ")";
-+                }
+                 }
 +
 +                readout += ".<br />Game white: <recomp-color primary>" + format_nits(paper_white) + "</recomp-color>";
 +                if (crt_on) {
@@ -897,7 +1424,7 @@ index 4fdf81f..ac118cc 100644
 +            std::string status;
 +            if (active) {
 +                status = "<br /><br /><recomp-color success>HDR is active.</recomp-color>";
-+            }
+             }
 +            else if (requested) {
 +                status = "<br /><br /><recomp-color warning>Windows HDR is off for this display, so the game is using SDR.</recomp-color> "
 +                    "Turn on \"Use HDR\" in Windows display settings, then restart the game.";
@@ -905,10 +1432,11 @@ index 4fdf81f..ac118cc 100644
 +
 +            get_graphics_config().update_option_description(graphics::options::hdr_option, hdr_description + status);
 +            update_hdr_picture_readout();
-+        }
-+
+         }
+ 
          void graphics::update_refresh_rate(uint32_t refresh_rate) {
              recomp::config::Config& config = get_graphics_config();
++            preset_display_rate = refresh_rate;
              std::string framerate_text = get_framerate_text(refresh_rate);
 -            config.update_option_description(graphics::options::rr_option, framerate_text);
 -            config.update_option_description(graphics::options::rr_manual_value, framerate_text);
@@ -920,14 +1448,130 @@ index 4fdf81f..ac118cc 100644
          }
  
          void graphics::toggle_fullscreen() {
-@@ -299,12 +635,17 @@ namespace recompui {
+@@ -222,7 +663,10 @@ namespace recompui {
+ 
+             recomp::config::Config &config = recompui::config::create_config_tab(name, graphics::id, true);
+             config.set_save_callback(apply_graphics_config);
+-            config.set_load_callback(apply_graphics_config);
++            config.set_load_callback([]() {
++                reconcile_saved_preset();
++                apply_graphics_config();
++            });
+ 
+             config.add_bool_option(
+                 graphics::options::developer_mode,
+@@ -232,6 +676,37 @@ namespace recompui {
+                 true
+             );
+ 
++            // [wcw] Graphics presets. The options' defaults are Enhanced's, so a new player starts on Enhanced.
++            const uint32_t smooth_rate = recompui::programconfig::get_frame_interpolation().smooth_rate;
++            const presets::Settings enhanced = presets::settings_for(presets::Preset::Enhanced, preset_limits()).value();
++            config.add_enum_option(
++                graphics::options::preset,
++                "Preset",
++                "Sets the main graphics options in one go; you can still change any of them afterwards. "
++                "<recomp-color primary>Authentic</recomp-color>: the game as it shipped, in 4:3 at 30 fps on a simulated composite TV (the CRT filter). "
++                "<recomp-color primary>Enhanced</recomp-color> (the default): widescreen, smooth motion (60 fps where the game offers it) and MSAA 4x, without ray tracing. "
++                "<recomp-color primary>Enhanced Ray Tracing</recomp-color>: Enhanced with ray-traced shadows and ambient occlusion (Balanced). "
++                "<recomp-color primary>Max</recomp-color>: Enhanced Ray Tracing at 120 fps on a 120 Hz or faster display, with Ultra ray tracing and HDR (Auto). "
++                "<recomp-color primary>Custom</recomp-color> shows when the options match none of these."
++                "<br />"
++                "<br />"
++                "<recomp-color primary>Ray tracing needs an RTX-class GPU with D3D12, and HDR needs Windows HDR and a restart of the game; without them those parts have no effect.</recomp-color>",
++                preset_options,
++                presets::Preset::Enhanced
++            );
++            {
++                // Custom is only ever shown, never picked.
++                config.update_enum_option_disabled(graphics::options::preset, static_cast<uint32_t>(presets::Preset::Custom), true);
++                config.add_option_change_callback(
++                    graphics::options::preset,
++                    [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant, OptionChangeContext change_context) {
++                        if (!syncing_preset && (change_context == OptionChangeContext::Temporary)) {
++                            stage_preset(static_cast<presets::Preset>(std::get<uint32_t>(cur_value)));
++                        }
++                    }
++                );
++            }
++
+             config.add_enum_option(
+                 graphics::options::res_option,
+                 "Resolution",
+@@ -252,7 +727,7 @@ namespace recompui {
+             config.add_enum_option(
+                 graphics::options::ds_option,
+                 "Downsampling Quality",
+-                "Renders at a higher resolution and scales it down to the output resolution for increased quality. Only available in <recomp-color primary>Original</recomp-color> and <recomp-color primary>Original 2x</recomp-color> resolution."
++                "Renders at a higher resolution and scales it down to the output resolution for increased quality. For <recomp-color primary>Original</recomp-color> and <recomp-color primary>Original 2x</recomp-color> resolution; <recomp-color primary>Auto</recomp-color> has <recomp-color primary>Supersampling</recomp-color> instead."
+                 "<br />"
+                 "<br />"
+                 "Note: <recomp-color primary>4x</recomp-color> downsampling quality at <recomp-color primary>Original 2x</recomp-color> resolution may cause performance issues on low end devices, as it will cause the game to render <recomp-color warning>at almost 4k internal resolution</recomp-color>.",
+@@ -268,7 +743,8 @@ namespace recompui {
+                     }
+                 );
+ 
+-                config.add_option_disable_dependency(
++                // [wcw] Auto shows Supersampling in its place (it used to show this option disabled).
++                config.add_option_hidden_dependency(
+                     graphics::options::ds_option,
+                     graphics::options::res_option,
+                     ultramodern::renderer::Resolution::Auto
+@@ -283,12 +759,46 @@ namespace recompui {
+                 });
+             }
+ 
++            // [wcw] Supersampling: Downsampling Quality's counterpart at Auto resolution.
++            config.add_enum_option(
++                graphics::options::ss_option,
++                "Supersampling",
++                "Renders at twice the resolution and scales it down to the window for smoother edges. Unlike MSAA, it also "
++                "smooths cut-out edges such as ropes, cages and ladders, and steadies shimmering textures."
++                "<br />"
++                "<br />"
++                "<recomp-color warning>Note:</recomp-color> <recomp-color primary>2x</recomp-color> renders four times the pixels "
++                "and is demanding at high window sizes: about 4K internally for a 1080p window. Ray tracing still traces at the window's size.",
++                supersampling_options,
++                SupersamplingOption::Off
++            );
++            {
++                config.add_option_hidden_dependency(
++                    graphics::options::ss_option,
++                    graphics::options::res_option,
++                    ultramodern::renderer::Resolution::Original,
++                    ultramodern::renderer::Resolution::Original2x
++                );
++
++                config.on_json_parse_option(graphics::options::ss_option, [](const nlohmann::json& j) {
++                    // Configs saved before this option existed have no value for it (null): use the default.
++                    if (!j.is_number_unsigned()) {
++                        return uint32_t(SupersamplingOption::Off);
++                    }
++                    return j.get<uint32_t>();
++                });
++
++                config.on_json_serialize_option(graphics::options::ss_option, [](const recomp::config::ConfigValueVariant& value) {
++                    return nlohmann::json(std::get<uint32_t>(value));
++                });
++            }
++
+             config.add_enum_option(
+                 graphics::options::ar_option,
+                 "Aspect Ratio",
+                 "Sets the horizontal aspect ratio. <recomp-color primary>Original</recomp-color> uses the game's original 4:3 aspect ratio. <recomp-color primary>Expand</recomp-color> will adjust to match the game window's aspect ratio.",
+                 aspect_ratio_options,
+-                ultramodern::renderer::AspectRatio::Expand
++                enhanced.aspect_ratio
+             );
+ 
+             config.add_enum_option(
+@@ -299,12 +809,16 @@ namespace recompui {
                  wm_default()
              );
  
 +            // [wcw hfr] Framerate: games that declare frame interpolation (programconfig::set_frame_interpolation)
 +            // offer "30 (Original)" / "<rate> (Smooth)", defaulting to Original. Games that don't stay locked to
 +            // Original: these engines submit only combined matrices, which RT64 can't interpolate on its own.
-+            const uint32_t smooth_rate = recompui::programconfig::get_frame_interpolation().smooth_rate;
 +            static EnumOptionVector framerate_options = (smooth_rate > 0) ? smooth_rate_options(smooth_rate) : refresh_rate_options;
              config.add_enum_option(
                  graphics::options::rr_option,
@@ -938,11 +1582,11 @@ index 4fdf81f..ac118cc 100644
 +                (smooth_rate > 0) ? "Framerate (Experimental)" : "Framerate",
 +                (smooth_rate > 0) ? smooth_rate_description(smooth_rate) : get_framerate_text(60),
 +                framerate_options,
-+                ultramodern::renderer::RefreshRate::Original
++                enhanced.framerate
              );
  
              config.add_number_option(
-@@ -314,12 +655,28 @@ namespace recompui {
+@@ -314,12 +828,28 @@ namespace recompui {
                  20.0, 240.0, 1.0, 0, false, 60.0
              );
              {
@@ -977,7 +1621,16 @@ index 4fdf81f..ac118cc 100644
              }
  
              config.add_enum_option(
-@@ -359,6 +716,147 @@ namespace recompui {
+@@ -330,7 +860,7 @@ namespace recompui {
+                 "<br />"
+                 "<recomp-color primary>Note: This option won't be available if your GPU does not support programmable MSAA sample positions, as it is currently required to avoid rendering glitches.</recomp-color>",
+                 antialiasing_options,
+-                ultramodern::renderer::Antialiasing::MSAA2X
++                enhanced.msaa
+             );
+ 
+             config.add_enum_option(
+@@ -359,6 +889,177 @@ namespace recompui {
                  true
              );
  
@@ -991,7 +1644,7 @@ index 4fdf81f..ac118cc 100644
 +                "<br />"
 +                "The first use of each signal takes a few seconds to prepare.",
 +                crt_filter_options,
-+                CrtFilterOption::Off
++                enhanced.crt
 +            );
 +
 +            config.add_enum_option(
@@ -1050,7 +1703,7 @@ index 4fdf81f..ac118cc 100644
 +                "HDR (Experimental)",
 +                hdr_description,
 +                hdr_options,
-+                HdrOption::Off
++                enhanced.hdr
 +            );
 +
 +            config.add_enum_option(
@@ -1078,17 +1731,18 @@ index 4fdf81f..ac118cc 100644
 +                    graphics::options::hdr_picture,
 +                    HdrPictureOption::Auto, HdrPictureOption::Brighter, HdrPictureOption::Balanced, HdrPictureOption::CrtDetail
 +                );
-+
-+                // The readout follows the choices that change it while the menu is open.
-+                for (const std::string &option : { graphics::options::hdr_picture, graphics::options::hdr_custom_nits,
-+                    graphics::options::crt_filter_option, graphics::options::crt_beam_option }) {
-+                    config.add_option_change_callback(option,
-+                        [](recomp::config::ConfigValueVariant, recomp::config::ConfigValueVariant, OptionChangeContext change_context) {
-+                            update_hdr_picture_readout(change_context);
-+                        }
-+                    );
-+                }
 +            }
++
++            config.add_enum_option(
++                graphics::options::texture_edges_option,
++                "2D Texture Edges",
++                "How pixel-art textures (crowds, signs, the HUD, fonts) look at high resolutions. "
++                "<recomp-color primary>Original</recomp-color> keeps the N64's sharp texel blocks. "
++                "<recomp-color primary>Smooth</recomp-color> keeps every texel a crisp square but softens the edges between them "
++                "over one screen pixel, so they don't look jagged or crawl when they move.",
++                texture_edges_options,
++                TextureEdgesOption::Original
++            );
 +
 +            config.add_enum_option(
 +                graphics::options::rt_option,
@@ -1099,7 +1753,7 @@ index 4fdf81f..ac118cc 100644
 +                "<br />"
 +                "<recomp-color primary>Requires an RTX-class GPU with DirectX Raytracing 1.1 and the D3D12 graphics API.</recomp-color> It has no effect otherwise.",
 +                ray_tracing_options,
-+                RayTracingOption::Off
++                enhanced.rt
 +            );
 +
 +            config.add_enum_option(
@@ -1112,7 +1766,7 @@ index 4fdf81f..ac118cc 100644
 +                "<recomp-color primary>Ultra</recomp-color> keeps Quality's look with twice the rays, for the cleanest result; "
 +                "it costs the most and suits fast GPUs.",
 +                ray_tracing_quality_options,
-+                RayTracingQuality::Balanced
++                enhanced.rt_quality
 +            );
 +            {
 +                config.add_option_hidden_dependency(
@@ -1122,22 +1776,62 @@ index 4fdf81f..ac118cc 100644
 +                );
 +            }
 +
++            // An option has one change callback, so this registers them for both uses: the HDR Picture readout follows
++            // the choices that change it while the menu is open, and the preset follows the options it sets.
++            {
++                const std::vector<std::string> readout_ids = { graphics::options::hdr_picture, graphics::options::hdr_custom_nits,
++                    graphics::options::crt_filter_option, graphics::options::crt_beam_option };
++                const std::vector<std::string> &preset_ids = preset_option_ids();
++                std::vector<std::string> ids = readout_ids;
++                for (const std::string &option : preset_ids) {
++                    if (std::find(ids.begin(), ids.end(), option) == ids.end()) {
++                        ids.push_back(option);
++                    }
++                }
++
++                for (const std::string &option : ids) {
++                    const bool readout = std::find(readout_ids.begin(), readout_ids.end(), option) != readout_ids.end();
++                    const bool preset = std::find(preset_ids.begin(), preset_ids.end(), option) != preset_ids.end();
++                    config.add_option_change_callback(option,
++                        [readout, preset](recomp::config::ConfigValueVariant, recomp::config::ConfigValueVariant, OptionChangeContext change_context) {
++                            if (readout) {
++                                update_hdr_picture_readout(change_context);
++                            }
++                            if (preset) {
++                                follow_preset(change_context);
++                            }
++                        }
++                    );
++                }
++            }
++
              return config;
          }
      }
 diff --git a/recompui/src/renderer/rt64_render_context.cpp b/recompui/src/renderer/rt64_render_context.cpp
-index a7954c7..930cc2b 100644
+index a7954c7..d899e2a 100644
 --- a/recompui/src/renderer/rt64_render_context.cpp
 +++ b/recompui/src/renderer/rt64_render_context.cpp
-@@ -4,6 +4,7 @@
+@@ -4,6 +4,8 @@
  #include <algorithm>
  
  #include "hle/rt64_application.h"
++#include "common/rt64_wcw_logic.h"
 +#include "render/rt64_hdr_output.h"
  #include "rt64_render_hooks.h"
  #include "overloaded.h"
  
-@@ -270,6 +271,9 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
+@@ -143,7 +145,8 @@ void set_application_user_config(RT64::Application* application, const ultramode
+         default:
+         case ultramodern::renderer::Resolution::Auto:
+             application->userConfig.resolution = RT64::UserConfiguration::Resolution::WindowIntegerScale;
+-            application->userConfig.downsampleMultiplier = 1;
++            // [wcw] Supersampling (graphics_rules.h): RT64 multiplies the window scale by this and box-filters back down.
++            application->userConfig.downsampleMultiplier = std::max(config.ds_option, 1);
+             break;
+         case ultramodern::renderer::Resolution::Original:
+             application->userConfig.resolution = RT64::UserConfiguration::Resolution::Manual;
+@@ -270,6 +273,9 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
      RT64::ApplicationConfiguration appConfig;
      appConfig.useConfigurationFile = false;
  
@@ -1147,7 +1841,7 @@ index a7954c7..930cc2b 100644
      // Create the RT64 application.
      app = std::make_unique<RT64::Application>(appCore, appConfig);
  
-@@ -299,6 +303,8 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
+@@ -299,6 +305,8 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
              app->userConfig.graphicsAPI = RT64::UserConfiguration::GraphicsAPI::Automatic;
              break;
      }
@@ -1156,7 +1850,7 @@ index a7954c7..930cc2b 100644
  
      // Set up the RT64 application.
      uint32_t thread_id = 0;
-@@ -331,6 +337,7 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
+@@ -331,6 +339,7 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
      }
  
      recompui::config::graphics::update_msaa_supported(sample_positions_supported);
@@ -1164,6 +1858,22 @@ index a7954c7..930cc2b 100644
  
      high_precision_fb_enabled = app->shaderLibrary->usesHDR;
  }
+@@ -405,12 +414,9 @@ float renderer::RT64Context::get_resolution_scale() const {
+     constexpr int ReferenceHeight = 240;
+     switch (app->userConfig.resolution) {
+         case RT64::UserConfiguration::Resolution::WindowIntegerScale:
+-            if (app->sharedQueueResources->swapChainHeight > 0) {
+-                return std::max(float((app->sharedQueueResources->swapChainHeight + ReferenceHeight - 1) / ReferenceHeight), 1.0f);
+-            }
+-            else {
+-                return 1.0f;
+-            }
++            // [wcw] The render scale, supersampling included (as Manual reports resolutionMultiplier).
++            return RT64::WcwLogic::windowResolutionMultiplier(app->sharedQueueResources->swapChainHeight, ReferenceHeight,
++                uint32_t(std::max(app->userConfig.downsampleMultiplier, 1)));
+         case RT64::UserConfiguration::Resolution::Manual:
+             return float(app->userConfig.resolutionMultiplier);
+         case RT64::UserConfiguration::Resolution::Original:
 diff --git a/recompui/src/renderer/ui_renderer.cpp b/recompui/src/renderer/ui_renderer.cpp
 index 5ca5349..7a28b2b 100644
 --- a/recompui/src/renderer/ui_renderer.cpp
@@ -1504,6 +2214,318 @@ index 0000000..4047081
 +
 +int main() {
 +    return WcwTest::runAll("recompui wcw tests");
++}
+diff --git a/recompui/tests/graphics_presets_tests.cpp b/recompui/tests/graphics_presets_tests.cpp
+new file mode 100644
+index 0000000..147d383
+--- /dev/null
++++ b/recompui/tests/graphics_presets_tests.cpp
+@@ -0,0 +1,256 @@
++// [wcw] Unit tests for the graphics presets (src/config/graphics_presets). Built and run as part of every recompui
++// build (RECOMPUI_WCW_TESTS); a failure fails the build.
++
++#include "graphics_presets.h"
++
++#include "wcw_test.h"
++
++using ultramodern::renderer::Antialiasing;
++using ultramodern::renderer::AspectRatio;
++using ultramodern::renderer::RefreshRate;
++using namespace recompui::config;
++using namespace recompui::config::presets;
++
++template <typename T>
++static int val(T value) {
++    return static_cast<int>(value);
++}
++
++// A game with frame interpolation (smooth rate 60) on a 144 Hz display with an MSAA 4x GPU.
++static Limits interpolating() {
++    Limits limits;
++    limits.smooth_rate = 60;
++    limits.display_rate = 144;
++    limits.max_msaa = Antialiasing::MSAA4X;
++    return limits;
++}
++
++static Settings preset(Preset p, const Limits &limits = interpolating()) {
++    return settings_for(p, limits).value();
++}
++
++TEST_CASE("Authentic is the game as it shipped on a composite TV") {
++    const Settings s = preset(Preset::Authentic);
++    CHECK_EQ(val(s.aspect_ratio), val(AspectRatio::Original));
++    CHECK_EQ(val(s.framerate), val(RefreshRate::Original));
++    CHECK_EQ(val(s.msaa), val(Antialiasing::None));
++    CHECK_EQ(val(s.crt), val(CrtFilterOption::On));
++    CHECK_EQ(val(s.crt_signal), val(CrtSignalOption::Composite));
++    CHECK_EQ(val(s.rt), val(RayTracingOption::Off));
++    CHECK_EQ(val(s.hdr), val(HdrOption::Off));
++}
++
++TEST_CASE("Enhanced is Expand, 60 fps (Smooth), MSAA 4x, no ray tracing, CRT or HDR") {
++    const Settings s = preset(Preset::Enhanced);
++    CHECK_EQ(val(s.aspect_ratio), val(AspectRatio::Expand));
++    CHECK_EQ(val(s.framerate), val(RefreshRate::Manual));
++    CHECK_EQ(val(s.msaa), val(Antialiasing::MSAA4X));
++    CHECK_EQ(val(s.crt), val(CrtFilterOption::Off));
++    CHECK_EQ(val(s.rt), val(RayTracingOption::Off));
++    CHECK_EQ(val(s.hdr), val(HdrOption::Off));
++}
++
++TEST_CASE("Enhanced Ray Tracing is Expand, 60 fps (Smooth), MSAA 4x, RT Balanced, no CRT or HDR") {
++    const Settings s = preset(Preset::EnhancedRayTracing);
++    CHECK_EQ(val(s.aspect_ratio), val(AspectRatio::Expand));
++    CHECK_EQ(val(s.framerate), val(RefreshRate::Manual));
++    CHECK_EQ(val(s.msaa), val(Antialiasing::MSAA4X));
++    CHECK_EQ(val(s.crt), val(CrtFilterOption::Off));
++    CHECK_EQ(val(s.rt), val(RayTracingOption::On));
++    CHECK_EQ(val(s.rt_quality), val(RayTracingQuality::Balanced));
++    CHECK_EQ(val(s.hdr), val(HdrOption::Off));
++}
++
++TEST_CASE("Enhanced and Enhanced Ray Tracing differ only in ray tracing") {
++    const Settings plain = preset(Preset::Enhanced);
++    Settings s = preset(Preset::EnhancedRayTracing);
++    s.rt = RayTracingOption::Off;
++    CHECK_EQ(val(s.aspect_ratio), val(plain.aspect_ratio));
++    CHECK_EQ(val(s.framerate), val(plain.framerate));
++    CHECK_EQ(val(s.msaa), val(plain.msaa));
++    CHECK_EQ(val(s.crt), val(plain.crt));
++    CHECK_EQ(val(s.hdr), val(plain.hdr));
++    CHECK_EQ(val(matching_preset(s, interpolating())), val(Preset::Enhanced));
++}
++
++TEST_CASE("the default is Enhanced, with ray tracing off") {
++    // The tab builds the options' defaults from settings_for(Enhanced) and the Preset option defaults to Enhanced, so a
++    // fresh config is these settings.
++    const Settings defaults = preset(Preset::Enhanced);
++    CHECK_EQ(val(defaults.rt), val(RayTracingOption::Off));
++    CHECK_EQ(val(matching_preset(defaults, interpolating())), val(Preset::Enhanced));
++
++    // The default Settings (Expand, Original framerate, no MSAA) match nothing; only Enhanced's do.
++    CHECK_EQ(val(matching_preset(Settings{}, interpolating())), val(Preset::Custom));
++}
++
++TEST_CASE("the old Enhanced (RT Balanced) now matches Enhanced Ray Tracing") {
++    Settings s;
++    s.aspect_ratio = AspectRatio::Expand;
++    s.framerate = RefreshRate::Manual;
++    s.msaa = Antialiasing::MSAA4X;
++    s.rt = RayTracingOption::On;
++    s.rt_quality = RayTracingQuality::Balanced;
++    CHECK_EQ(val(matching_preset(s, interpolating())), val(Preset::EnhancedRayTracing));
++    CHECK(!matches(Preset::Enhanced, s, interpolating()));
++}
++
++TEST_CASE("stored preset values follow the menu order") {
++    CHECK_EQ(val(Preset::Authentic), 0);
++    CHECK_EQ(val(Preset::Enhanced), 1);
++    CHECK_EQ(val(Preset::EnhancedRayTracing), 2);
++    CHECK_EQ(val(Preset::Max), 3);
++    CHECK_EQ(val(Preset::Custom), 4);
++}
++
++TEST_CASE("Max is 120 fps (Smooth2x), MSAA 4x, RT Ultra, HDR Auto") {
++    const Settings s = preset(Preset::Max);
++    CHECK_EQ(val(s.aspect_ratio), val(AspectRatio::Expand));
++    CHECK_EQ(val(s.framerate), val(RefreshRate::Display));
++    CHECK_EQ(val(s.msaa), val(Antialiasing::MSAA4X));
++    CHECK_EQ(val(s.crt), val(CrtFilterOption::Off));
++    CHECK_EQ(val(s.rt), val(RayTracingOption::On));
++    CHECK_EQ(val(s.rt_quality), val(RayTracingQuality::Ultra));
++    CHECK_EQ(val(s.hdr), val(HdrOption::On));
++    CHECK_EQ(val(s.hdr_picture), val(HdrPictureOption::Auto));
++}
++
++TEST_CASE("Max runs 120 only where the display allows it, otherwise the smooth rate") {
++    Limits limits = interpolating();
++    limits.display_rate = 60;
++    CHECK_EQ(val(preset(Preset::Max, limits).framerate), val(RefreshRate::Manual));
++    limits.display_rate = 100;
++    CHECK_EQ(val(preset(Preset::Max, limits).framerate), val(RefreshRate::Manual));
++    limits.display_rate = 119; // 119.88 Hz
++    CHECK_EQ(val(preset(Preset::Max, limits).framerate), val(RefreshRate::Display));
++    limits.display_rate = 120;
++    CHECK_EQ(val(preset(Preset::Max, limits).framerate), val(RefreshRate::Display));
++    limits.display_rate = 0; // not known yet
++    CHECK_EQ(val(preset(Preset::Max, limits).framerate), val(RefreshRate::Display));
++}
++
++TEST_CASE("a game with a locked framerate stays at Original in every preset") {
++    Limits limits = interpolating();
++    limits.smooth_rate = 0;
++    for (Preset p : { Preset::Authentic, Preset::Enhanced, Preset::EnhancedRayTracing, Preset::Max }) {
++        CHECK_EQ(val(preset(p, limits).framerate), val(RefreshRate::Original));
++    }
++}
++
++TEST_CASE("MSAA is capped at what the GPU offers") {
++    Limits limits = interpolating();
++    limits.max_msaa = Antialiasing::MSAA2X;
++    CHECK_EQ(val(preset(Preset::Enhanced, limits).msaa), val(Antialiasing::MSAA2X));
++    CHECK_EQ(val(preset(Preset::EnhancedRayTracing, limits).msaa), val(Antialiasing::MSAA2X));
++    CHECK_EQ(val(preset(Preset::Max, limits).msaa), val(Antialiasing::MSAA2X));
++    limits.max_msaa = Antialiasing::None;
++    CHECK_EQ(val(preset(Preset::Max, limits).msaa), val(Antialiasing::None));
++}
++
++TEST_CASE("Custom sets nothing") {
++    CHECK(!settings_for(Preset::Custom, interpolating()).has_value());
++    CHECK(!matches(Preset::Custom, preset(Preset::Enhanced), interpolating()));
++    CHECK(!matches(Preset::Custom, preset(Preset::EnhancedRayTracing), interpolating()));
++}
++
++TEST_CASE("each preset's settings match that preset") {
++    for (Preset p : { Preset::Authentic, Preset::Enhanced, Preset::EnhancedRayTracing, Preset::Max }) {
++        CHECK_EQ(val(matching_preset(preset(p), interpolating())), val(p));
++    }
++
++    Limits locked = interpolating();
++    locked.smooth_rate = 0;
++    locked.max_msaa = Antialiasing::None;
++    for (Preset p : { Preset::Authentic, Preset::Enhanced, Preset::EnhancedRayTracing, Preset::Max }) {
++        CHECK_EQ(val(matching_preset(preset(p, locked), locked)), val(p));
++    }
++}
++
++TEST_CASE("changing any one option a preset sets makes it Custom") {
++    for (Preset p : { Preset::Authentic, Preset::Enhanced, Preset::EnhancedRayTracing, Preset::Max }) {
++        const Settings base = preset(p);
++        Settings s;
++
++        s = base;
++        s.aspect_ratio = (base.aspect_ratio == AspectRatio::Expand) ? AspectRatio::Original : AspectRatio::Expand;
++        CHECK_EQ(val(matching_preset(s, interpolating())), val(Preset::Custom));
++
++        s = base;
++        s.framerate = (base.framerate == RefreshRate::Original) ? RefreshRate::Manual : RefreshRate::Original;
++        CHECK_EQ(val(matching_preset(s, interpolating())), val(Preset::Custom));
++
++        s = base;
++        s.msaa = (base.msaa == Antialiasing::MSAA2X) ? Antialiasing::None : Antialiasing::MSAA2X;
++        CHECK_EQ(val(matching_preset(s, interpolating())), val(Preset::Custom));
++
++        s = base;
++        s.crt = (base.crt == CrtFilterOption::On) ? CrtFilterOption::Off : CrtFilterOption::On;
++        CHECK_EQ(val(matching_preset(s, interpolating())), val(Preset::Custom));
++
++        s = base;
++        s.rt = (base.rt == RayTracingOption::On) ? RayTracingOption::Off : RayTracingOption::On;
++        // Ray tracing is the one difference between Enhanced and Enhanced Ray Tracing.
++        const Preset rt_toggled = (p == Preset::Enhanced) ? Preset::EnhancedRayTracing :
++            (p == Preset::EnhancedRayTracing) ? Preset::Enhanced : Preset::Custom;
++        CHECK_EQ(val(matching_preset(s, interpolating())), val(rt_toggled));
++
++        s = base;
++        s.hdr = (base.hdr == HdrOption::On) ? HdrOption::Off : HdrOption::On;
++        CHECK_EQ(val(matching_preset(s, interpolating())), val(Preset::Custom));
++    }
++
++    Settings s = preset(Preset::Authentic);
++    s.crt_signal = CrtSignalOption::RGB;
++    CHECK_EQ(val(matching_preset(s, interpolating())), val(Preset::Custom));
++
++    s = preset(Preset::EnhancedRayTracing);
++    s.rt_quality = RayTracingQuality::Quality;
++    CHECK_EQ(val(matching_preset(s, interpolating())), val(Preset::Custom));
++
++    s = preset(Preset::Max);
++    s.hdr_picture = HdrPictureOption::Brighter;
++    CHECK_EQ(val(matching_preset(s, interpolating())), val(Preset::Custom));
++}
++
++TEST_CASE("hidden sub-options don't count: CRT signal with CRT off, RT quality with RT off, HDR picture with HDR off") {
++    Settings s = preset(Preset::Enhanced);
++    s.crt_signal = CrtSignalOption::RF;
++    s.hdr_picture = HdrPictureOption::CrtDetail;
++    CHECK_EQ(val(matching_preset(s, interpolating())), val(Preset::Enhanced));
++
++    s = preset(Preset::Authentic);
++    s.rt_quality = RayTracingQuality::Ultra;
++    CHECK_EQ(val(matching_preset(s, interpolating())), val(Preset::Authentic));
++
++    s = preset(Preset::Enhanced);
++    s.rt_quality = RayTracingQuality::Performance;
++    CHECK_EQ(val(matching_preset(s, interpolating())), val(Preset::Enhanced));
++}
++
++TEST_CASE("options the presets leave alone don't count") {
++    // Window mode, resolution, HUD placement, CRT colors and beam simulator aren't part of Settings at all; a framerate
++    // the game locks doesn't count either.
++    Limits locked = interpolating();
++    locked.smooth_rate = 0;
++    Settings s = preset(Preset::Enhanced, locked);
++    s.framerate = RefreshRate::Manual;
++    CHECK_EQ(val(matching_preset(s, locked)), val(Preset::Enhanced));
++}
++
++TEST_CASE("MSAA above what the GPU offers counts as the GPU's highest level") {
++    // A saved MSAA 4x on a 2x-only GPU runs as 2x, which is what Enhanced asks for there.
++    Limits limits = interpolating();
++    limits.max_msaa = Antialiasing::MSAA2X;
++    Settings s = preset(Preset::Enhanced, interpolating());
++    CHECK_EQ(val(s.msaa), val(Antialiasing::MSAA4X));
++    CHECK_EQ(val(matching_preset(s, limits)), val(Preset::Enhanced));
++}
++
++TEST_CASE("Max on a 60 Hz display matches at the smooth rate, not at 120") {
++    Limits limits = interpolating();
++    limits.display_rate = 60;
++    Settings s = preset(Preset::Max, limits);
++    CHECK_EQ(val(matching_preset(s, limits)), val(Preset::Max));
++    s.framerate = RefreshRate::Display;
++    CHECK_EQ(val(matching_preset(s, limits)), val(Preset::Custom));
++}
+diff --git a/recompui/tests/graphics_rules_tests.cpp b/recompui/tests/graphics_rules_tests.cpp
+new file mode 100644
+index 0000000..d617ed0
+--- /dev/null
++++ b/recompui/tests/graphics_rules_tests.cpp
+@@ -0,0 +1,44 @@
++// [wcw] Unit tests for the Resolution / Downsampling / Supersampling and MSAA rules (src/config/graphics_rules).
++// Built and run as part of every recompui build (RECOMPUI_WCW_TESTS); a failure fails the build.
++
++#include "graphics_rules.h"
++
++#include "wcw_test.h"
++
++using ultramodern::renderer::Antialiasing;
++using ultramodern::renderer::Resolution;
++using namespace recompui::graphics_rules;
++
++TEST_CASE("supersampling: Auto renders at twice the window's scale with Supersampling 2x") {
++    CHECK_EQ(downsample_multiplier(Resolution::Auto, 0, 2), 2);
++    CHECK_EQ(downsample_multiplier(Resolution::Auto, 0, 0), 1);
++    // Downsampling Quality is for Original and Original 2x; at Auto it no longer forces 1x (it used to), but it
++    // doesn't apply either: a saved 4x there doesn't turn on supersampling.
++    CHECK_EQ(downsample_multiplier(Resolution::Auto, 4, 0), 1);
++    CHECK_EQ(downsample_multiplier(Resolution::Auto, 4, 2), 2);
++}
++
++TEST_CASE("supersampling: Auto caps at 2x whatever the saved value") {
++    CHECK_EQ(downsample_multiplier(Resolution::Auto, 0, 4), 2);
++    CHECK_EQ(downsample_multiplier(Resolution::Auto, 0, 1), 1);
++    CHECK_EQ(downsample_multiplier(Resolution::Auto, 0, -3), 1);
++}
++
++TEST_CASE("supersampling: Original and Original 2x keep Downsampling Quality and ignore Supersampling") {
++    for (Resolution resolution : { Resolution::Original, Resolution::Original2x }) {
++        CHECK_EQ(downsample_multiplier(resolution, 0, 2), 1);
++        CHECK_EQ(downsample_multiplier(resolution, 2, 0), 2);
++        CHECK_EQ(downsample_multiplier(resolution, 4, 2), 4);
++    }
++}
++
++TEST_CASE("msaa: 8x is offered only on devices that support it") {
++    CHECK(msaa_level_supported(Antialiasing::MSAA8X, Antialiasing::MSAA8X));
++    CHECK(!msaa_level_supported(Antialiasing::MSAA8X, Antialiasing::MSAA4X));
++    CHECK(!msaa_level_supported(Antialiasing::MSAA8X, Antialiasing::None));
++    CHECK(msaa_level_supported(Antialiasing::MSAA4X, Antialiasing::MSAA8X));
++    CHECK(!msaa_level_supported(Antialiasing::MSAA4X, Antialiasing::MSAA2X));
++    CHECK(msaa_level_supported(Antialiasing::MSAA2X, Antialiasing::MSAA2X));
++    CHECK(!msaa_level_supported(Antialiasing::MSAA2X, Antialiasing::None));
++    CHECK(msaa_level_supported(Antialiasing::None, Antialiasing::None));
 +}
 diff --git a/recompui/tests/wcw_test.h b/recompui/tests/wcw_test.h
 new file mode 100644

@@ -10,7 +10,7 @@ index 21df8c2..5635c09 100644
 +	url = https://github.com/jessetbh/plume.git
 +	branch = wcw
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 2fb01e5..8e465f3 100644
+index 2fb01e5..62da249 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -319,6 +319,8 @@ set (SOURCES
@@ -33,7 +33,7 @@ index 2fb01e5..8e465f3 100644
      "${PROJECT_SOURCE_DIR}/src/render/rt64_vi_renderer.cpp"
  
      "${PROJECT_SOURCE_DIR}/src/preset/rt64_preset.cpp"
-@@ -442,6 +448,30 @@ target_link_libraries(rt64 nfd)
+@@ -442,6 +448,31 @@ target_link_libraries(rt64 nfd)
  target_link_libraries(rt64 libzstd_static)
  target_link_libraries(rt64 plume)
  
@@ -44,6 +44,7 @@ index 2fb01e5..8e465f3 100644
 +    add_executable(rt64_wcw_tests
 +        "${PROJECT_SOURCE_DIR}/tests/wcw/rt64_wcw_logic_tests.cpp"
 +        "${PROJECT_SOURCE_DIR}/tests/wcw/rt64_wcw_venues_tests.cpp"
++        "${PROJECT_SOURCE_DIR}/tests/wcw/rt64_wcw_sharp_texel_tests.cpp"
 +        "${PROJECT_SOURCE_DIR}/src/common/rt64_wcw_logic.cpp"
 +        "${PROJECT_SOURCE_DIR}/src/common/rt64_wcw_venues.cpp"
 +    )
@@ -64,7 +65,7 @@ index 2fb01e5..8e465f3 100644
  # Add tools.
  add_subdirectory(src/tools/texture_hasher)
  add_subdirectory(src/tools/texture_packer)
-@@ -527,6 +557,12 @@ build_pixel_shader(  rt64 "src/shaders/PostBlendDitherNoisePS.hlsl" "src/shaders
+@@ -527,6 +558,12 @@ build_pixel_shader(  rt64 "src/shaders/PostBlendDitherNoisePS.hlsl" "src/shaders
  build_compute_shader(rt64 "src/shaders/RSPModifyCS.hlsl")
  build_compute_shader(rt64 "src/shaders/RSPProcessCS.hlsl")
  build_compute_shader(rt64 "src/shaders/RSPWorldCS.hlsl")
@@ -77,7 +78,7 @@ index 2fb01e5..8e465f3 100644
  build_compute_shader(rt64 "src/shaders/RSPSmoothNormalCS.hlsl")
  build_compute_shader(rt64 "src/shaders/RSPVertexTestZCS.hlsl")
  build_compute_shader(rt64 "src/shaders/RSPVertexTestZCS.hlsl" "src/shaders/RSPVertexTestZCSMS.hlsl" "-D MULTISAMPLING")
-@@ -545,6 +581,8 @@ build_pixel_shader(  rt64 "src/shaders/TextureResolvePS.hlsl" "src/shaders/Textu
+@@ -545,6 +582,8 @@ build_pixel_shader(  rt64 "src/shaders/TextureResolvePS.hlsl" "src/shaders/Textu
  build_pixel_shader(  rt64 "src/shaders/TextureResolvePS.hlsl" "src/shaders/TextureResolveSamples8XPS.hlsl" "-D SAMPLES_8X")
  build_pixel_shader(  rt64 "src/shaders/VideoInterfacePS.hlsl" "src/shaders/VideoInterfacePSRegular.hlsl")
  build_pixel_shader(  rt64 "src/shaders/VideoInterfacePS.hlsl" "src/shaders/VideoInterfacePSPixel.hlsl" "-D PIXEL_ANTIALIASING")
@@ -247,10 +248,10 @@ index f555048..a9de81e 100644
      }
 diff --git a/src/common/rt64_wcw_logic.cpp b/src/common/rt64_wcw_logic.cpp
 new file mode 100644
-index 0000000..05e9d23
+index 0000000..d797953
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.cpp
-@@ -0,0 +1,412 @@
+@@ -0,0 +1,583 @@
 +//
 +// RT64
 +//
@@ -263,6 +264,44 @@ index 0000000..05e9d23
 +namespace RT64::WcwLogic {
 +    bool shadowCasterFresh(uint64_t frameCounter, uint64_t builtFrame) {
 +        return (frameCounter >= builtFrame) && ((frameCounter - builtFrame) <= ShadowCasterStaleFrames);
++    }
++
++    TraceArea traceArea(bool darkenMisses, float outsideDarkness) {
++        if (outsideDarkness <= 0.0f) {
++            return TraceArea::Receivers;
++        }
++
++        return darkenMisses ? TraceArea::FullScreen : TraceArea::Geometry;
++    }
++
++    bool generatedFrame(float curFrameWeight) {
++        return curFrameWeight < (1.0f - 1e-4f);
++    }
++
++    bool traceRender(bool generated, bool haveTrace, uint32_t reusesSinceTrace) {
++        return !generated || !haveTrace || (reusesSinceTrace >= MaxGeneratedReuse);
++    }
++
++    bool reusableTrace(bool traced, uint64_t tracedSignature, uint64_t signature, bool tracedDarkened, bool darkens) {
++        return traced && (tracedSignature == signature) && (tracedDarkened == darkens);
++    }
++
++    uint64_t passSignature(const uint32_t *triangleCounts, size_t count) {
++        // FNV-1a over the count and the triangle counts.
++        uint64_t hash = 14695981039346656037ULL;
++        auto mix = [&hash](uint64_t value) {
++            for (uint32_t i = 0; i < 8; i++) {
++                hash ^= (value >> (i * 8)) & 0xFF;
++                hash *= 1099511628211ULL;
++            }
++        };
++
++        mix(count);
++        for (size_t i = 0; i < count; i++) {
++            mix(triangleCounts[i]);
++        }
++
++        return hash;
 +    }
 +
 +    AoSettings aoLookSettings(AoLevel level, uint32_t samples) {
@@ -335,13 +374,26 @@ index 0000000..05e9d23
 +        return preset;
 +    }
 +
-+    float rtTraceScale(const RtPreset &preset, uint32_t targetHeight) {
++    float rtTraceScale(const RtPreset &preset, uint32_t targetHeight, uint32_t downsampleMultiplier) {
 +        float scale = preset.scale;
 +        if ((preset.maxLines > 0.0f) && (targetHeight > 0)) {
 +            scale = std::min(scale, preset.maxLines / float(targetHeight));
 +        }
 +
++        if (downsampleMultiplier > 1) {
++            scale = std::min(scale, 1.0f / float(downsampleMultiplier));
++        }
++
 +        return scale;
++    }
++
++    float windowResolutionMultiplier(uint32_t windowHeight, uint32_t referenceHeight, uint32_t downsampleMultiplier) {
++        float multiplier = 1.0f;
++        if ((windowHeight > 0) && (referenceHeight > 0)) {
++            multiplier = std::max(float((windowHeight + referenceHeight - 1) / referenceHeight), 1.0f);
++        }
++
++        return multiplier * float(std::max(downsampleMultiplier, 1u));
 +    }
 +
 +    AoSettings aoSettings(uint32_t quality) {
@@ -632,8 +684,38 @@ index 0000000..05e9d23
 +        return HdrAdvice::Good;
 +    }
 +
++    bool publishShortRun(uint32_t runLength, uint32_t previousRunLength) {
++        return runLength >= previousRunLength;
++    }
++
 +    bool primeGeneratedTargets(bool primeEnabled, bool generateInterpolatedFrames, bool usingMSAA, uint32_t runLength) {
 +        return primeEnabled && generateInterpolatedFrames && !usingMSAA && (runLength == 1);
++    }
++
++    bool framebufferPassCoversScreen(int32_t scissorWidth, int32_t scissorHeight, int32_t fbWidth, int32_t fbHeight) {
++        if ((scissorWidth <= 0) || (scissorHeight <= 0) || (fbWidth <= 0) || (fbHeight <= 0)) {
++            return false;
++        }
++
++        const float SimilarityPercentage = 0.1f;
++        const float scissorRatio = float(scissorWidth) / float(scissorHeight);
++        const float fbPixelRatio = float(fbWidth) / float(fbHeight);
++        if (std::abs((scissorRatio / fbPixelRatio) - 1.0f) < SimilarityPercentage) {
++            return true;
++        }
++
++        return (scissorWidth == fbWidth) && (scissorHeight >= fbHeight);
++    }
++
++    uint32_t modifiedScreenXYForAspect(uint32_t value, float viewportCenterX, float projRatioScale) {
++        if (projRatioScale == 1.0f) {
++            return value;
++        }
++
++        const float x = float(int16_t((value >> 16) & 0xFFFF)) / 4.0f;
++        const float adjusted = viewportCenterX + (x - viewportCenterX) * projRatioScale;
++        const long quarters = std::clamp(std::lround(adjusted * 4.0f), long(INT16_MIN), long(INT16_MAX));
++        return (uint32_t(uint16_t(int16_t(quarters))) << 16) | (value & 0xFFFF);
 +    }
 +
 +    MatrixSlotIdentity::MatrixSlotIdentity(uint32_t stride) : stride(stride) { }
@@ -662,13 +744,103 @@ index 0000000..05e9d23
 +        identities.emplace(address, id);
 +        return id;
 +    }
++
++    std::vector<HudAnchor> hudAnchors(const std::vector<HudBox> &boxes, float screenLeft, float screenRight) {
++        const size_t n = boxes.size();
++        std::vector<HudAnchor> anchors(n, HudAnchor::Centre);
++        const float width = screenRight - screenLeft;
++        if ((n == 0) || (n > HudMaxBoxes) || !(width > 0.0f)) {
++            return anchors;
++        }
++
++        // Group boxes closer than the gap (union-find).
++        std::vector<size_t> parent(n);
++        for (size_t i = 0; i < n; i++) {
++            parent[i] = i;
++        }
++
++        auto root = [&](size_t i) {
++            while (parent[i] != i) {
++                parent[i] = parent[parent[i]];
++                i = parent[i];
++            }
++
++            return i;
++        };
++
++        const float gap = HudElementGap * width;
++        for (size_t i = 0; i < n; i++) {
++            for (size_t j = i + 1; j < n; j++) {
++                const HudBox &a = boxes[i];
++                const HudBox &b = boxes[j];
++                const bool near = (a.left - gap <= b.right) && (b.left - gap <= a.right) && (a.top - gap <= b.bottom) && (b.top - gap <= a.bottom);
++                if (near) {
++                    parent[root(i)] = root(j);
++                }
++            }
++        }
++
++        // Each element's horizontal extent.
++        std::vector<float> elementLeft(n, 0.0f), elementRight(n, 0.0f);
++        std::vector<bool> elementSeen(n, false);
++        for (size_t i = 0; i < n; i++) {
++            const size_t r = root(i);
++            if (!elementSeen[r]) {
++                elementSeen[r] = true;
++                elementLeft[r] = boxes[i].left;
++                elementRight[r] = boxes[i].right;
++            }
++            else {
++                elementLeft[r] = std::min(elementLeft[r], boxes[i].left);
++                elementRight[r] = std::max(elementRight[r], boxes[i].right);
++            }
++        }
++
++        const float centre = (screenLeft + screenRight) / 2.0f;
++        for (size_t i = 0; i < n; i++) {
++            const size_t r = root(i);
++            const float left = elementLeft[r];
++            const float right = elementRight[r];
++            const bool crossesCentre = (left < centre) && (right > centre);
++            const bool nearCentre = std::abs((left + right) / 2.0f - centre) <= (HudCentreBand * width);
++            if (crossesCentre || nearCentre) {
++                anchors[i] = HudAnchor::Centre;
++            }
++            else {
++                anchors[i] = (right <= centre) ? HudAnchor::Left : HudAnchor::Right;
++            }
++        }
++
++        return anchors;
++    }
++
++    bool hudPlacementActive(float centredWidthFraction, float placement) {
++        return (placement > 0.0f) && (centredWidthFraction < 0.999f) && (centredWidthFraction > 0.0f);
++    }
++
++    float hudShiftNdc(HudAnchor anchor, float centredWidthFraction, float placement) {
++        if (!hudPlacementActive(centredWidthFraction, placement)) {
++            return 0.0f;
++        }
++
++        const float shift = (1.0f - centredWidthFraction) * std::min(placement, 1.0f);
++        switch (anchor) {
++        case HudAnchor::Left:
++            return -shift;
++        case HudAnchor::Right:
++            return shift;
++        case HudAnchor::Centre:
++        default:
++            return 0.0f;
++        }
++    }
 +};
 diff --git a/src/common/rt64_wcw_logic.h b/src/common/rt64_wcw_logic.h
 new file mode 100644
-index 0000000..ec2d596
+index 0000000..04956c8
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.h
-@@ -0,0 +1,303 @@
+@@ -0,0 +1,423 @@
 +//
 +// RT64
 +//
@@ -695,6 +867,49 @@ index 0000000..ec2d596
 +
 +    // Whether a scene last built on game frame builtFrame still casts shadows on game frame frameCounter.
 +    bool shadowCasterFresh(uint64_t frameCounter, uint64_t builtFrame);
++
++    // What a workload's trace pass covers on screen.
++    enum class TraceArea {
++        // The whole color target: the pass that darkens the misses (crowd and background, never in the traced scene).
++        FullScreen,
++        // Everything the pass's geometry covers: with outside darkness, its surfaces beyond the receiver radius
++        // darken too. Its misses keep factor 1, so tracing them is wasted work.
++        Geometry,
++        // Only the geometry within the receiver radius: nothing beyond it gets shadows, AO or darkness.
++        Receivers
++    };
++
++    // The trace area for a pass. Tracing every pass full screen whenever the venue had outside darkness made each
++    // No Mercy arena frame trace its 5-7 passes over the whole target (Quality at 5760x2160: ~48 ms of GPU per
++    // game frame), which slowed the game itself, at 60/120 fps most of all.
++    TraceArea traceArea(bool darkenMisses, float outsideDarkness);
++
++    // Frame interpolation renders every workload once per displayed frame: 2 times per game frame at 60 fps, 4 at
++    // 120. Tracing each of them multiplied the ray tracing cost by that much (No Mercy arenas at Quality fell to ~6
++    // presents/s and slowed the game itself), so only the real frame (the game frame's last, current weight 1)
++    // traces; a generated frame composites its pass's latest trace, at most half a game frame old at 60 fps.
++    // A pass traces anyway when it has no trace yet, or after MaxGeneratedReuse generated frames in a row (the real
++    // frame was skipped under load), so shadows never freeze.
++    constexpr uint32_t MaxGeneratedReuse = 3;
++
++    // Whether a frame of curFrameWeight (1 = real, below 1 = generated by interpolation) is generated.
++    bool generatedFrame(float curFrameWeight);
++
++    // Whether a pass traces on this render. generated: the displayed frame is generated (generatedFrame);
++    // haveTrace: the pass's slot holds a trace of this same pass (see passSignature); reusesSinceTrace: generated
++    // frames that reused it since.
++    bool traceRender(bool generated, bool haveTrace, uint32_t reusesSinceTrace);
++
++    // A pass's identity within a game frame: its draws' triangle counts, in order. A generated frame replays the
++    // real frame's draws, so the same pass has the same signature. Two passes can share a slot (similar scenes);
++    // reusing by slot alone composited one pass's trace for both, darkening generated frames ~5%.
++    uint64_t passSignature(const uint32_t *triangleCounts, size_t count);
++
++    // Whether a slot's trace can stand in for this pass on a generated frame: the slot holds a trace (traced) of
++    // this pass (same signature) that made the same outside darkness choice (WcwLogic::MissDarkening, decided for
++    // every pass on every target as if it traced). A reused arena pass that didn't count as the target's darkening
++    // pass let a second pass darken the misses again: generated frames ~5% darker, 3% of game frames off.
++    bool reusableTrace(bool traced, uint64_t tracedSignature, uint64_t signature, bool tracedDarkened, bool darkens);
 +
 +    // Ray tracing quality presets
 +
@@ -755,8 +970,17 @@ index 0000000..ec2d596
 +    // The preset for a quality level; levels past Ultra clamp to Ultra.
 +    RtPreset rtPreset(uint32_t quality);
 +
-+    // The trace resolution relative to a color target targetHeight lines tall.
-+    float rtTraceScale(const RtPreset &preset, uint32_t targetHeight);
++    // The trace resolution relative to a color target targetHeight lines tall. A supersampled target (rendered at
++    // downsampleMultiplier times the output size, then box-filtered down) traces at no more than the output size:
++    // the soft, temporally resolved shadows gain nothing from the extra samples, and they'd cost 4x the rays.
++    float rtTraceScale(const RtPreset &preset, uint32_t targetHeight, uint32_t downsampleMultiplier = 1);
++
++    // Resolution
++
++    // The render scale at Auto (WindowIntegerScale) resolution: the smallest whole multiple of referenceHeight that
++    // covers the window, times downsampleMultiplier (Supersampling: render that much larger and box-filter it back
++    // down, so the presented image still fits the window). A window not created yet counts as 1x.
++    float windowResolutionMultiplier(uint32_t windowHeight, uint32_t referenceHeight, uint32_t downsampleMultiplier);
 +
 +    // The AO parameters for a quality level.
 +    AoSettings aoSettings(uint32_t quality);
@@ -956,6 +1180,35 @@ index 0000000..ec2d596
 +    // (fades) twice; priming every layer replaced the earlier layers' draws with the blend (Revenge flicker).
 +    bool primeGeneratedTargets(bool primeEnabled, bool generateInterpolatedFrames, bool usingMSAA, uint32_t runLength);
 +
++    // Multi-layer runs that end early
++
++    // A run's generated frame waits for the run's expected number of layers; a run that ends shorter is published
++    // when the next run starts. When it is also shorter than the run before it, the game drew only part of its
++    // usual layers this frame (Revenge's attract mode: 1 of 3, 3 of 5), and the generated frame lacks the rest:
++    // a one-present flash (a missing overlay or darkening layer, ~15-20% luminance). Such a run's generated frame
++    // is dropped and the real frame shows for the whole game frame, as at 30 fps. A run as long as the previous
++    // one is the scene's steady structure (fewer layers than the recent maximum) and is published.
++    bool publishShortRun(uint32_t runLength, uint32_t previousRunLength);
++
++    // Widescreen (Aspect Ratio = Expand)
++
++    // Whether a framebuffer pass draws the whole screen, so Expand aspect-corrects it (the pass's 2D keeps its proportions
++    // in a widened frame) instead of stretching it. True when the pass's scissor (in framebuffer pixels) has the
++    // framebuffer's own pixel ratio (within 10%), or when it spans the framebuffer's full width and at least its height.
++    // The second case: RT64 sizes a framebuffer from what was drawn so far, so No Mercy's story-mode screens (480x240)
++    // measured 480x196 or 480x198 in some passes and 480x240 in others. The ratio test alone flipped between them, and
++    // the dialog text was drawn at one width for a few seconds and then jumped to another.
++    bool framebufferPassCoversScreen(int32_t scissorWidth, int32_t scissorHeight, int32_t fbWidth, int32_t fbHeight);
++
++    // A G_MWO_POINT_XYSCREEN vertex modify (value: x in the high 16 bits, y in the low 16 bits, signed quarter pixels of
++    // the N64 screen) as it must land in an Expand frame. Transformed vertices of an aspect-adjusted projection get their
++    // screen x compressed toward their viewport's center (the projection's x scale times projRatioScale), and the wide
++    // viewport then spreads them back to their original proportions. A modify sets the screen position directly, so it
++    // skipped the compression and came out stretched by the widening: No Mercy's story-mode flow lines and the hub's
++    // panel text moved away from the boxes they belong to. x' = viewportCenterX + (x - viewportCenterX) * projRatioScale;
++    // y unchanged. projRatioScale 1 (Original, or a projection Expand leaves alone) returns the value unchanged.
++    uint32_t modifiedScreenXYForAspect(uint32_t value, float viewportCenterX, float projRatioScale);
++
 +    // Matrix identity across frames
 +
 +    // AKI engines double-buffer their uploaded matrices: an object's matrix alternates between two slots 'stride'
@@ -971,6 +1224,45 @@ index 0000000..ec2d596
 +        std::unordered_map<uint32_t, uint32_t> identities;
 +        std::mutex identitiesMutex;
 +    };
++
++    // HUD Placement without G_EX tags
++
++    // The games never tag their HUD with gEXSetRectAlign / G_EX_ORIGIN_*, so Graphics > HUD Placement did nothing.
++    // Instead the renderer collects the 2D draws a pass makes after its widened 3D scene (texrects, fill rects,
++    // triangles drawn with a matrix without perspective), and anchors them here: draws that touch or nearly touch are
++    // one element; an element left of the centre anchors to the left edge, right of it to the right edge, and one
++    // across the centre or near it stays centred. Grouping first keeps an element in one piece (a timer's digits,
++    // a meter's segments) instead of tearing it at the centre line.
++    enum class HudAnchor : uint8_t {
++        Centre,
++        Left,
++        Right
++    };
++
++    // A 2D draw's bounds in the game's framebuffer pixels.
++    struct HudBox {
++        float left, top, right, bottom;
++    };
++
++    // Draws closer than this fraction of the screen width (on both axes) belong to one element.
++    constexpr float HudElementGap = 0.025f;
++    // An element whose centre is closer to the screen centre than this fraction of the screen width stays centred.
++    constexpr float HudCentreBand = 0.08f;
++    // Passes with more 2D draws than this are left alone (a full 2D screen, not a HUD; also bounds the grouping cost).
++    constexpr size_t HudMaxBoxes = 512;
++
++    // One anchor per box. The screen spans screenLeft..screenRight in the same pixels as the boxes.
++    std::vector<HudAnchor> hudAnchors(const std::vector<HudBox> &boxes, float screenLeft, float screenRight);
++
++    // Whether HUD placement changes anything: the frame is wider than the game's 4:3 (centredWidthFraction = 4:3 width /
++    // output width, below 1) and the HUD Placement mode moves elements (placement = rt64's extAspectPercentage, 0 for
++    // Original).
++    bool hudPlacementActive(float centredWidthFraction, float placement);
++
++    // Horizontal shift, in normalized device coordinates of the wide output, that moves a centred 4:3 element to its
++    // anchor: all the way to the window edge at placement 1, part of the way for a clamped mode (16:9 in a 21:9
++    // window). Matches rt64's G_EX_ORIGIN_LEFT / RIGHT rect origins.
++    float hudShiftNdc(HudAnchor anchor, float centredWidthFraction, float placement);
 +};
 diff --git a/src/common/rt64_wcw_venues.cpp b/src/common/rt64_wcw_venues.cpp
 new file mode 100644
@@ -16458,10 +16750,20 @@ index a870166..ad4c1d8 100644
  
      const VIHistory::Present &VIHistory::top() const {
 diff --git a/src/hle/rt64_workload.cpp b/src/hle/rt64_workload.cpp
-index b4c85f5..f530450 100644
+index b4c85f5..64bfc30 100644
 --- a/src/hle/rt64_workload.cpp
 +++ b/src/hle/rt64_workload.cpp
-@@ -74,6 +74,9 @@ namespace RT64 {
+@@ -56,6 +56,9 @@ namespace RT64 {
+         drawData.lookAtIndices.clear();
+         drawData.faceIndices.clear();
+         drawData.modifyPosUints.clear();
++        drawData.projRatioScales.clear();
++        drawData.modifyPosUintsAdjusted.clear();
++        drawData.modifyPosAdjusted = false;
+         drawData.rdpParams.clear();
+         drawData.extraParams.clear();
+         drawData.renderParams.clear();
+@@ -74,6 +77,9 @@ namespace RT64 {
          drawData.lerpRspLookAt.clear();
          drawData.loadOperations.clear();
          drawData.worldTransforms.clear();
@@ -16471,7 +16773,7 @@ index b4c85f5..f530450 100644
          drawData.viewTransforms.clear();
          drawData.projTransforms.clear();
          drawData.viewProjTransforms.clear();
-@@ -106,6 +109,10 @@ namespace RT64 {
+@@ -106,6 +112,10 @@ namespace RT64 {
          drawData.projTransforms.push_back(interop::float4x4::identity());
          drawData.viewProjTransforms.push_back(interop::float4x4::identity());
          drawData.worldTransforms.push_back(interop::float4x4::identity());
@@ -16483,10 +16785,23 @@ index b4c85f5..f530450 100644
          drawData.worldTransformGroups.push_back(0);
          drawData.viewProjTransformGroups.push_back(0);
 diff --git a/src/hle/rt64_workload.h b/src/hle/rt64_workload.h
-index 8ea27d5..b270866 100644
+index 8ea27d5..b16db27 100644
 --- a/src/hle/rt64_workload.h
 +++ b/src/hle/rt64_workload.h
-@@ -55,6 +55,11 @@ namespace RT64 {
+@@ -37,6 +37,12 @@ namespace RT64 {
+         std::vector<uint16_t> lookAtIndices;
+         std::vector<uint32_t> faceIndices;
+         std::vector<uint32_t> modifyPosUints;
++        // [wcw fix] Per viewProj transform: the x scale Expand applied to its projection (1 = none), and modifyPosUints
++        // with its screen-x modifies adjusted to match (WcwLogic::modifiedScreenXYForAspect). Both filled by the
++        // ProjectionProcessor; the RSP modify pass uses the adjusted copy when modifyPosAdjusted is set.
++        std::vector<float> projRatioScales;
++        std::vector<uint32_t> modifyPosUintsAdjusted;
++        bool modifyPosAdjusted = false;
+         std::vector<hlslpp::float4> posTransformed;
+         std::vector<hlslpp::float3> posScreen;
+         std::vector<interop::RDPParams> rdpParams;
+@@ -55,6 +61,11 @@ namespace RT64 {
          std::vector<interop::float4x4> prevWorldTransforms;
          std::vector<interop::float4x4> invTWorldTransforms;
          std::vector<interop::float4x4> lerpWorldTransforms;
@@ -16498,7 +16813,15 @@ index 8ea27d5..b270866 100644
          std::vector<interop::RDPTile> rdpTiles;
          std::vector<interop::RDPTile> lerpRdpTiles;
          std::vector<interop::GPUTile> gpuTiles;
-@@ -233,6 +238,8 @@ namespace RT64 {
+@@ -147,6 +158,7 @@ namespace RT64 {
+         BufferPair lookAtIndicesBuffer;
+         BufferPair faceIndicesBuffer;
+         BufferPair modifyPosUintsBuffer;
++        BufferPair modifyPosUintsAdjustedBuffer; // [wcw fix] see DrawData::modifyPosUintsAdjusted
+         BufferPair rdpParamsBuffer;
+         BufferPair rspParamsBuffer;
+         BufferPair extraParamsBuffer;
+@@ -233,6 +245,8 @@ namespace RT64 {
          std::vector<uint32_t> transformIgnoredIds;
          uint64_t workloadId = 0;
          uint64_t presentId = 0;
@@ -16508,7 +16831,7 @@ index 8ea27d5..b270866 100644
  
          struct {
 diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
-index 5a331aa..ac17ae9 100644
+index 5a331aa..c9eb780 100644
 --- a/src/hle/rt64_workload_queue.cpp
 +++ b/src/hle/rt64_workload_queue.cpp
 @@ -5,6 +5,7 @@
@@ -16560,7 +16883,25 @@ index 5a331aa..ac17ae9 100644
  
          const auto ratioMode = ext.sharedResources->userConfig.aspectRatio;
          switch (ratioMode) {
-@@ -258,9 +266,30 @@ namespace RT64 {
+@@ -187,13 +195,10 @@ namespace RT64 {
+         const auto resolutionMode = ext.sharedResources->userConfig.resolution;
+         switch (resolutionMode) {
+         case UserConfiguration::Resolution::WindowIntegerScale:
+-            if (ext.sharedResources->swapChainHeight > 0) {
+-                resolutionMultiplier = std::max(float((ext.sharedResources->swapChainHeight + referenceHeight - 1) / referenceHeight), 1.0f);
+-            }
+-            else {
+-                resolutionMultiplier = 1.0f;
+-            }
+-
++            // [wcw] Times the downsample multiplier: Supersampling at Auto renders above the window size and
++            // box-filters back down (upstream left downsampling to Manual resolution).
++            resolutionMultiplier = WcwLogic::windowResolutionMultiplier(ext.sharedResources->swapChainHeight, referenceHeight,
++                uint32_t(std::max(ext.sharedResources->userConfig.downsampleMultiplier, 1)));
+             break;
+         case UserConfiguration::Resolution::Manual:
+             resolutionMultiplier = float(ext.sharedResources->userConfig.resolutionMultiplier);
+@@ -258,9 +263,30 @@ namespace RT64 {
                  // Wait until the other queue has stopped using the interpolated color targets.
                  std::unique_lock<std::mutex> interpolatedLock(ext.sharedResources->interpolatedMutex);
                  InterpolatedFrameCounters &curFrameCounters = ext.sharedResources->interpolatedFrames[ext.sharedResources->interpolatedFramesIndex];
@@ -16592,7 +16933,7 @@ index 5a331aa..ac17ae9 100644
              }
  
              std::scoped_lock<std::mutex> managerLock(ext.sharedResources->managerMutex);
-@@ -271,6 +300,8 @@ namespace RT64 {
+@@ -271,6 +297,8 @@ namespace RT64 {
              fbManager.destroyAllTileCopies();
              ext.sharedResources->fbConfigChanged = false;
              ext.sharedResources->interpolatedColorTargets.clear();
@@ -16601,7 +16942,7 @@ index 5a331aa..ac17ae9 100644
          }
  
          if (ext.sharedResources->userConfigChanged) {
-@@ -289,6 +320,10 @@ namespace RT64 {
+@@ -289,6 +317,10 @@ namespace RT64 {
          }
      }
      
@@ -16612,7 +16953,7 @@ index 5a331aa..ac17ae9 100644
      void WorkloadQueue::threadRenderFrame(GameFrame &curFrame, const GameFrame &prevFrame, const WorkloadConfiguration &workloadConfig,
          const DebuggerRenderer &debuggerRenderer, const DebuggerCamera &debuggerCamera, float curFrameWeight, float prevFrameWeight,
          float deltaTimeMs, RenderTargetKey overrideTargetKey, int32_t overrideTargetFbPairIndex, RenderTarget *overrideTarget,
-@@ -387,7 +422,8 @@ namespace RT64 {
+@@ -387,7 +419,8 @@ namespace RT64 {
                  rspProcessor->process(rspParams);
              }
  
@@ -16622,7 +16963,7 @@ index 5a331aa..ac17ae9 100644
              if (processWorldVertices) {
                  workload.resetWorldOutputBuffers();
  
-@@ -452,6 +488,24 @@ namespace RT64 {
+@@ -452,6 +485,24 @@ namespace RT64 {
                      if (colorFb != nullptr) {
                          fbKey.colorTargetKey = RenderTargetKey(colorFb->addressStart, colorFb->width, colorFb->siz, Framebuffer::Type::Color);
                          colorTarget = &targetManager.get(fbKey.colorTargetKey);
@@ -16647,18 +16988,18 @@ index 5a331aa..ac17ae9 100644
                      }
                      else {
                          colorTarget = nullptr;
-@@ -604,6 +658,10 @@ namespace RT64 {
+@@ -604,6 +655,10 @@ namespace RT64 {
              // Add all framebuffer pairs to the framebuffer renderer and setup the operations.
              scratchFbChangePool.reset();
              fbManager.resetOperations();
 +            if (framebufferRenderer->wcwRaytracer != nullptr) {
-+                framebufferRenderer->wcwRaytracer->beginWorkload(workload.presentId);
++                framebufferRenderer->wcwRaytracer->beginWorkload(workload.presentId, curFrameWeight);
 +            }
 +
              framebufferRenderer->resetFramebuffers(ext.workloadGraphicsWorker, ubershadersVisible, workload.extended.ditherNoiseStrength, targetManager.multisampling);
  
  #       if RT_ENABLED
-@@ -703,7 +761,40 @@ namespace RT64 {
+@@ -703,7 +758,40 @@ namespace RT64 {
              ext.workloadGraphicsWorker->commandList->writeTimestamp(queryPool.get(), 0);
              framebufferRenderer->endFramebuffers(ext.workloadGraphicsWorker, &workload.drawBuffers, &workload.outputBuffers, workloadConfig.raytracingEnabled);
              framebufferRenderer->recordSetup(ext.workloadGraphicsWorker, bufferUploaders, processRSP ? rspProcessor.get() : nullptr, processWorldVertices ? vertexProcessor.get() : nullptr, &workload.outputBuffers, workloadConfig.raytracingEnabled);
@@ -16700,7 +17041,7 @@ index 5a331aa..ac17ae9 100644
              // Record all framebuffer pairs.
              uint32_t framebufferIndex = 0;
              for (uint32_t f = 0; f < fbPairCount; f++) {
-@@ -814,7 +905,11 @@ namespace RT64 {
+@@ -814,7 +902,11 @@ namespace RT64 {
                      const uint64_t writeTimestamp = fbManager.nextWriteTimestamp();
                      FixedRect depthFbRect;
                      if (colorFb != nullptr) {
@@ -16713,7 +17054,7 @@ index 5a331aa..ac17ae9 100644
                          colorFb->lastWriteType = Framebuffer::Type::Color;
                          colorFb->lastWriteFmt = colorImg.fmt;
                          colorFb->lastWriteTimestamp = writeTimestamp;
-@@ -842,12 +937,83 @@ namespace RT64 {
+@@ -842,12 +934,83 @@ namespace RT64 {
              framebufferRenderer->waitForUploaders();
              ext.workloadGraphicsWorker->execute();
              ext.workloadGraphicsWorker->wait();
@@ -16797,7 +17138,7 @@ index 5a331aa..ac17ae9 100644
  
              // Indicate to the texture cache it's safe to delete the textures if no locks are active.
              ext.textureCache->decrementLock();
-@@ -866,7 +1032,7 @@ namespace RT64 {
+@@ -866,7 +1029,7 @@ namespace RT64 {
  
      void WorkloadQueue::threadAdvanceBarrier() {
          std::scoped_lock<std::mutex> cursorLock(cursorMutex);
@@ -16806,7 +17147,7 @@ index 5a331aa..ac17ae9 100644
      }
  
      void WorkloadQueue::threadAdvanceWorkloadId(uint64_t newWorkloadId) {
-@@ -882,12 +1048,26 @@ namespace RT64 {
+@@ -882,12 +1045,29 @@ namespace RT64 {
          Thread::setCurrentThreadName("RT64 Workload");
  
          WorkloadConfiguration workloadConfig;
@@ -16831,6 +17172,9 @@ index 5a331aa..ac17ae9 100644
 +        uint64_t wcwPendingRunSerial = 0;
 +        uint32_t wcwPendingRunAddr = 0;
 +        uint32_t wcwPendingFrames = 0; // generated frames the pending run will make available
++        // The pending run's layer count so far, and the length of the run before it (WcwLogic::publishShortRun).
++        uint32_t wcwPendingRunLength = 0;
++        uint32_t wcwPendingPrevRunLength = 0;
 +        // True once any layer of the current run has skipped its generated frame.
 +        bool wcwRunGenIncomplete = false;
          while (threadsRunning) {
@@ -17193,7 +17537,7 @@ index 5a331aa..ac17ae9 100644
                      assert((displayFrames > 0) && "At least one display frame must be generated.");
                  }
                  else if (workload.viOriginalRate > 0) {
-@@ -1022,16 +1474,48 @@ namespace RT64 {
+@@ -1022,16 +1474,63 @@ namespace RT64 {
                  
                  // Get the current and previous set of frame counters. The other set can be in use by the present queue. Skip if no new present event has arrived before this workload event.
                  InterpolatedFrameCounters &prevFrameCounters = ext.sharedResources->interpolatedFrames[ext.sharedResources->interpolatedFramesIndex];
@@ -17206,12 +17550,27 @@ index 5a331aa..ac17ae9 100644
 +                // [wcw fix] A new run has started (or this workload won't generate), so the pending run is
 +                // complete: publish its generated frame now.
 +                if (wcwInterpFlushPending && (useDifferentCounters || !generateInterpolatedFrames)) {
++                    // [wcw fix] A run that ended shorter than the one before it is missing layers: drop its generated
++                    // frame (the real frame shows instead) rather than publish a frame without them.
++                    const bool wcwPublishPending = WcwLogic::publishShortRun(wcwPendingRunLength, wcwPendingPrevRunLength);
++                    static const bool wcwRunLog = getenv("WCW_RUN_LOG") != nullptr;
++                    if (wcwRunLog) {
++                        fprintf(stderr, "[wcw run] t=%.3f present %llu serial %llu PENDING-FLUSH of serial %llu (%s) layer %u gen %d\n",
++                            std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(),
++                            (unsigned long long)workload.presentId, (unsigned long long)workload.wcwRunSerial, (unsigned long long)wcwPendingRunSerial,
++                            useDifferentCounters ? "new present" : "non-generating workload", wcwCompositeRunLength, generateInterpolatedFrames ? 1 : 0);
++                    }
 +                    {
 +                        std::scoped_lock<std::mutex> managerLock(ext.sharedResources->interpolatedMutex);
 +                        InterpolatedFrameCounters &wcwFlushCounters = ext.sharedResources->interpolatedFrames[wcwInterpFlushIndex];
-+                        wcwFlushCounters.available = std::max(wcwFlushCounters.available, wcwPendingFrames);
-+                        RT64::wcwAddrSlotComplete[(wcwPendingRunAddr >> 10) & 3].store(wcwPendingRunSerial, std::memory_order_relaxed);
-+                        RT64::wcwSlotRealComplete[wcwPendingRunSerial % 3].store(wcwPendingRunSerial, std::memory_order_relaxed);
++                        if (wcwPublishPending) {
++                            wcwFlushCounters.available = std::max(wcwFlushCounters.available, wcwPendingFrames);
++                            RT64::wcwAddrSlotComplete[(wcwPendingRunAddr >> 10) & 3].store(wcwPendingRunSerial, std::memory_order_relaxed);
++                            RT64::wcwSlotRealComplete[wcwPendingRunSerial % 3].store(wcwPendingRunSerial, std::memory_order_relaxed);
++                        }
++                        else {
++                            wcwFlushCounters.skipped = true;
++                        }
 +                    }
 +
 +                    ext.sharedResources->interpolatedCondition.notify_all();
@@ -17244,7 +17603,7 @@ index 5a331aa..ac17ae9 100644
                          return (prevFrameCounters.presented == 0) || (prevFrameCounters.presented >= prevFrameCounters.available);
                      });
                  }
-@@ -1043,7 +1527,11 @@ namespace RT64 {
+@@ -1043,7 +1542,11 @@ namespace RT64 {
                  curFrameCounters.count = displayFrames;
  
                  // Create as many render targets as required to store the interpolated targets.
@@ -17257,7 +17616,7 @@ index 5a331aa..ac17ae9 100644
                  const bool usingMSAA = (ext.sharedResources->renderTargetManager.multisampling.sampleCount > 1);
                  const bool usesHDR = ext.sharedResources->renderTargetManager.usesHDR;
                  uint32_t requiredFrames = (usingMSAA && generateInterpolatedFrames) ? displayFrames : (displayFrames - 1);
-@@ -1061,18 +1549,31 @@ namespace RT64 {
+@@ -1061,18 +1564,31 @@ namespace RT64 {
                  const int64_t maxTimePerFrameMicro = adjustedTimeWindowMicro / displayFrames;
                  bool skippedFrames = false;
                  bool skipWorkloadNow = false;
@@ -17291,7 +17650,7 @@ index 5a331aa..ac17ae9 100644
                              continue;
                          }
                      }
-@@ -1080,23 +1581,16 @@ namespace RT64 {
+@@ -1080,23 +1596,16 @@ namespace RT64 {
                      RenderTarget *overrideTarget = nullptr;
                      uint32_t overrideModifier = 0;
                      if (generateInterpolatedFrames) {
@@ -17321,7 +17680,7 @@ index 5a331aa..ac17ae9 100644
  
                              targetIndex++;
                          }
-@@ -1120,6 +1614,19 @@ namespace RT64 {
+@@ -1120,6 +1629,19 @@ namespace RT64 {
                      threadRenderFrame(curFrame, prevFrame, workloadConfig, workload.debuggerRenderer, workload.debuggerCamera, curFrameWeight, prevFrameWeight, deltaTimeMs,
                          interpolationTargetKey, interpolationTargetFbPairIndex, overrideTarget, overrideModifier, velocityUploaderUsed, uploadExtras, tileInterpolationUsed, lookAtInterpolationUsed);
  
@@ -17341,7 +17700,7 @@ index 5a331aa..ac17ae9 100644
                      // Add total time the frame took to render.
                      renderTimeTotalMicro += workloadTimer.elapsedMicroseconds() - renderTimeMicro;
  
-@@ -1132,18 +1639,61 @@ namespace RT64 {
+@@ -1132,18 +1654,72 @@ namespace RT64 {
                      if (generateInterpolatedFrames && (usingMSAA || (frame > 0))) {
                          {
                              std::scoped_lock<std::mutex> cursorLock(cursorMutex);
@@ -17389,6 +17748,15 @@ index 5a331aa..ac17ae9 100644
 +                            }
 +                        }
 +
++                        // [wcw hfr] WCW_RUN_LOG=1: one line per layer's generated frame (flicker hunting).
++                        static const bool wcwRunLog = getenv("WCW_RUN_LOG") != nullptr;
++                        if (wcwRunLog) {
++                            fprintf(stderr, "[wcw run] t=%.3f present %llu serial %llu layer %u/%u addr %06X frame %u/%u %s\n",
++                                std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(),
++                                (unsigned long long)workload.presentId, (unsigned long long)workload.wcwRunSerial, wcwCompositeRunLength, wcwExpectedRunLen,
++                                interpolationTargetKey.address & 0xFFFFFF, frame, displayFrames, wcwDropNow ? "DROP" : (wcwFlushNow ? "FLUSH" : "pending"));
++                        }
++
 +                        if (wcwFlushNow || wcwDropNow) {
 +                            wcwInterpFlushPending = false;
 +                        }
@@ -17398,6 +17766,8 @@ index 5a331aa..ac17ae9 100644
 +                            wcwPendingRunSerial = workload.wcwRunSerial;
 +                            wcwPendingRunAddr = interpolationTargetKey.address;
 +                            wcwPendingFrames = usingMSAA ? (frame + 1) : frame;
++                            wcwPendingRunLength = wcwCompositeRunLength;
++                            wcwPendingPrevRunLength = wcwLastCompositeRunLength;
                          }
  
                          // Add the amount of display ticks that correspond to the remaining frames.
@@ -17407,7 +17777,7 @@ index 5a331aa..ac17ae9 100644
                          }
  
                          ext.sharedResources->interpolatedCondition.notify_all();
-@@ -1162,6 +1712,64 @@ namespace RT64 {
+@@ -1162,6 +1738,64 @@ namespace RT64 {
                      ext.sharedResources->interpolatedCondition.notify_all();
                  }
  
@@ -18490,19 +18860,27 @@ index 0000000..9f63d18
 +    };
 +};
 diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
-index 9fae0d4..d899e08 100644
+index 9fae0d4..ff6ed78 100644
 --- a/src/render/rt64_framebuffer_renderer.cpp
 +++ b/src/render/rt64_framebuffer_renderer.cpp
-@@ -4,6 +4,8 @@
+@@ -3,11 +3,16 @@
+ //
  
  #include "rt64_framebuffer_renderer.h"
- 
-+#include <cfloat>
++#include "rt64_wcw_texture_edges.h"
 +
++#include <cfloat>
++#include <cstring>
+ 
  #include "../include/rt64_extended_gbi.h"
  
  #include "common/rt64_elapsed_timer.h"
-@@ -50,6 +52,102 @@ namespace interop {
+ #include "common/rt64_math.h"
++#include "common/rt64_wcw_logic.h"
+ #include "hle/rt64_color_converter.h"
+ #include "gbi/rt64_f3d.h"
+ #include "shared/rt64_framebuffer_params.h"
+@@ -50,6 +55,102 @@ namespace interop {
  };
  
  namespace RT64 {
@@ -18605,7 +18983,155 @@ index 9fae0d4..d899e08 100644
      // Helper functions.
      
      RenderRect convertFixedRect(FixedRect rect, hlslpp::float2 resScale, int32_t fbWidth, float aspectRatioScale, float extOriginPercentage, int32_t horizontalMisalignment, uint16_t leftOrigin, uint16_t rightOrigin) {
-@@ -152,6 +250,12 @@ namespace RT64 {
+@@ -113,6 +214,142 @@ namespace RT64 {
+         return RenderViewport(left, top, right - left, bottom - top);
+     }
+ 
++    // [wcw] HUD Placement without G_EX tags. A projection drawn with the wide viewport (same test as the draw loop's
++    // useWideViewport).
++    static bool wcwHudWideProjection(const FramebufferPair &fbPair, const DrawData &drawData, const Projection &proj) {
++        if (!proj.usesViewport()) {
++            return false;
++        }
++
++        const int16_t *clipRatios = &drawData.viewportClipRatios[proj.transformsIndex * 4];
++        const FixedRect rect = proj.scissorRect.intersection(drawData.rspViewports[proj.transformsIndex].rect(clipRatios));
++        const bool coversWholeWidth = !rect.isEmpty() && (rect.ulx <= fbPair.scissorRect.ulx) && (rect.lrx >= fbPair.scissorRect.lrx);
++        const bool horizontalRatio = !rect.isEmpty() && (rect.width(true, true) > rect.height(true, true));
++        return (drawData.viewportOrigins[proj.transformsIndex] == G_EX_ORIGIN_NONE) && coversWholeWidth && horizontalRatio;
++    }
++
++    // [wcw] Anchors for the 2D draws a pass makes after its widened 3D scene (WcwLogic::hudAnchors): texrects and fill
++    // rects that don't span the scissor's width, and triangles whose forced matrix has no perspective (every vertex at
++    // w = 1: the classification the interpolation code uses for screen-space draws) in wide projections. Draws before
++    // the scene (backdrops), passes without a 3D scene (menus, 2D screens), tagged rects and tile copies keep their
++    // place. anchors[callBase[pr] + d] is projection pr's call d.
++    static void wcwHudPlacementAnchors(const FramebufferPair &fbPair, const DrawData &drawData, float fbWidth, std::vector<uint32_t> &callBase, std::vector<WcwLogic::HudAnchor> &anchors) {
++        callBase.clear();
++        anchors.clear();
++        uint32_t callTotal = 0;
++        for (uint32_t pr = 0; pr < fbPair.projectionCount; pr++) {
++            callBase.push_back(callTotal);
++            callTotal += fbPair.projections[pr].gameCallCount;
++        }
++
++        anchors.assign(callTotal, WcwLogic::HudAnchor::Centre);
++
++        const size_t vertexTotal = std::min(drawData.posTransformed.size(), drawData.posScreen.size());
++        std::vector<WcwLogic::HudBox> boxes;
++        std::vector<uint32_t> boxCalls;
++        bool sceneDrawn = false;
++        for (uint32_t pr = 0; pr < fbPair.projectionCount; pr++) {
++            const Projection &proj = fbPair.projections[pr];
++            if (proj.scissorRect.isNull()) {
++                continue;
++            }
++
++            const bool rectProj = (proj.type == Projection::Type::Rectangle);
++            const bool triProj = (proj.type == Projection::Type::Perspective) || (proj.type == Projection::Type::Orthographic);
++            const bool wideProj = triProj && wcwHudWideProjection(fbPair, drawData, proj);
++            for (uint32_t d = 0; d < proj.gameCallCount; d++) {
++                const GameCall &call = proj.gameCalls[d];
++                if (rectProj) {
++                    const FixedRect &rect = call.callDesc.rect;
++                    if (!sceneDrawn || rect.isNull() || (call.callDesc.rectLeftOrigin != G_EX_ORIGIN_NONE) || (call.callDesc.rectRightOrigin != G_EX_ORIGIN_NONE) ||
++                        (call.callDesc.rectAspect != G_EX_ASPECT_AUTO) || ((rect.ulx <= fbPair.scissorRect.ulx) && (rect.lrx >= fbPair.scissorRect.lrx)))
++                    {
++                        continue;
++                    }
++
++                    bool tileCopiesUsed = false;
++                    for (uint32_t t = 0; (t < call.callDesc.tileCount) && !tileCopiesUsed; t++) {
++                        tileCopiesUsed = drawData.callTiles[call.callDesc.tileIndex + t].tileCopyUsed;
++                    }
++
++                    if (tileCopiesUsed) {
++                        continue;
++                    }
++
++                    boxes.push_back({ rect.ulx / 4.0f, rect.uly / 4.0f, rect.lrx / 4.0f, rect.lry / 4.0f });
++                    boxCalls.push_back(callBase[pr] + d);
++                }
++                else if (triProj) {
++                    if ((call.callDesc.extendedType != DrawExtendedType::None) || (call.callDesc.triangleCount == 0) || (call.callDesc.otherMode.cycleType() == G_CYC_FILL)) {
++                        continue;
++                    }
++
++                    bool flat = true;
++                    bool valid = true;
++                    WcwLogic::HudBox box = { FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX };
++                    for (uint32_t i = 0; i < call.callDesc.triangleCount * 3; i++) {
++                        const size_t faceIndex = size_t(call.meshDesc.faceIndicesStart) + i;
++                        if (faceIndex >= drawData.faceIndices.size()) {
++                            valid = false;
++                            break;
++                        }
++
++                        const uint32_t v = drawData.faceIndices[faceIndex];
++                        if (v >= vertexTotal) {
++                            valid = false;
++                            break;
++                        }
++
++                        if (std::abs(float(drawData.posTransformed[v].w) - 1.0f) >= 1e-4f) {
++                            flat = false;
++                            break;
++                        }
++
++                        const hlslpp::float3 &screen = drawData.posScreen[v];
++                        box.left = std::min(box.left, float(screen.x));
++                        box.right = std::max(box.right, float(screen.x));
++                        box.top = std::min(box.top, float(screen.y));
++                        box.bottom = std::max(box.bottom, float(screen.y));
++                    }
++
++                    if (!valid) {
++                        continue;
++                    }
++
++                    if (!flat) {
++                        sceneDrawn = sceneDrawn || wideProj;
++                        continue;
++                    }
++
++                    if (sceneDrawn && wideProj) {
++                        boxes.push_back(box);
++                        boxCalls.push_back(callBase[pr] + d);
++                    }
++                }
++            }
++        }
++
++        if (boxes.empty()) {
++            return;
++        }
++
++        const std::vector<WcwLogic::HudAnchor> boxAnchors = WcwLogic::hudAnchors(boxes, 0.0f, fbWidth);
++        for (size_t b = 0; b < boxes.size(); b++) {
++            anchors[boxCalls[b]] = boxAnchors[b];
++        }
++
++        // WCW_HUD_LOG=1: the 2D draws found after the scene and their anchors, every 300th pass that has any.
++        static const bool wcwHudLog = getenv("WCW_HUD_LOG") != nullptr;
++        static uint32_t wcwHudLogCount = 0;
++        if (wcwHudLog && ((wcwHudLogCount++ % 300) == 0)) {
++            fprintf(stderr, "[wcw hud] fb width %.0f: %zu 2D draws after the scene\n", fbWidth, boxes.size());
++            for (size_t b = 0; (b < boxes.size()) && (b < 48); b++) {
++                const char *anchorName = (boxAnchors[b] == WcwLogic::HudAnchor::Left) ? "left" : ((boxAnchors[b] == WcwLogic::HudAnchor::Right) ? "right" : "centre");
++                fprintf(stderr, "[wcw hud]   (%.1f,%.1f)-(%.1f,%.1f) %s\n", boxes[b].left, boxes[b].top, boxes[b].right, boxes[b].bottom, anchorName);
++            }
++        }
++    }
++
+     hlslpp::float3 viewPositionFrom(hlslpp::float4x4 viewI) {
+         return viewI[3].xyz;
+     }
+@@ -148,10 +385,17 @@ namespace RT64 {
+         frameParams.frameCount = 0;
+         frameParams.viewUbershaders = false;
+         frameParams.ditherNoiseStrength = 1.0f;
++        frameParams.wcwSmooth2DEdges = 0;
+ 
          shaderUploader = std::make_unique<BufferUploader>(worker->device);
          descCommonSet = std::make_unique<FramebufferRendererDescriptorCommonSet>(shaderLibrary->samplerLibrary, worker->device->getCapabilities().raytracing, worker->device);
  
@@ -18618,7 +19144,7 @@ index 9fae0d4..d899e08 100644
  #   if RT_ENABLED
          if (rtSupport) {
              this->rtSupport = rtSupport;
-@@ -172,6 +276,10 @@ namespace RT64 {
+@@ -172,8 +416,13 @@ namespace RT64 {
          hitGroupVector.clear();
          renderIndicesVector.clear();
          rspSmoothNormalVector.clear();
@@ -18628,8 +19154,11 @@ index 9fae0d4..d899e08 100644
 +
          frameParams.viewUbershaders = ubershadersVisible;
          frameParams.ditherNoiseStrength = ditherNoiseStrength;
++        frameParams.wcwSmooth2DEdges = WcwTextureEdges::smooth() ? 1u : 0u;
          framebufferCount = 0;
-@@ -484,6 +592,10 @@ namespace RT64 {
+ 
+         // Create dummy color target if it hasn't been created yet.
+@@ -484,6 +733,10 @@ namespace RT64 {
              worker->commandList->setGraphicsDescriptorSet(descTextureSet->get(), 1);
              worker->commandList->setGraphicsDescriptorSet(descTextureSet->get(), 2);
              worker->commandList->setGraphicsDescriptorSet(depthState ? descRealFbSet : descDummyFbSet, 3);
@@ -18640,7 +19169,7 @@ index 9fae0d4..d899e08 100644
              worker->commandList->setViewports(framebuffer.viewport);
          };
  
-@@ -546,6 +658,16 @@ namespace RT64 {
+@@ -546,6 +799,16 @@ namespace RT64 {
                  assert(triangles.pipeline != nullptr);
  
                  // Draw calls can sometimes end up with empty scissors and cause validation errors. We just skip them.
@@ -18657,7 +19186,7 @@ index 9fae0d4..d899e08 100644
                  if (triangles.scissor.isEmpty()) {
                      continue;
                  }
-@@ -576,6 +698,12 @@ namespace RT64 {
+@@ -576,6 +839,12 @@ namespace RT64 {
                  rasterParams.screenOffset = triangles.screenOffset;
                  worker->commandList->setGraphicsPushConstants(0, &rasterParams);
  
@@ -18670,7 +19199,7 @@ index 9fae0d4..d899e08 100644
                  drawCallTriangles(drawCall);
  
                  // Simulate dither noise.
-@@ -1206,6 +1334,10 @@ namespace RT64 {
+@@ -1206,6 +1475,10 @@ namespace RT64 {
              vertexProcessor->recordCommandList(worker, shaderLibrary, outputBuffers);
          }
  
@@ -18681,7 +19210,7 @@ index 9fae0d4..d899e08 100644
  #   if RT_ENABLED
          if (rtEnabled) {
              assert(rtResources != nullptr);
-@@ -1249,6 +1381,7 @@ namespace RT64 {
+@@ -1249,6 +1522,7 @@ namespace RT64 {
          worker->commandList->barriers(RenderBarrierStage::GRAPHICS, startBarriers);
  
          bool depthState = false;
@@ -18689,7 +19218,7 @@ index 9fae0d4..d899e08 100644
          worker->commandList->setFramebuffer(targetDrawCall.fbStorage->colorDepthWrite.get());
          for (const auto &pair : targetDrawCall.sceneIndices) {
  #       if RT_ENABLED
-@@ -1298,6 +1431,13 @@ namespace RT64 {
+@@ -1298,6 +1572,13 @@ namespace RT64 {
                  submitDepthAccess(worker, targetDrawCall.fbStorage, false, depthState);
                  submitRasterScene(worker, framebuffer, targetDrawCall.fbStorage, rasterScene, depthState);
              }
@@ -18703,7 +19232,7 @@ index 9fae0d4..d899e08 100644
          }
      }
  
-@@ -1430,10 +1570,16 @@ namespace RT64 {
+@@ -1430,10 +1711,20 @@ namespace RT64 {
  
          targetDrawCall.fbStorage = p.fbStorage;
          targetDrawCall.sceneIndices.clear();
@@ -18716,15 +19245,39 @@ index 9fae0d4..d899e08 100644
 +        // p.aspectRatioSource (now the 4:3 display ratio). The scissor is in fb pixels,
 +        // so "covers the whole screen" means it matches the fb's dimensions — identical
 +        // for square-pixel games (320x240), required for WCW's anamorphic 480x240 fb.
-+        const float fbPixelRatio = (p.fbHeight > 0) ? (static_cast<float>(p.fbWidth) / static_cast<float>(p.fbHeight)) : p.aspectRatioSource;
-+        const bool adjustRatio = (abs((scissorRatio / fbPixelRatio) - 1.0f) < SimilarityPercentage);
++        // [wcw fix] Also when the scissor spans the fb's full width and at least its height: RT64 sizes the fb from
++        // what was drawn, so a 480x240 screen measured 480x196 in some passes, failed the ratio test there and was
++        // stretched instead of aspect-corrected (No Mercy's story dialog text jumped; WcwLogic::framebufferPassCoversScreen).
++        const bool adjustRatio = (p.fbHeight > 0) ?
++            WcwLogic::framebufferPassCoversScreen(fbPair.scissorRect.width(false, true), fbPair.scissorRect.height(false, true), int32_t(p.fbWidth), int32_t(p.fbHeight)) :
++            (abs((scissorRatio / p.aspectRatioSource) - 1.0f) < SimilarityPercentage);
          const float aspectRatioScale = adjustRatio ? (p.aspectRatioTarget / p.aspectRatioSource) : 1.0f;
          InstanceDrawCall instanceDrawCall;
          interop::RenderIndices renderIndices;
-@@ -1506,6 +1652,34 @@ namespace RT64 {
+@@ -1450,6 +1741,17 @@ namespace RT64 {
+         uint32_t vertexTestZFaceIndicesStart = 0;
+         int32_t vertexTestZCallIndex = -1;
+         RenderViewport viewportClip;
++
++        // [wcw] HUD Placement without G_EX tags: 2D elements after the 3D scene anchor to the window edges.
++        // WCW_HUD_PLACEMENT=0 turns it off.
++        static const bool wcwHudDisabled = (getenv("WCW_HUD_PLACEMENT") != nullptr) && (strcmp(getenv("WCW_HUD_PLACEMENT"), "0") == 0);
++        const float wcwCentredWidth = (wideWidth > 0.0f) ? (originalWidth / wideWidth) : 1.0f;
++        const bool wcwHudActive = !wcwHudDisabled && WcwLogic::hudPlacementActive(wcwCentredWidth, extOriginPercentage);
++        std::vector<uint32_t> wcwHudCallBase;
++        std::vector<WcwLogic::HudAnchor> wcwHudAnchorList;
++        if (wcwHudActive) {
++            wcwHudPlacementAnchors(fbPair, drawData, float(p.fbWidth), wcwHudCallBase, wcwHudAnchorList);
++        }
+         for (uint32_t pr = 0; (pr < fbPair.projectionCount) && (globalCallIndex < p.maxGameCall); pr++) {
+             const Projection &proj = fbPair.projections[pr];
+             if (proj.scissorRect.isNull()) {
+@@ -1506,8 +1808,43 @@ namespace RT64 {
                  viewportClip = convertViewportRect(viewport.rect(viewportClipRatios), p.resolutionScale, p.fbWidth, projInvRatioScale, extOriginPercentage, 0.0f, viewportOrigin, viewportOrigin);
              }
  
++            const float wcwProjScreenOffsetX = triangles.screenOffset.x;
++
 +            // [wcw rt] The first perspective projection becomes the traced scene. (AKI games draw
 +            // without the Z-buffer, back to front, so depth writes can't identify the 3D scene.)
 +            const bool wcwRtProj = (wcwRaytracer != nullptr) && wcwRaytracer->wantsScene() && (proj.type == Projection::Type::Perspective) &&
@@ -18755,8 +19308,24 @@ index 9fae0d4..d899e08 100644
 +
              for (uint32_t d = 0; (d < proj.gameCallCount) && (globalCallIndex < p.maxGameCall); d++) {
                  const GameCall &call = proj.gameCalls[d];
++                const WcwLogic::HudAnchor wcwHudAnchor = wcwHudActive ? wcwHudAnchorList[wcwHudCallBase[pr] + d] : WcwLogic::HudAnchor::Centre;
++                const bool wcwHudAnchored = (wcwHudAnchor != WcwLogic::HudAnchor::Centre);
++                const uint16_t wcwHudOrigin = (wcwHudAnchor == WcwLogic::HudAnchor::Left) ? uint16_t(G_EX_ORIGIN_LEFT) : uint16_t(G_EX_ORIGIN_RIGHT);
++                const uint16_t rectLeftOrigin = wcwHudAnchored ? wcwHudOrigin : call.callDesc.rectLeftOrigin;
++                const uint16_t rectRightOrigin = wcwHudAnchored ? wcwHudOrigin : call.callDesc.rectRightOrigin;
                  renderIndices.instanceIndex = call.callDesc.callIndex;
-@@ -1607,6 +1781,8 @@ namespace RT64 {
+                 renderIndices.faceIndicesStart = call.meshDesc.faceIndicesStart;
+                 renderIndices.rdpTileIndex = call.callDesc.tileIndex;
+@@ -1547,7 +1884,7 @@ namespace RT64 {
+                         horizontalMisalignment = int32_t(p.horizontalMisalignment);
+                     }
+ 
+-                    clearRect.rect = convertFixedRect(call.callDesc.rect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, horizontalMisalignment, call.callDesc.rectLeftOrigin, call.callDesc.rectRightOrigin);
++                    clearRect.rect = convertFixedRect(call.callDesc.rect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, horizontalMisalignment, rectLeftOrigin, rectRightOrigin);
+                 }
+                 else if (call.callDesc.extendedType != DrawExtendedType::None) {
+                     switch (call.callDesc.extendedType) {
+@@ -1607,6 +1944,8 @@ namespace RT64 {
                      {
                          triangles.shaderDesc = call.shaderDesc;
  
@@ -18765,7 +19334,7 @@ index 9fae0d4..d899e08 100644
                          RasterShader *gpuShader = p.ubershadersOnly ? nullptr : p.rasterShaderCache->getGPUShader(call.shaderDesc);
                          if (gpuShader != nullptr) {
                              triangles.pipeline = gpuShader->pipeline.get();
-@@ -1618,6 +1794,12 @@ namespace RT64 {
+@@ -1618,6 +1957,12 @@ namespace RT64 {
                                  !copyMode && call.shaderDesc.otherMode.zUpd(),
                                  (call.shaderDesc.otherMode.cvgDst() == CVG_DST_WRAP) || (call.shaderDesc.otherMode.cvgDst() == CVG_DST_SAVE));
                          }
@@ -18778,10 +19347,37 @@ index 9fae0d4..d899e08 100644
                          
                          triangles.faceCount = call.callDesc.triangleCount;
                          triangles.vertexTestZ = (vertexTestZCallIndex >= 0);
-@@ -1676,6 +1858,105 @@ namespace RT64 {
+@@ -1631,6 +1976,7 @@ namespace RT64 {
+                             instanceDrawCall.type = InstanceDrawCall::Type::IndexedTriangles;
+                             triangles.indexStart = triangles.vertexTestZ ? vertexTestZFaceIndicesStart : call.meshDesc.faceIndicesStart;
+                             invRatioScale = projInvRatioScale;
++                            triangles.screenOffset.x = wcwProjScreenOffsetX + WcwLogic::hudShiftNdc(wcwHudAnchor, wcwCentredWidth, extOriginPercentage);
+                             break;
+                         }
+                         case Projection::Type::Rectangle: {
+@@ -1643,7 +1989,7 @@ namespace RT64 {
+                             }
+ 
+                             // The call's scissor spans the whole width of the framebuffer pair scissor. The rect must not be using extended origins.
+-                            const bool regularOrigins = (call.callDesc.rectLeftOrigin == G_EX_ORIGIN_NONE) && (call.callDesc.rectRightOrigin == G_EX_ORIGIN_NONE);
++                            const bool regularOrigins = (rectLeftOrigin == G_EX_ORIGIN_NONE) && (rectRightOrigin == G_EX_ORIGIN_NONE);
+                             const bool coversScissorWidth = regularOrigins && (call.callDesc.rect.ulx <= fbPair.scissorRect.ulx) && (call.callDesc.rect.lrx >= fbPair.scissorRect.lrx);
+                             if ((tileCopiesUsed || coversScissorWidth || call.callDesc.rectAspect == G_EX_ASPECT_STRETCH) && (call.callDesc.rectAspect != G_EX_ASPECT_ADJUST)) {
+                                 invRatioScale = 1.0f;
+@@ -1652,7 +1998,7 @@ namespace RT64 {
+                                 horizontalMisalignment = p.horizontalMisalignment;
+                             }
+ 
+-                            RenderViewport viewportRect = convertViewportRect(call.callDesc.rect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, horizontalMisalignment, call.callDesc.rectLeftOrigin, call.callDesc.rectRightOrigin);
++                            RenderViewport viewportRect = convertViewportRect(call.callDesc.rect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, horizontalMisalignment, rectLeftOrigin, rectRightOrigin);
+                             triangles.screenScale = { viewportRect.width / framebuffer.viewport.width, viewportRect.height / framebuffer.viewport.height };
+                             triangles.screenOffset.x = halfPixelOffset.x + ((viewportRect.x + viewportRect.width / 2.0f) - halfViewportSize.x) / halfViewportSize.x;
+                             triangles.screenOffset.y = halfPixelOffset.y + (halfViewportSize.y - (viewportRect.y + viewportRect.height / 2.0f)) / halfViewportSize.y;
+@@ -1676,7 +2022,109 @@ namespace RT64 {
                              break;
                          }
  
+-                        triangles.scissor = convertFixedRect(call.callDesc.scissorRect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, int32_t(horizontalMisalignment), call.callDesc.scissorLeftOrigin, call.callDesc.scissorRightOrigin);
 +                        // WCW_RT_DUMP also lists the draws the translucency filter leaves out.
 +                        if (wcwRtProj && (call.callDesc.triangleCount > 0) && wcwBlendsWithMemory(call.callDesc.otherMode)) {
 +                            static const int wcwDumpExcludedAt = getenv("WCW_RT_DUMP") ? atoi(getenv("WCW_RT_DUMP")) : -1;
@@ -18881,10 +19477,14 @@ index 9fae0d4..d899e08 100644
 +                            }
 +                        }
 +
-                         triangles.scissor = convertFixedRect(call.callDesc.scissorRect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, int32_t(horizontalMisalignment), call.callDesc.scissorLeftOrigin, call.callDesc.scissorRightOrigin);
++                        // [wcw] An anchored rect's scissor moves with it (a centred 4:3 scissor would cut it off).
++                        const bool wcwHudRectScissor = wcwHudAnchored && (proj.type == Projection::Type::Rectangle);
++                        triangles.scissor = convertFixedRect(call.callDesc.scissorRect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, int32_t(horizontalMisalignment),
++                            wcwHudRectScissor ? wcwHudOrigin : call.callDesc.scissorLeftOrigin, wcwHudRectScissor ? wcwHudOrigin : call.callDesc.scissorRightOrigin);
  
                          bool usesViewport = (proj.type == Projection::Type::Perspective) || (proj.type == Projection::Type::Orthographic);
-@@ -1746,12 +2027,42 @@ namespace RT64 {
+                         if (usesViewport) {
+@@ -1746,12 +2194,42 @@ namespace RT64 {
                  else 
  #           endif
                  {
@@ -19251,6 +19851,87 @@ index 0000000..2cb4561
 +        static RenderFormat swapChainFormat();
 +    };
 +};
+diff --git a/src/render/rt64_projection_processor.cpp b/src/render/rt64_projection_processor.cpp
+index e842dcc..dc0960c 100644
+--- a/src/render/rt64_projection_processor.cpp
++++ b/src/render/rt64_projection_processor.cpp
+@@ -5,6 +5,7 @@
+ #include "rt64_projection_processor.h"
+ 
+ #include "common/rt64_math.h"
++#include "common/rt64_wcw_logic.h"
+ #include "hle/rt64_workload_queue.h"
+ 
+ namespace RT64 {
+@@ -39,6 +40,7 @@ namespace RT64 {
+             drawData.prevViewTransforms = drawData.viewTransforms;
+             drawData.prevProjTransforms = drawData.projTransforms;
+             drawData.prevViewProjTransforms = drawData.viewProjTransforms;
++            drawData.projRatioScales.assign(drawData.viewProjTransforms.size(), 1.0f);
+         }
+ 
+         for (size_t s = 0; s < p.curFrame->perspectiveScenes.size(); s++) {
+@@ -48,6 +50,39 @@ namespace RT64 {
+         for (size_t s = 0; s < p.curFrame->orthographicScenes.size(); s++) {
+             processScene(p, p.curFrame->orthographicScenes[s], s);
+         }
++
++        // [wcw fix] Screen-position modifies (G_MWO_POINT_XYSCREEN) bypass the projection, so give them the same x
++        // compression as their projection got (WcwLogic::modifiedScreenXYForAspect), from the unmodified values every
++        // frame (this runs for every displayed frame; the source is never changed).
++        for (uint32_t w : p.curFrame->workloads) {
++            Workload &workload = p.workloadQueue->workloads[w];
++            DrawData &drawData = workload.drawData;
++            drawData.modifyPosAdjusted = false;
++            drawData.modifyPosUintsAdjusted = drawData.modifyPosUints;
++            for (size_t i = 0; (i + 1) < drawData.modifyPosUintsAdjusted.size(); i += 2) {
++                const uint32_t key = drawData.modifyPosUintsAdjusted[i];
++                if ((key & 0x1) != 0) {
++                    continue;
++                }
++
++                const uint32_t vertexIndex = key >> 1;
++                if (vertexIndex >= drawData.viewProjIndices.size()) {
++                    continue;
++                }
++
++                const uint32_t transformsIndex = drawData.viewProjIndices[vertexIndex];
++                if ((transformsIndex >= drawData.projRatioScales.size()) || (transformsIndex >= drawData.rspViewports.size())) {
++                    continue;
++                }
++
++                const float ratio = drawData.projRatioScales[transformsIndex];
++                if (ratio != 1.0f) {
++                    drawData.modifyPosUintsAdjusted[i + 1] = WcwLogic::modifiedScreenXYForAspect(drawData.modifyPosUintsAdjusted[i + 1],
++                        drawData.rspViewports[transformsIndex].translate.x, ratio);
++                    drawData.modifyPosAdjusted = true;
++                }
++            }
++        }
+     }
+ 
+     void ProjectionProcessor::processScene(const ProcessParams &p, const GameScene &scene, size_t sceneIndex) {
+@@ -99,6 +134,9 @@ namespace RT64 {
+             }
+  
+             float projRatioScale = adjustAspectRatio ? (1.0f / p.aspectRatioScale) : 1.0f;
++            if (proj.transformsIndex < drawData.projRatioScales.size()) {
++                drawData.projRatioScales[proj.transformsIndex] = projRatioScale; // [wcw fix] for the screen-position modifies
++            }
+             interop::float4x4 &viewMatrix = drawData.modViewTransforms[proj.transformsIndex];
+             interop::float4x4 &projMatrix = drawData.modProjTransforms[proj.transformsIndex];
+             interop::float4x4 &viewProjMatrix = drawData.modViewProjTransforms[proj.transformsIndex];
+@@ -156,6 +194,10 @@ namespace RT64 {
+             DrawBuffers &drawBuffers = workload.drawBuffers;
+             std::pair<size_t, size_t> uploadRange = { 0, drawData.viewProjTransforms.size() };
+             uploads.emplace_back(BufferUploader::Upload{ drawData.modViewProjTransforms.data(), uploadRange, sizeof(interop::float4x4), RenderBufferFlag::STORAGE, { }, &drawBuffers.viewProjTransformsBuffer });
++            if (drawData.modifyPosAdjusted) {
++                std::pair<size_t, size_t> modifyRange = { 0, drawData.modifyPosUintsAdjusted.size() };
++                uploads.emplace_back(BufferUploader::Upload{ drawData.modifyPosUintsAdjusted.data(), modifyRange, sizeof(uint32_t), RenderBufferFlag::FORMATTED, { RenderFormat::R32_UINT }, &drawBuffers.modifyPosUintsAdjustedBuffer });
++            }
+         }
+ 
+         bufferUploader->submit(p.worker, uploads);
 diff --git a/src/render/rt64_raster_shader.cpp b/src/render/rt64_raster_shader.cpp
 index 721a01e..41ee077 100644
 --- a/src/render/rt64_raster_shader.cpp
@@ -19292,6 +19973,22 @@ index 494d99e..d3d406a 100644
 +            }
              return storage;
          }
+ 
+diff --git a/src/render/rt64_rsp_processor.cpp b/src/render/rt64_rsp_processor.cpp
+index 5687b81..de8c4a7 100644
+--- a/src/render/rt64_rsp_processor.cpp
++++ b/src/render/rt64_rsp_processor.cpp
+@@ -50,7 +50,10 @@ namespace RT64 {
+ 
+         const uint32_t modifyCount = drawData.modifyCount();
+         modifyCB.modifyCount = modifyCount;
+-        modifySet->setBuffer(modifySet->srcModifyPos, p.drawBuffers->modifyPosUintsBuffer.get(), p.drawBuffers->modifyPosUintsBuffer.getView(0));
++        // [wcw fix] The ProjectionProcessor's aspect-adjusted copy when Expand changed a modify (see DrawData).
++        const bool useAdjusted = drawData.modifyPosAdjusted && (p.drawBuffers->modifyPosUintsAdjustedBuffer.get() != nullptr);
++        BufferPair &modifyPair = useAdjusted ? p.drawBuffers->modifyPosUintsAdjustedBuffer : p.drawBuffers->modifyPosUintsBuffer;
++        modifySet->setBuffer(modifySet->srcModifyPos, modifyPair.get(), modifyPair.getView(0));
+         modifySet->setBuffer(modifySet->screenPos, p.outputBuffers->screenPosBuffer.buffer.get(), RenderBufferStructuredView(sizeof(float) * 4));
+     }
  
 diff --git a/src/render/rt64_shader_library.cpp b/src/render/rt64_shader_library.cpp
 index d1c5273..39a247f 100644
@@ -20087,10 +20784,10 @@ index 0000000..29fb84f
 +};
 diff --git a/src/render/rt64_wcw_raytracer.cpp b/src/render/rt64_wcw_raytracer.cpp
 new file mode 100644
-index 0000000..5853843
+index 0000000..cf64aa6
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.cpp
-@@ -0,0 +1,1228 @@
+@@ -0,0 +1,1273 @@
 +//
 +// RT64
 +//
@@ -20259,7 +20956,8 @@ index 0000000..5853843
 +        blueNoiseBuffer->unmap();
 +    }
 +
-+    void WcwRaytracer::beginWorkload(uint64_t presentId) {
++    void WcwRaytracer::beginWorkload(uint64_t presentId, float curFrameWeight) {
++        generatedRender = WcwLogic::generatedFrame(curFrameWeight);
 +        if (presentId != lastPresentId) {
 +            finishPresent();
 +            lastPresentId = presentId;
@@ -20594,6 +21292,8 @@ index 0000000..5853843
 +        boundsViewProj = hlslpp::mul(view, proj);
 +        boundsMin[0] = boundsMin[1] = FLT_MAX;
 +        boundsMax[0] = boundsMax[1] = -FLT_MAX;
++        geometryMin[0] = geometryMin[1] = FLT_MAX;
++        geometryMax[0] = geometryMax[1] = -FLT_MAX;
 +        boundsFullScreen = false;
 +        if (presetsStamp == INT64_MIN) {
 +            loadPresets(true);
@@ -20661,7 +21361,8 @@ index 0000000..5853843
 +        }
 +
 +        // Triangles entirely outside the receiver radius only need primary rays where other
-+        // geometry is traced anyway: they don't widen the rect.
++        // geometry is traced anyway: they don't widen the receiver rect (only the geometry rect).
++        bool receiver = true;
 +        if (receiverRadius > 0.0f) {
 +            float minX = FLT_MAX, maxX = -FLT_MAX, minZ = FLT_MAX, maxZ = -FLT_MAX;
 +            for (uint32_t i = 0; i < 3; i++) {
@@ -20673,9 +21374,7 @@ index 0000000..5853843
 +
 +            const float dx = std::max({ minX - receiverCenter[0], 0.0f, receiverCenter[0] - maxX });
 +            const float dz = std::max({ minZ - receiverCenter[1], 0.0f, receiverCenter[1] - maxZ });
-+            if ((dx * dx + dz * dz) > (receiverRadius * receiverRadius)) {
-+                return;
-+            }
++            receiver = (dx * dx + dz * dz) <= (receiverRadius * receiverRadius);
 +        }
 +
 +        // Clip the triangle against the near plane (w > NearW) so vertices behind the camera
@@ -20698,10 +21397,16 @@ index 0000000..5853843
 +            const float w = c.w;
 +            const float px = viewport.x + (float(c.x) / w * 0.5f + 0.5f) * viewport.width;
 +            const float py = viewport.y + (0.5f - float(c.y) / w * 0.5f) * viewport.height;
-+            boundsMin[0] = std::min(boundsMin[0], px);
-+            boundsMin[1] = std::min(boundsMin[1], py);
-+            boundsMax[0] = std::max(boundsMax[0], px);
-+            boundsMax[1] = std::max(boundsMax[1], py);
++            geometryMin[0] = std::min(geometryMin[0], px);
++            geometryMin[1] = std::min(geometryMin[1], py);
++            geometryMax[0] = std::max(geometryMax[0], px);
++            geometryMax[1] = std::max(geometryMax[1], py);
++            if (receiver) {
++                boundsMin[0] = std::min(boundsMin[0], px);
++                boundsMin[1] = std::min(boundsMin[1], py);
++                boundsMax[0] = std::max(boundsMax[0], px);
++                boundsMax[1] = std::max(boundsMax[1], py);
++            }
 +        };
 +
 +        for (uint32_t i = 0; i < 3; i++) {
@@ -20854,7 +21559,7 @@ index 0000000..5853843
 +        // WCW_RT_SCALE the whole scale.
 +        WcwLogic::RtPreset qualityPreset = WcwLogic::rtPreset(quality);
 +        qualityPreset.maxLines = envFloat(getenv("WCW_RT_MAX_LINES"), qualityPreset.maxLines);
-+        const float frameScale = std::clamp(envFloat(getenv("WCW_RT_SCALE"), WcwLogic::rtTraceScale(qualityPreset, colorTarget->height)), 0.1f, 1.0f);
++        const float frameScale = std::clamp(envFloat(getenv("WCW_RT_SCALE"), WcwLogic::rtTraceScale(qualityPreset, colorTarget->height, colorTarget->downsampleMultiplier)), 0.1f, 1.0f);
 +        const uint32_t presetSamples = qualityPreset.samplesPerLight;
 +
 +        // Re-enabled after being off: the histories are stale.
@@ -20924,6 +21629,33 @@ index 0000000..5853843
 +
 +            pipelineDesc.renderTargetBlend[0].renderTargetWriteMask = uint8_t(RenderColorWriteEnable::RED) | uint8_t(RenderColorWriteEnable::GREEN) | uint8_t(RenderColorWriteEnable::BLUE);
 +            compositePipeline = device->createGraphicsPipeline(pipelineDesc);
++        }
++
++        // Frame interpolation: a generated frame composites this pass's latest trace instead of tracing again
++        // (WcwLogic::traceRender). WCW_RT_TRACE_GENERATED=1 traces every displayed frame (the old cost).
++        static const bool traceGenerated = getenv("WCW_RT_TRACE_GENERATED") != nullptr;
++        passTriangleCounts.clear();
++        for (const RenderBottomLevelASMesh &mesh : meshes) {
++            passTriangleCounts.push_back(mesh.indexCount / 3);
++        }
++
++        const uint64_t signature = WcwLogic::passSignature(passTriangleCounts.data(), passTriangleCounts.size());
++        // Outside darkness: which pass darkens the misses is decided for every pass, traced or not, so each
++        // target gets exactly one (WcwLogic::MissDarkening).
++        const bool darkenMisses = missDarkening.darkenThisPass(colorTarget, lastPresentId, meshes.size());
++        const bool haveTrace = WcwLogic::reusableTrace(slot.tracedPresent != UINT64_MAX, slot.tracedSignature, signature, slot.tracedDarkened, darkenMisses);
++        if (!traceGenerated && !WcwLogic::traceRender(generatedRender, haveTrace, slot.reusesSinceTrace)) {
++            memcpy(traceRect, slot.tracedRect, sizeof(traceRect));
++            traceRectEmpty = (traceRect[2] <= traceRect[0]) || (traceRect[3] <= traceRect[1]);
++            compositeSet->setTexture(0, slot.output.get(), RenderTextureLayout::SHADER_READ);
++            slot.reusesSinceTrace++;
++            generatedReuses++;
++            return;
++        }
++
++        if (generatedRender && !traceGenerated) {
++            const uint32_t reason = (slot.tracedPresent == UINT64_MAX) ? 0 : ((slot.tracedSignature != signature) ? 1 : ((slot.tracedDarkened != darkenMisses) ? 2 : 3));
++            generatedTraces[reason]++;
 +        }
 +
 +        // Parameters.
@@ -21088,7 +21820,6 @@ index 0000000..5853843
 +                params.litAreaCount += used ? 1u : 0u;
 +            }
 +        }
-+        const bool darkenMisses = missDarkening.darkenThisPass(colorTarget, lastPresentId, meshes.size());
 +        params.darkenMisses = ((outsideDarkness > 0.0f) && darkenMisses) ? 1u : 0u;
 +
 +        {
@@ -21101,20 +21832,25 @@ index 0000000..5853843
 +            }
 +        }
 +
-+        // Trace only this workload's screen footprint (plus a margin for the bilinear upsample
-+        // and the resolve filters' neighborhoods); the whole screen with outside darkness.
++        // Trace only this workload's screen footprint (plus a margin for the bilinear upsample and the resolve
++        // filters' neighborhoods): WcwLogic::traceArea. WCW_RT_FULL_TRACE=1 traces every pass full screen (the old cost).
++        static const bool fullTrace = getenv("WCW_RT_FULL_TRACE") != nullptr;
 +        const float margin = float(std::max({ 3u, params.shadowFilterRadius + 1, params.aoFilterRadius + 1, params.filterRadius + 1 }));
-+        if (boundsFullScreen || (outsideDarkness > 0.0f)) {
++        const WcwLogic::TraceArea area = WcwLogic::traceArea(darkenMisses, outsideDarkness);
++        if (boundsFullScreen || (area == WcwLogic::TraceArea::FullScreen) || (fullTrace && (outsideDarkness > 0.0f))) {
 +            traceRect[0] = traceRect[1] = 0;
 +            traceRect[2] = traceWidth;
 +            traceRect[3] = traceHeight;
 +        }
 +        else {
 +            const float scale = params.traceScale;
-+            traceRect[0] = uint32_t(std::clamp(std::floor(boundsMin[0] * scale) - margin, 0.0f, float(traceWidth)));
-+            traceRect[1] = uint32_t(std::clamp(std::floor(boundsMin[1] * scale) - margin, 0.0f, float(traceHeight)));
-+            traceRect[2] = uint32_t(std::clamp(std::ceil(boundsMax[0] * scale) + margin, 0.0f, float(traceWidth)));
-+            traceRect[3] = uint32_t(std::clamp(std::ceil(boundsMax[1] * scale) + margin, 0.0f, float(traceHeight)));
++            const bool geometry = (area == WcwLogic::TraceArea::Geometry);
++            const float *rectMin = geometry ? geometryMin : boundsMin;
++            const float *rectMax = geometry ? geometryMax : boundsMax;
++            traceRect[0] = uint32_t(std::clamp(std::floor(rectMin[0] * scale) - margin, 0.0f, float(traceWidth)));
++            traceRect[1] = uint32_t(std::clamp(std::floor(rectMin[1] * scale) - margin, 0.0f, float(traceHeight)));
++            traceRect[2] = uint32_t(std::clamp(std::ceil(rectMax[0] * scale) + margin, 0.0f, float(traceWidth)));
++            traceRect[3] = uint32_t(std::clamp(std::ceil(rectMax[1] * scale) + margin, 0.0f, float(traceHeight)));
 +        }
 +
 +        traceRectEmpty = (traceRect[2] <= traceRect[0]) || (traceRect[3] <= traceRect[1]);
@@ -21136,6 +21872,9 @@ index 0000000..5853843
 +        slot.tracedViewProj = viewProj;
 +        memcpy(slot.tracedRect, traceRect, sizeof(traceRect));
 +        slot.tracedMeshes = uint32_t(meshes.size());
++        slot.reusesSinceTrace = 0;
++        slot.tracedSignature = signature;
++        slot.tracedDarkened = darkenMisses;
 +
 +        params.traceOffset = { traceRect[0], traceRect[1] };
 +        params.traceEnd = { traceRect[2], traceRect[3] };
@@ -21308,10 +22047,13 @@ index 0000000..5853843
 +        fullScreenSum += timingFullScreen ? 1 : 0;
 +        timingWritten = 0;
 +        if (++count == 300) {
-+            fprintf(stderr, "[wcw rt gpu] per traced workload avg: build=%.3f trace=%.3f resolve=%.3f composite=%.3f ms, build->composite span=%.3f (max %.3f) ms; %llu meshes (%llu alpha-tested), %llu tris, %llu trace px of %u lines, %llu full-screen, %u traces reused (300 workloads)\n",
++            fprintf(stderr, "[wcw rt gpu] per traced workload avg: build=%.3f trace=%.3f resolve=%.3f composite=%.3f ms, build->composite span=%.3f (max %.3f) ms; %llu meshes (%llu alpha-tested), %llu tris, %llu trace px of %u lines, %llu full-screen, %u traces reused, %u generated frames reused a trace, traced %u/%u/%u/%u (none/other pass/darkening/stale) (300 workloads)\n",
 +                sums[0] / count, sums[1] / count, sums[2] / count, sums[3] / count, sums[4] / count, maxTotal,
-+                (unsigned long long)(meshSum / count), (unsigned long long)(alphaSum / count), (unsigned long long)(triangleSum / count), (unsigned long long)(pixelSum / count), timingTraceHeight, (unsigned long long)fullScreenSum, reusedTraces);
++                (unsigned long long)(meshSum / count), (unsigned long long)(alphaSum / count), (unsigned long long)(triangleSum / count), (unsigned long long)(pixelSum / count), timingTraceHeight, (unsigned long long)fullScreenSum, reusedTraces, generatedReuses,
++                generatedTraces[0], generatedTraces[1], generatedTraces[2], generatedTraces[3]);
++            memset(generatedTraces, 0, sizeof(generatedTraces));
 +            reusedTraces = 0;
++            generatedReuses = 0;
 +            memset(sums, 0, sizeof(sums));
 +            maxTotal = 0.0;
 +            triangleSum = meshSum = alphaSum = pixelSum = fullScreenSum = 0;
@@ -21321,10 +22063,10 @@ index 0000000..5853843
 +};
 diff --git a/src/render/rt64_wcw_raytracer.h b/src/render/rt64_wcw_raytracer.h
 new file mode 100644
-index 0000000..63fa2b7
+index 0000000..f34f27f
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.h
-@@ -0,0 +1,295 @@
+@@ -0,0 +1,312 @@
 +//
 +// RT64
 +//
@@ -21391,10 +22133,13 @@ index 0000000..63fa2b7
 +        RenderViewport viewport;
 +        bool structuresBuilt = false;
 +
-+        // Screen bounds (color target pixels) of this workload's gathered geometry.
++        // Screen bounds (color target pixels) of this workload's gathered geometry: within the receiver radius
++        // (boundsMin/Max) and all of it (geometryMin/Max). WcwLogic::traceArea picks one.
 +        hlslpp::float4x4 boundsViewProj;
 +        float boundsMin[2] = {};
 +        float boundsMax[2] = {};
++        float geometryMin[2] = {};
++        float geometryMax[2] = {};
 +        bool boundsFullScreen = false;
 +        // Shadows and AO are only cast onto surfaces within receiverRadius (XZ) of the lights'
 +        // center: the ring and ringside. The arena and crowd beyond it only get primary rays,
@@ -21438,6 +22183,12 @@ index 0000000..63fa2b7
 +            hlslpp::float4x4 tracedViewProj;
 +            uint32_t tracedRect[4] = {};
 +            uint32_t tracedMeshes = 0;
++            // Generated frames that composited this trace instead of tracing (WcwLogic::traceRender), and the
++            // traced pass's WcwLogic::passSignature.
++            uint32_t reusesSinceTrace = 0;
++            uint64_t tracedSignature = 0;
++            // The trace darkened the misses (WcwLogic::MissDarkening).
++            bool tracedDarkened = false;
 +        };
 +
 +        Slot slots[MaxSlots];
@@ -21473,6 +22224,13 @@ index 0000000..63fa2b7
 +        std::unique_ptr<RenderTexture> currentAoTexture;
 +        uint32_t frameIndex = 0;
 +        uint32_t reusedTraces = 0;
++        // Traces generated frames skipped (WcwLogic::traceRender), for WCW_GPU_LOG.
++        uint32_t generatedReuses = 0;
++        // Why generated frames traced anyway: no trace in the slot, another pass's trace, another darkening choice, stale.
++        uint32_t generatedTraces[4] = {};
++        // The workload being recorded renders a frame generated by interpolation (not the game frame's real one).
++        bool generatedRender = false;
++        std::vector<uint32_t> passTriangleCounts;
 +        std::unique_ptr<RenderDescriptorSet> resolveSet;
 +        std::unique_ptr<RenderPipelineLayout> resolveLayout;
 +        std::unique_ptr<RenderPipeline> resolvePipeline;
@@ -21589,8 +22347,9 @@ index 0000000..63fa2b7
 +        WcwRaytracer(RenderDevice *device, RenderShaderFormat shaderFormat);
 +        void reset();
 +        // Called before each workload is recorded. Workloads sharing a presentId belong to the
-+        // same displayed frame; the slot is the workload's index within it.
-+        void beginWorkload(uint64_t presentId);
++        // same displayed frame; the slot is the workload's index within it. curFrameWeight: the
++        // interpolation weight of the frame being rendered (1 = the real frame; WcwLogic::generatedFrame).
++        void beginWorkload(uint64_t presentId, float curFrameWeight);
 +        bool wantsScene() const;
 +        // Shadow mode drops the game's blob shadows (WCW_RT_KEEP_BLOBS=1 keeps them).
 +        bool replacesBlobShadows() const;
@@ -21620,6 +22379,127 @@ index 0000000..63fa2b7
 +        void collectTimings();
 +    };
 +};
+diff --git a/src/render/rt64_wcw_texture_edges.h b/src/render/rt64_wcw_texture_edges.h
+new file mode 100644
+index 0000000..1b30f09
+--- /dev/null
++++ b/src/render/rt64_wcw_texture_edges.h
+@@ -0,0 +1,29 @@
++//
++// RT64
++//
++
++#pragma once
++
++#include <atomic>
++#include <cstdlib>
++
++namespace RT64 {
++    // [wcw] The graphics menu's "2D Texture Edges" option: Original (point-sampled art as the N64 draws it) or Smooth
++    // (sharp bilinear, shared/rt64_wcw_sharp_texel.h). Read by the framebuffer renderer into FrameParams every frame,
++    // so it takes effect on the next frame. WCW_SMOOTH_2D=0/1 overrides it.
++    struct WcwTextureEdges {
++        static std::atomic<bool> &flag() {
++            static std::atomic<bool> value(false);
++            return value;
++        }
++
++        static void setSmooth(bool smooth) {
++            flag() = smooth;
++        }
++
++        static bool smooth() {
++            static const char *envText = getenv("WCW_SMOOTH_2D");
++            return (envText != nullptr) ? (envText[0] == '1') : flag().load();
++        }
++    };
++};
+diff --git a/src/shaders/RasterPS.hlsl b/src/shaders/RasterPS.hlsl
+index f5beee9..1c63633 100644
+--- a/src/shaders/RasterPS.hlsl
++++ b/src/shaders/RasterPS.hlsl
+@@ -134,7 +134,8 @@ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float
+         }
+         
+         const GPUTile gpuTile = GPUTiles[globalTileIndex];
+-        const float2 textureUV = gpuTileFlagHighRes(gpuTile.flags) ? vertexUV : lowResUV;
++        // [wcw] Smoothed 2D edges need the continuous UV: the low-res snap would stair-step the seam ramp.
++        const float2 textureUV = (gpuTileFlagHighRes(gpuTile.flags) || wcwSmoothPointTexture(otherMode, rp.flags)) ? vertexUV : lowResUV;
+         texVal0 = sampleTexture(otherMode, rp.flags, textureUV, ddx(vertexUV), ddy(vertexUV), rdpTile, gpuTile, false);
+     }
+     
+@@ -149,7 +150,7 @@ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float
+         }
+         
+         const GPUTile gpuTile = GPUTiles[globalTileIndex];
+-        const float2 textureUV = gpuTileFlagHighRes(gpuTile.flags) ? vertexUV : lowResUV;
++        const float2 textureUV = (gpuTileFlagHighRes(gpuTile.flags) || wcwSmoothPointTexture(otherMode, rp.flags)) ? vertexUV : lowResUV;
+         const uint nativeSampler = renderFlagNativeSampler1(rp.flags);
+         texVal1 = sampleTexture(otherMode, rp.flags, textureUV, ddx(vertexUV), ddy(vertexUV), rdpTile, gpuTile, oneCycleHardwareBug);
+     }
+diff --git a/src/shaders/TextureSampler.hlsli b/src/shaders/TextureSampler.hlsli
+index 5164e16..9c87c10 100644
+--- a/src/shaders/TextureSampler.hlsli
++++ b/src/shaders/TextureSampler.hlsli
+@@ -11,6 +11,7 @@
+ #include "shared/rt64_other_mode.h"
+ #include "shared/rt64_render_flags.h"
+ #include "shared/rt64_render_params.h"
++#include "shared/rt64_wcw_sharp_texel.h"
+ 
+ #define SIMULATE_LOW_PRECISION 1
+ #define FIX_UPSCALING_PRECISION 1
+@@ -213,7 +214,18 @@ float4 sampleTextureLevel(const RDPTile rdpTile, const GPUTile gpuTile, bool fil
+     }
+ }
+ 
++// [wcw] "2D Texture Edges: Smooth" applies to this draw: the option is on and the RDP point-samples the texture
++// (the user's bilinear choice, linearFiltering, already smooths everything).
++bool wcwSmoothPointTexture(OtherMode otherMode, RenderFlags renderFlags) {
++    const bool pointSampled = (otherMode.textFilt() == G_TF_POINT) || (otherMode.cycleType() == G_CYC_COPY);
++    return (FrParams.wcwSmooth2DEdges != 0) && pointSampled && !renderFlagLinearFiltering(renderFlags);
++}
++
+ float4 sampleTexture(OtherMode otherMode, RenderFlags renderFlags, float2 inputUV, float2 ddxUVx, float2 ddyUVy, const RDPTile rdpTile, const GPUTile gpuTile, bool nextPixelBug) {
++    // [wcw] Sharp bilinear for point-sampled art (not for texture packs, mipmapped tiles or coverage-in-alpha
++    // framebuffer textures, whose alpha must stay exact).
++    const bool smoothEdges = wcwSmoothPointTexture(otherMode, renderFlags) && !gpuTileFlagHighRes(gpuTile.flags) &&
++        !gpuTileFlagHasMipmaps(gpuTile.flags) && !gpuTileFlagAlphaIsCvg(gpuTile.flags);
+     const bool texturePerspective = (otherMode.textPersp() == G_TP_PERSP);
+     const bool applyCorrection = (!texturePerspective && !renderFlagRect(renderFlags));
+ 
+@@ -222,7 +234,8 @@ float4 sampleTexture(OtherMode otherMode, RenderFlags renderFlags, float2 inputU
+     float2 uvCoord = inputUV * perspCorrectionMod * float2(rdpTile.shifts, rdpTile.shiftt);
+ 
+ #if SIMULATE_LOW_PRECISION
+-    if (!gpuTileFlagHighRes(gpuTile.flags)) {
++    // [wcw] Not for smoothed edges: the seam ramp needs sub-texel precision.
++    if (!gpuTileFlagHighRes(gpuTile.flags) && !smoothEdges) {
+         // Simulates the lower precision of the hardware's coordinate interpolation.
+         // This is not simulated if a texture replacement is being used.
+         uvCoord = round(uvCoord * LowPrecision) / LowPrecision;
+@@ -242,12 +255,20 @@ float4 sampleTexture(OtherMode otherMode, RenderFlags renderFlags, float2 inputU
+     
+     uvCoord *= gpuTile.tcScale;
+     uvCoord -= (float2(rdpTile.uls, rdpTile.ult) * gpuTile.ulScale) / 4.0f;
++
++    // [wcw] Sharp bilinear: texels stay squares, seams blend over one screen pixel (shared/rt64_wcw_sharp_texel.h).
++    if (smoothEdges) {
++        const float2 texelScale = abs(perspCorrectionMod * float2(rdpTile.shifts, rdpTile.shiftt) * gpuTile.tcScale);
++        const float2 texelsPerPixel = (abs(ddxUVx) + abs(ddyUVy)) * texelScale;
++        uvCoord = float2(wcwSharpTexelCoord(uvCoord.x, texelsPerPixel.x), wcwSharpTexelCoord(uvCoord.y, texelsPerPixel.y));
++    }
+     
+     const uint filter = otherMode.textFilt();
+     const uint cycleType = otherMode.cycleType();
+     const bool filterBilerp = (filter != G_TF_POINT) && (cycleType != G_CYC_COPY);
+     const bool filterAverage = (filter == G_TF_AVERAGE);
+-    const bool linearFiltering = renderFlagLinearFiltering(renderFlags);
++    // [wcw] Smoothed edges sample the remapped coordinate with bilinear filtering.
++    const bool linearFiltering = renderFlagLinearFiltering(renderFlags) || smoothEdges;
+     
+ #if FIX_UPSCALING_PRECISION
+     // Account for the fact that scaling can result in less than perfect results that affect the quality of point filtering.
 diff --git a/src/shaders/VideoInterfacePS.hlsl b/src/shaders/VideoInterfacePS.hlsl
 index 3f33475..cafdc69 100644
 --- a/src/shaders/VideoInterfacePS.hlsl
@@ -22525,6 +23405,19 @@ index 0000000..8004a27
 +    gCurrent[pixel] = float4(factor, hitT);
 +    gCurrentAo[pixel] = ao;
 +}
+diff --git a/src/shared/rt64_frame_params.h b/src/shared/rt64_frame_params.h
+index 2e62aaf..a6213cd 100644
+--- a/src/shared/rt64_frame_params.h
++++ b/src/shared/rt64_frame_params.h
+@@ -13,6 +13,8 @@ namespace interop {
+         uint frameCount;
+         uint viewUbershaders;
+         float ditherNoiseStrength;
++        // [wcw] "2D Texture Edges: Smooth": sharp bilinear for point-sampled textures (TextureSampler.hlsli).
++        uint wcwSmooth2DEdges;
+     };
+ #ifdef HLSL_CPU
+ };
 diff --git a/src/shared/rt64_video_interface.h b/src/shared/rt64_video_interface.h
 index b51cf09..19048ae 100644
 --- a/src/shared/rt64_video_interface.h
@@ -22738,12 +23631,58 @@ index 0000000..22a556e
 +#ifdef HLSL_CPU
 +};
 +#endif
+diff --git a/src/shared/rt64_wcw_sharp_texel.h b/src/shared/rt64_wcw_sharp_texel.h
+new file mode 100644
+index 0000000..80f5019
+--- /dev/null
++++ b/src/shared/rt64_wcw_sharp_texel.h
+@@ -0,0 +1,40 @@
++//
++// RT64
++//
++
++// [wcw] Sharp bilinear texel coordinates ("2D Texture Edges: Smooth"), shared by TextureSampler.hlsli and the unit
++// tests (tests/wcw), so the tested function is the one the shader runs.
++//
++// Point-sampled 2D art (crowds, signs, HUD, fonts: 32-64 texel textures blown up ~9x at 4K) shows hard, crawling
++// texel edges. Sharp bilinear keeps every texel a crisp square but blends across each seam between texels over one
++// screen pixel, the per-texel version of VideoInterfacePS.hlsl's PixelAntialiasing.
++//
++// The coordinate is remapped per axis and then sampled with bilinear filtering, where value(u) =
++// lerp(texel[floor(u)], texel[floor(u) + 1], frac(u)). Away from a seam the result is a whole number, so it samples
++// exactly texel[floor(coord)], the same texel point sampling picks; within half a screen pixel of the seam it ramps
++// linearly to the next texel.
++
++#pragma once
++
++#ifdef HLSL_CPU
++#include <cmath>
++#define WCW_SHARP_INLINE inline
++#define WCW_SHARP_FLOOR std::floor
++#else
++#define WCW_SHARP_INLINE
++#define WCW_SHARP_FLOOR floor
++#endif
++
++// coord: texel-space coordinate (texel k covers [k, k + 1) under point sampling). texelsPerPixel: how many texels
++// one screen pixel spans along this axis (fwidth of coord).
++WCW_SHARP_INLINE float wcwSharpTexelCoord(float coord, float texelsPerPixel) {
++    // No footprint (a degenerate derivative): plain point sampling.
++    if (!(texelsPerPixel > 1e-6f)) {
++        return WCW_SHARP_FLOOR(coord);
++    }
++
++    const float seam = WCW_SHARP_FLOOR(coord + 0.5f);
++    float t = (coord - seam) / texelsPerPixel;
++    t = (t < -0.5f) ? -0.5f : ((t > 0.5f) ? 0.5f : t);
++    return seam - 0.5f + t;
++}
 diff --git a/tests/wcw/rt64_wcw_logic_tests.cpp b/tests/wcw/rt64_wcw_logic_tests.cpp
 new file mode 100644
-index 0000000..a40409f
+index 0000000..863d725
 --- /dev/null
 +++ b/tests/wcw/rt64_wcw_logic_tests.cpp
-@@ -0,0 +1,642 @@
+@@ -0,0 +1,1047 @@
 +//
 +// RT64
 +//
@@ -22781,6 +23720,159 @@ index 0000000..a40409f
 +            CHECK(shadowCasterFresh(frame, built));
 +        }
 +    }
++}
++
++// Multi-layer runs that end early
++
++// Replays a sequence of run lengths through the workload queue's publishing: a run's generated frame waits for
++// the longest of the last 8 runs; a run that ends shorter is published when the next run starts, if
++// publishShortRun allows. Returns, per run, whether its generated frame was shown.
++static std::vector<bool> replayRuns(const std::vector<uint32_t> &lengths) {
++    std::vector<bool> shown;
++    std::vector<uint32_t> history;
++    uint32_t previous = 0;
++    for (uint32_t length : lengths) {
++        uint32_t expected = 1;
++        for (size_t i = (history.size() > 8) ? history.size() - 8 : 0; i < history.size(); i++) {
++            expected = std::max(expected, history[i]);
++        }
++
++        shown.push_back((length >= expected) || publishShortRun(length, previous));
++        history.push_back(length);
++        previous = length;
++    }
++
++    return shown;
++}
++
++TEST_CASE("short runs: a run cut short after longer runs drops its generated frame (Revenge attract flashes)") {
++    // Run lengths from Revenge's attract mode (WCW_RUN_LOG, 60 fps). Both cut-short runs flashed in the flicker
++    // log: a 1-layer run after 3-layer runs (generated 55.9 against real 48.6) and a 3-layer run after a 5-layer
++    // one (generated 6.4 against real 8.2).
++    const std::vector<bool> a = replayRuns({ 3, 3, 3, 3, 3, 3, 3, 3, 1, 1, 1, 1 });
++    CHECK(!a[8]);
++    const std::vector<bool> b = replayRuns({ 3, 3, 3, 3, 3, 3, 3, 5, 3, 3, 3, 3 });
++    CHECK(!b[8]);
++}
++
++TEST_CASE("short runs: a scene's steady layer count keeps its generated frames") {
++    // After the first cut-short run, the scene keeps 1 (or 3) layers: those runs match the previous one and are
++    // shown, though still shorter than the recent maximum.
++    const std::vector<bool> a = replayRuns({ 3, 3, 3, 3, 3, 3, 3, 3, 1, 1, 1, 1 });
++    CHECK(a[9] && a[10] && a[11]);
++    const std::vector<bool> b = replayRuns({ 3, 3, 3, 3, 3, 3, 3, 5, 3, 3, 3, 3 });
++    CHECK(b[9] && b[10] && b[11]);
++    for (bool s : replayRuns({ 3, 3, 3, 3, 3, 3, 3, 3, 3, 3 })) {
++        CHECK(s);
++    }
++}
++
++TEST_CASE("short runs: publishShortRun") {
++    CHECK(!publishShortRun(1, 3));
++    CHECK(!publishShortRun(3, 5));
++    CHECK(publishShortRun(3, 3));
++    CHECK(publishShortRun(4, 3));
++    // No previous run yet.
++    CHECK(publishShortRun(1, 0));
++}
++
++TEST_CASE("trace area: only the pass that darkens the misses traces full screen (No Mercy arenas ran at ~7 fps)") {
++    // A No Mercy arena frame with outside darkness: the arena pass darkens the misses, the ring, wrestler and
++    // small passes don't, and must stay within their geometry instead of tracing the whole target.
++    CHECK(traceArea(true, 0.55f) == TraceArea::FullScreen);
++    CHECK(traceArea(false, 0.55f) == TraceArea::Geometry);
++}
++
++TEST_CASE("trace area: without outside darkness, passes trace only their receivers") {
++    CHECK(traceArea(false, 0.0f) == TraceArea::Receivers);
++    // darkenMisses alone (no darkness to apply) doesn't widen the pass.
++    CHECK(traceArea(true, 0.0f) == TraceArea::Receivers);
++}
++
++TEST_CASE("generated frames: the real frame (current weight 1) is not generated, interpolated ones are") {
++    CHECK(!generatedFrame(1.0f));
++    CHECK(generatedFrame(0.5f));
++    CHECK(generatedFrame(0.25f));
++    CHECK(generatedFrame(0.75f));
++    CHECK(generatedFrame(0.0f));
++}
++
++TEST_CASE("generated frames: only the real frame traces at 60 and 120 fps (every displayed frame traced: ~6 fps)") {
++    // Replays a pass through the interpolation weights of a few game frames and counts its traces.
++    for (uint32_t targetRate : { 60u, 120u }) {
++        InterpolationTicks ticks;
++        bool haveTrace = false;
++        uint32_t reuses = 0, traces = 0, displayed = 0;
++        const uint32_t gameFrames = 10;
++        for (uint32_t g = 0; g < gameFrames; g++) {
++            const uint32_t frames = ticks.beginGameFrame(targetRate, 30, 0);
++            for (uint32_t f = 0; f < frames; f++) {
++                const FrameWeights weights = ticks.advance(targetRate, 30);
++                displayed++;
++                if (traceRender(generatedFrame(weights.cur), haveTrace, reuses)) {
++                    traces++;
++                    haveTrace = true;
++                    reuses = 0;
++                }
++                else {
++                    reuses++;
++                }
++            }
++        }
++
++        CHECK_EQ(displayed, gameFrames * (targetRate / 30));
++        // One trace per game frame; the very first generated frame traces too, having nothing to reuse.
++        CHECK(traces <= gameFrames + 1);
++        CHECK(traces >= gameFrames);
++    }
++}
++
++TEST_CASE("generated frames: a pass with no trace yet traces, even on a generated frame") {
++    CHECK(traceRender(true, false, 0));
++    CHECK(traceRender(false, false, 0));
++    CHECK(traceRender(false, true, 0));
++    CHECK(!traceRender(true, true, 0));
++}
++
++TEST_CASE("generated frames: shadows don't freeze when real frames are skipped under load") {
++    // 120 fps: 3 generated frames between real ones reuse the trace; a 4th in a row (the real frame was skipped)
++    // traces again.
++    CHECK(!traceRender(true, true, 1));
++    CHECK(!traceRender(true, true, 2));
++    CHECK(traceRender(true, true, MaxGeneratedReuse));
++    CHECK(traceRender(true, true, MaxGeneratedReuse + 5));
++}
++
++TEST_CASE("generated frames: two passes sharing a slot don't reuse each other's trace (generated frames ~5% darker)") {
++    // Two No Mercy passes of similar scenes map to one slot. On the real frame each traces in turn, so the slot
++    // holds the second pass's trace; on a generated frame the first pass must trace, not composite that trace.
++    const uint32_t passA[] = { 12, 40, 2, 2, 600 };
++    const uint32_t passB[] = { 12, 40, 2, 2, 598 };
++    const uint64_t slotTrace = passSignature(passB, 5);
++    CHECK(passSignature(passA, 5) != slotTrace);
++    CHECK(traceRender(true, passSignature(passA, 5) == slotTrace, 0));
++    CHECK(!traceRender(true, passSignature(passB, 5) == slotTrace, 0));
++}
++
++TEST_CASE("generated frames: a trace is reused only with the same outside darkness choice (misses darkened twice)") {
++    // The arena pass darkened the misses on the real frame's target. On a generated target it is again the
++    // darkening pass: reuse. If that target picked another pass to darken, the arena trace (darkness baked in)
++    // must not be composited, or the misses darken twice.
++    CHECK(reusableTrace(true, 7, 7, true, true));
++    CHECK(reusableTrace(true, 7, 7, false, false));
++    CHECK(!reusableTrace(true, 7, 7, true, false));
++    CHECK(!reusableTrace(true, 7, 7, false, true));
++    CHECK(!reusableTrace(true, 7, 8, true, true));
++    CHECK(!reusableTrace(false, 7, 7, true, true));
++}
++
++TEST_CASE("generated frames: a pass's signature is stable across the renders of a game frame") {
++    const uint32_t pass[] = { 24, 8, 8, 130 };
++    CHECK_EQ(passSignature(pass, 4), passSignature(pass, 4));
++    // Order and count matter: the same draws in another order, or one draw fewer, are another pass.
++    const uint32_t reordered[] = { 8, 24, 8, 130 };
++    CHECK(passSignature(pass, 4) != passSignature(reordered, 4));
++    CHECK(passSignature(pass, 4) != passSignature(pass, 3));
 +}
 +
 +// Ray-traced ambient occlusion
@@ -22907,6 +23999,39 @@ index 0000000..a40409f
 +    CHECK_NEAR(rtTraceScale(rtPreset(0), 2160), 720.0f / 2160.0f, 1e-6f);
 +    CHECK_NEAR(rtTraceScale(rtPreset(1), 2160), 0.5f, 1e-6f);
 +    CHECK_EQ(rtTraceScale(rtPreset(2), 2160), 1.0f);
++}
++
++TEST_CASE("quality: a supersampled target traces at no more than the output size") {
++    // Supersampling 2x at a 1080p window renders a 2400-line target (5x 240, times 2) that presents as 1200 lines.
++    // Quality and Ultra trace those 1200 lines, not all 2400 (4x the rays for shadows nobody can see sharper).
++    CHECK_NEAR(rtTraceScale(rtPreset(2), 2400, 2), 0.5f, 1e-6f);
++    CHECK_NEAR(rtTraceScale(rtPreset(3), 2400, 2), 0.5f, 1e-6f);
++    // The line caps still apply when they're lower: Performance traces 720 of the 2400 lines, Balanced 1080.
++    CHECK_NEAR(rtTraceScale(rtPreset(0), 2400, 2), 720.0f / 2400.0f, 1e-6f);
++    CHECK_NEAR(rtTraceScale(rtPreset(1), 2400, 2), 1080.0f / 2400.0f, 1e-6f);
++    // Without supersampling nothing changes.
++    CHECK_EQ(rtTraceScale(rtPreset(2), 1200, 1), 1.0f);
++    CHECK_EQ(rtTraceScale(rtPreset(2), 1200, 0), 1.0f);
++    CHECK_EQ(rtTraceScale(rtPreset(2), 1200), 1.0f);
++}
++
++TEST_CASE("resolution: Auto renders the window's whole multiple of 240, times the supersampling") {
++    CHECK_EQ(windowResolutionMultiplier(1080, 240, 1), 5.0f);
++    CHECK_EQ(windowResolutionMultiplier(1080, 240, 2), 10.0f);
++    CHECK_EQ(windowResolutionMultiplier(720, 240, 1), 3.0f);
++    CHECK_EQ(windowResolutionMultiplier(720, 240, 2), 6.0f);
++    CHECK_EQ(windowResolutionMultiplier(2160, 240, 2), 18.0f);
++    // A window shorter than the game still renders at 1x (2x supersampled).
++    CHECK_EQ(windowResolutionMultiplier(200, 240, 1), 1.0f);
++    CHECK_EQ(windowResolutionMultiplier(200, 240, 2), 2.0f);
++    // No swap chain yet, and a bad downsample value, fall back to 1x.
++    CHECK_EQ(windowResolutionMultiplier(0, 240, 1), 1.0f);
++    CHECK_EQ(windowResolutionMultiplier(0, 240, 2), 2.0f);
++    CHECK_EQ(windowResolutionMultiplier(1080, 240, 0), 5.0f);
++    // The presented size (render scale / downsample) is the same with and without supersampling.
++    for (uint32_t h : { 480u, 720u, 1080u, 1440u, 2160u }) {
++        CHECK_EQ(windowResolutionMultiplier(h, 240, 2) / 2.0f, windowResolutionMultiplier(h, 240, 1));
++    }
 +}
 +
 +TEST_CASE("quality: out-of-range levels clamp to Ultra") {
@@ -23383,8 +24508,320 @@ index 0000000..a40409f
 +    CHECK_EQ(int(hdrAdvice(100.0f, OwnerHdr, CrtOff)), int(HdrAdvice::Dim));
 +}
 +
++// HUD Placement
++
++namespace {
++    // A 320-pixel-wide game screen (centre 160) and a 480-pixel anamorphic one (WCW's 480x240).
++    std::vector<HudAnchor> anchors320(const std::vector<HudBox> &boxes) {
++        return hudAnchors(boxes, 0.0f, 320.0f);
++    }
++
++    // A meter drawn as segments 'step' pixels apart.
++    void addSegments(std::vector<HudBox> &boxes, float left, float right, float top, float bottom, float step, float segmentWidth) {
++        for (float x = left; x + segmentWidth <= right; x += step) {
++            boxes.push_back({ x, top, x + segmentWidth, bottom });
++        }
++    }
++
++    bool allAre(const std::vector<HudAnchor> &anchors, size_t begin, size_t end, HudAnchor anchor) {
++        for (size_t i = begin; i < end; i++) {
++            if (anchors[i] != anchor) {
++                return false;
++            }
++        }
++
++        return true;
++    }
++
++    // rt64's rect conversion for an origin (convertViewportRect), as normalized device x of the wide output.
++    float rectOriginNdc(float x, float fbWidth, float centredWidthFraction, float placement, HudAnchor anchor) {
++        float origin = fbWidth / 2.0f;
++        if (anchor == HudAnchor::Left) {
++            origin = 0.0f * placement + (fbWidth / 2.0f) * (1.0f - placement);
++        }
++        else if (anchor == HudAnchor::Right) {
++            origin = fbWidth * placement + (fbWidth / 2.0f) * (1.0f - placement);
++        }
++
++        const float wideX = origin + (x - origin) * centredWidthFraction;
++        return (wideX / fbWidth) * 2.0f - 1.0f;
++    }
++}
++
++TEST_CASE("hud: two corner meters anchor to their own edges (WM2000 attitude meters)") {
++    std::vector<HudBox> boxes;
++    addSegments(boxes, 16.0f, 120.0f, 200.0f, 210.0f, 6.0f, 4.0f);
++    const size_t leftCount = boxes.size();
++    addSegments(boxes, 200.0f, 304.0f, 200.0f, 210.0f, 6.0f, 4.0f);
++    // Name plates above the meters.
++    boxes.push_back({ 16.0f, 186.0f, 80.0f, 196.0f });
++    boxes.push_back({ 240.0f, 186.0f, 304.0f, 196.0f });
++
++    const auto anchors = anchors320(boxes);
++    CHECK(allAre(anchors, 0, leftCount, HudAnchor::Left));
++    CHECK(allAre(anchors, leftCount, boxes.size() - 2, HudAnchor::Right));
++    CHECK(anchors[boxes.size() - 2] == HudAnchor::Left);
++    CHECK(anchors[boxes.size() - 1] == HudAnchor::Right);
++}
++
++TEST_CASE("hud: a centred timer stays in one piece (digits left of the centre don't anchor left)") {
++    // "00:26": five glyphs across the centre line.
++    std::vector<HudBox> boxes;
++    for (int i = 0; i < 5; i++) {
++        boxes.push_back({ 136.0f + i * 10.0f, 12.0f, 144.0f + i * 10.0f, 24.0f });
++    }
++
++    const auto anchors = anchors320(boxes);
++    CHECK(allAre(anchors, 0, boxes.size(), HudAnchor::Centre));
++}
++
++TEST_CASE("hud: an element near the centre stays centred even without crossing it") {
++    // A short label just left of the centre line, alone.
++    const auto anchors = anchors320({ { 140.0f, 100.0f, 158.0f, 110.0f } });
++    CHECK(anchors[0] == HudAnchor::Centre);
++}
++
++TEST_CASE("hud: a meter's end segment near the centre moves with the meter (no tearing)") {
++    std::vector<HudBox> boxes;
++    addSegments(boxes, 20.0f, 154.0f, 200.0f, 210.0f, 6.0f, 4.0f);
++    // Alone, the last segment would be in the centre band.
++    CHECK(anchors320({ boxes.back() })[0] == HudAnchor::Centre);
++    const auto anchors = anchors320(boxes);
++    CHECK(allAre(anchors, 0, boxes.size(), HudAnchor::Left));
++}
++
++TEST_CASE("hud: an element across the centre stays, and draws far apart are separate elements") {
++    std::vector<HudBox> boxes = {
++        { 60.0f, 20.0f, 260.0f, 40.0f },  // banner across the centre
++        { 10.0f, 220.0f, 40.0f, 230.0f }, // bottom-left icon, far below the banner
++        { 280.0f, 220.0f, 310.0f, 230.0f } // bottom-right icon
++    };
++
++    const auto anchors = anchors320(boxes);
++    CHECK(anchors[0] == HudAnchor::Centre);
++    CHECK(anchors[1] == HudAnchor::Left);
++    CHECK(anchors[2] == HudAnchor::Right);
++
++    // Touching the banner joins it: the icon then stays with the banner.
++    boxes[1] = { 40.0f, 42.0f, 56.0f, 52.0f };
++    CHECK(anchors320(boxes)[1] == HudAnchor::Centre);
++}
++
++TEST_CASE("hud: the anamorphic 480-wide framebuffer uses its own centre") {
++    const auto anchors = hudAnchors({ { 20.0f, 200.0f, 150.0f, 210.0f }, { 330.0f, 200.0f, 460.0f, 210.0f }, { 225.0f, 10.0f, 255.0f, 20.0f } }, 0.0f, 480.0f);
++    CHECK(anchors[0] == HudAnchor::Left);
++    CHECK(anchors[1] == HudAnchor::Right);
++    CHECK(anchors[2] == HudAnchor::Centre);
++}
++
++TEST_CASE("hud: a full 2D screen (too many draws) and an empty screen are left alone") {
++    std::vector<HudBox> boxes;
++    for (size_t i = 0; i <= HudMaxBoxes; i++) {
++        boxes.push_back({ 0.0f, 0.0f, 4.0f, 4.0f });
++    }
++
++    CHECK(allAre(anchors320(boxes), 0, boxes.size(), HudAnchor::Centre));
++    CHECK(anchors320({}).empty());
++    CHECK(hudAnchors({ { 0.0f, 0.0f, 4.0f, 4.0f } }, 10.0f, 10.0f)[0] == HudAnchor::Centre);
++}
++
++TEST_CASE("hud: shift reaches the window edge at Expand, a 16:9 edge when clamped, nothing at Original or 4:3") {
++    // 16:9 window: the 4:3 picture is 0.75 of the width.
++    const float s169 = (4.0f / 3.0f) / (16.0f / 9.0f);
++    CHECK_NEAR(hudShiftNdc(HudAnchor::Left, s169, 1.0f), -0.25, 1e-5);
++    CHECK_NEAR(hudShiftNdc(HudAnchor::Right, s169, 1.0f), 0.25, 1e-5);
++    CHECK_NEAR(hudShiftNdc(HudAnchor::Centre, s169, 1.0f), 0.0, 1e-6);
++    // The 4:3 picture's left edge (-s) lands on the window edge.
++    CHECK_NEAR(-s169 + hudShiftNdc(HudAnchor::Left, s169, 1.0f), -1.0, 1e-5);
++
++    // 21:9 window with HUD Placement 16:9: rt64's percentage is (16:9 - 4:3) / (21:9 - 4:3).
++    const float s219 = (4.0f / 3.0f) / (21.0f / 9.0f);
++    const float clamp169 = (16.0f / 9.0f - 4.0f / 3.0f) / (21.0f / 9.0f - 4.0f / 3.0f);
++    CHECK_NEAR(-s219 + hudShiftNdc(HudAnchor::Left, s219, clamp169), -(16.0f / 9.0f) / (21.0f / 9.0f), 1e-5);
++    CHECK_NEAR(s219 + hudShiftNdc(HudAnchor::Right, s219, clamp169), (16.0f / 9.0f) / (21.0f / 9.0f), 1e-5);
++
++    CHECK(!hudPlacementActive(s169, 0.0f));
++    CHECK(!hudPlacementActive(1.0f, 1.0f));
++    CHECK(hudPlacementActive(s169, 1.0f));
++    CHECK_NEAR(hudShiftNdc(HudAnchor::Left, s169, 0.0f), 0.0, 1e-6);
++    CHECK_NEAR(hudShiftNdc(HudAnchor::Right, 1.0f, 1.0f), 0.0, 1e-6);
++}
++
++TEST_CASE("hud: triangles move exactly like rects with rt64's G_EX origins (both parts of an element stay together)") {
++    const float fbWidth = 320.0f;
++    const float placements[] = { 1.0f, 0.4444f, 0.25f };
++    const float fractions[] = { 0.75f, 0.5714f };
++    const HudAnchor sides[] = { HudAnchor::Left, HudAnchor::Right, HudAnchor::Centre };
++    for (float e : placements) {
++        for (float s : fractions) {
++            for (HudAnchor a : sides) {
++                for (float x : { 0.0f, 37.0f, 160.0f, 290.0f }) {
++                    // A triangle vertex: its 4:3 position compressed into the centre, then shifted.
++                    const float triNdc = ((x / fbWidth) * 2.0f - 1.0f) * s + hudShiftNdc(a, s, e);
++                    CHECK_NEAR(triNdc, rectOriginNdc(x, fbWidth, s, e, a), 1e-4);
++                }
++            }
++        }
++    }
++}
++
++// Widescreen
++
++TEST_CASE("widescreen: a pass whose scissor matches its framebuffer covers the screen (both pixel aspects)") {
++    CHECK(framebufferPassCoversScreen(320, 240, 320, 240));
++    CHECK(framebufferPassCoversScreen(480, 240, 480, 240));
++}
++
++TEST_CASE("widescreen: No Mercy's story screens (480x240 scissor, fb measured 480x196) cover the screen (dialog text jumped)") {
++    CHECK(framebufferPassCoversScreen(480, 240, 480, 196));
++    CHECK(framebufferPassCoversScreen(480, 240, 480, 198));
++}
++
++TEST_CASE("widescreen: a sub-rectangle of another shape doesn't (split screen, a texture rendered into part of it)") {
++    CHECK(!framebufferPassCoversScreen(240, 240, 480, 240));
++    CHECK(!framebufferPassCoversScreen(480, 120, 480, 240));
++    CHECK(!framebufferPassCoversScreen(64, 64, 480, 240));
++}
++
++TEST_CASE("widescreen: the ratio test is unchanged (a same-shape scissor counts, as before)") {
++    CHECK(framebufferPassCoversScreen(64, 32, 480, 240));
++    CHECK(framebufferPassCoversScreen(300, 240, 320, 240));
++}
++
++TEST_CASE("widescreen: empty or unknown sizes don't cover the screen") {
++    CHECK(!framebufferPassCoversScreen(0, 240, 480, 240));
++    CHECK(!framebufferPassCoversScreen(480, 240, 0, 0));
++}
++
++static uint32_t packXY(float x, float y) {
++    return (uint32_t(uint16_t(int16_t(std::lround(x * 4.0f)))) << 16) | uint32_t(uint16_t(int16_t(std::lround(y * 4.0f))));
++}
++
++static float unpackX(uint32_t v) {
++    return float(int16_t((v >> 16) & 0xFFFF)) / 4.0f;
++}
++
++TEST_CASE("widescreen: a game-set screen position is compressed like transformed vertices (story flow lines were stretched)") {
++    // 480-wide N64 screen, viewport centered at 240, Expand 16:9 (projRatioScale 0.75): a flow-line end at x = 338 lands
++    // 98 * 0.75 from the center, as the boxes it joins do; y stays.
++    const uint32_t v = modifiedScreenXYForAspect(packXY(338.0f, 61.25f), 240.0f, 0.75f);
++    CHECK(std::abs(unpackX(v) - (240.0f + 98.0f * 0.75f)) <= 0.25f);
++    CHECK((v & 0xFFFF) == (packXY(338.0f, 61.25f) & 0xFFFF));
++}
++
++TEST_CASE("widescreen: the viewport center and both sides follow the same rule") {
++    CHECK(unpackX(modifiedScreenXYForAspect(packXY(240.0f, 0.0f), 240.0f, 0.75f)) == 240.0f);
++    CHECK(std::abs(unpackX(modifiedScreenXYForAspect(packXY(40.0f, 0.0f), 240.0f, 0.75f)) - 90.0f) <= 0.25f);
++    // A viewport centered elsewhere (AKI's menus use a 3x screen viewport, still centered on the screen; others may not).
++    CHECK(std::abs(unpackX(modifiedScreenXYForAspect(packXY(100.0f, 0.0f), 60.0f, 0.5f)) - 80.0f) <= 0.25f);
++}
++
++TEST_CASE("widescreen: at Original (ratio 1) a modify is untouched, bit for bit") {
++    for (uint32_t v : { packXY(338.0f, 61.25f), packXY(-12.75f, 239.5f), 0xFFFF8000u, 0x7FFF0001u }) {
++        CHECK(modifiedScreenXYForAspect(v, 240.0f, 1.0f) == v);
++    }
++}
++
++TEST_CASE("widescreen: negative screen x and the int16 range survive the conversion") {
++    CHECK(std::abs(unpackX(modifiedScreenXYForAspect(packXY(-100.0f, 5.0f), 240.0f, 0.75f)) - (240.0f - 340.0f * 0.75f)) <= 0.25f);
++    CHECK(unpackX(modifiedScreenXYForAspect(packXY(8000.0f, 0.0f), 0.0f, 2.0f)) == 8191.75f);
++}
++
 +int main() {
 +    return WcwTest::runAll("rt64 wcw tests");
++}
+diff --git a/tests/wcw/rt64_wcw_sharp_texel_tests.cpp b/tests/wcw/rt64_wcw_sharp_texel_tests.cpp
+new file mode 100644
+index 0000000..42c1670
+--- /dev/null
++++ b/tests/wcw/rt64_wcw_sharp_texel_tests.cpp
+@@ -0,0 +1,87 @@
++//
++// RT64
++//
++
++// [wcw] Unit tests for shared/rt64_wcw_sharp_texel.h: sharp bilinear texel coordinates ("2D Texture Edges: Smooth").
++// The header is the same code TextureSampler.hlsli runs.
++
++#ifndef HLSL_CPU
++#define HLSL_CPU
++#endif
++#include "shared/rt64_wcw_sharp_texel.h"
++
++#include <algorithm>
++#include <cmath>
++#include <vector>
++
++#include "wcw_test.h"
++
++// RT64's bilinear filter along one axis: lerp(texel[floor(u)], texel[floor(u) + 1], frac(u)).
++static float bilinear(const std::vector<float> &texels, float u) {
++    const float base = std::floor(u);
++    const int i = int(base);
++    const float f = u - base;
++    auto at = [&](int k) { return texels[size_t(std::max(0, std::min(int(texels.size()) - 1, k)))]; };
++    return at(i) + (at(i + 1) - at(i)) * f;
++}
++
++static float pointSample(const std::vector<float> &texels, float u) {
++    return texels[size_t(int(std::floor(u)))];
++}
++
++static const std::vector<float> Texels = { 0.0f, 1.0f, 0.25f, 0.75f, 0.5f, 0.0f, 1.0f, 1.0f };
++
++TEST_CASE("sharp texels: away from a seam the result is exactly the point-sampled texel") {
++    // A 32-texel sprite blown up 9x at 4K: one screen pixel spans 1/9 texel.
++    const float w = 1.0f / 9.0f;
++    for (float u = 0.5f; u < 7.0f; u += 0.0137f) {
++        const float d = u - std::floor(u + 0.5f);
++        if (std::abs(d) <= w * 0.5f) {
++            continue;
++        }
++
++        CHECK_EQ(bilinear(Texels, wcwSharpTexelCoord(u, w)), pointSample(Texels, u));
++    }
++}
++
++TEST_CASE("sharp texels: a seam blends over one screen pixel, halfway at the seam") {
++    const float w = 1.0f / 9.0f;
++    const float seam = 3.0f;
++    // Half a pixel either side: the texels themselves.
++    CHECK_NEAR(bilinear(Texels, wcwSharpTexelCoord(seam - w * 0.5f, w)), Texels[2], 1e-5f);
++    CHECK_NEAR(bilinear(Texels, wcwSharpTexelCoord(seam + w * 0.5f, w)), Texels[3], 1e-5f);
++    // On the seam: the average.
++    CHECK_NEAR(bilinear(Texels, wcwSharpTexelCoord(seam, w)), (Texels[2] + Texels[3]) * 0.5f, 1e-5f);
++    // A quarter pixel past: three quarters of the way.
++    CHECK_NEAR(bilinear(Texels, wcwSharpTexelCoord(seam + w * 0.25f, w)), Texels[2] + (Texels[3] - Texels[2]) * 0.75f, 1e-5f);
++}
++
++TEST_CASE("sharp texels: the ramp is monotonic and continuous across the seam (no crawl)") {
++    const float w = 1.0f / 9.0f;
++    float previous = bilinear(Texels, wcwSharpTexelCoord(0.9f, w));
++    for (float u = 0.9f; u < 1.1f; u += 0.001f) {
++        const float v = bilinear(Texels, wcwSharpTexelCoord(u, w));
++        CHECK(v >= previous - 1e-6f);
++        // Steps of a thousandth of a texel move it by at most that share of one pixel's ramp.
++        CHECK(v - previous <= (0.001f / w) * (Texels[1] - Texels[0]) + 1e-4f);
++        previous = v;
++    }
++}
++
++TEST_CASE("sharp texels: a zero footprint acts as point sampling, without NaN") {
++    for (float u : { 0.2f, 0.9999f, 1.0f, 2.5f, 6.75f }) {
++        const float c = wcwSharpTexelCoord(u, 0.0f);
++        CHECK(std::isfinite(c));
++        CHECK_NEAR(bilinear(Texels, c), pointSample(Texels, u), 1e-5f);
++    }
++}
++
++TEST_CASE("sharp texels: minified (more than a texel per pixel) stays between the neighbouring texels") {
++    for (float u = 1.0f; u < 6.0f; u += 0.1f) {
++        const float c = wcwSharpTexelCoord(u, 2.0f);
++        CHECK(std::isfinite(c));
++        const float seam = std::floor(u + 0.5f);
++        CHECK(c >= seam - 1.0f - 1e-6f);
++        CHECK(c <= seam + 1e-6f);
++    }
 +}
 diff --git a/tests/wcw/rt64_wcw_venues_tests.cpp b/tests/wcw/rt64_wcw_venues_tests.cpp
 new file mode 100644

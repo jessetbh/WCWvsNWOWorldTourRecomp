@@ -13,22 +13,60 @@ index 4b3ed99..f77f97a 100644
  	path = thirdparty/o1heap
  	url = https://github.com/N64Recomp/o1heap
 diff --git a/librecomp/CMakeLists.txt b/librecomp/CMakeLists.txt
-index 716d48b..bbc5b5f 100644
+index 716d48b..aa59e72 100644
 --- a/librecomp/CMakeLists.txt
 +++ b/librecomp/CMakeLists.txt
-@@ -31,6 +31,7 @@ add_library(librecomp STATIC
+@@ -31,6 +31,9 @@ add_library(librecomp STATIC
      "${CMAKE_CURRENT_SOURCE_DIR}/src/print.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/rsp.cpp"
++    "${CMAKE_CURRENT_SOURCE_DIR}/src/save_backup_rules.cpp"
++    "${CMAKE_CURRENT_SOURCE_DIR}/src/save_backups.cpp"
 +    "${CMAKE_CURRENT_SOURCE_DIR}/src/si.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/sp.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/ultra_stubs.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/ultra_translation.cpp"
+@@ -65,3 +68,27 @@ add_subdirectory(${PROJECT_SOURCE_DIR}/../N64Recomp ${CMAKE_CURRENT_BINARY_DIR}/
+ 
+ target_link_libraries(librecomp PRIVATE ultramodern N64Recomp LiveRecomp)
+ target_link_libraries(librecomp PUBLIC miniz)
++
++# [wcw] Unit tests for librecomp's own decision logic (tests/wcw: quitting during startup, jessetbh/aki-roadmap#73;
++# save backup rules, aki-roadmap#50). Plain C++ (no game, no ROM), built and run as part of every librecomp build, so a
++# failing test fails the game's build (as rt64's and recompui's wcw tests do). LIBRECOMP_WCW_TESTS=OFF skips them.
++option(LIBRECOMP_WCW_TESTS "Build and run the wcw unit tests with librecomp" ON)
++if (LIBRECOMP_WCW_TESTS AND NOT CMAKE_CROSSCOMPILING)
++    add_executable(librecomp_wcw_tests
++        "${PROJECT_SOURCE_DIR}/tests/wcw/startup_shutdown_tests.cpp"
++        "${PROJECT_SOURCE_DIR}/tests/wcw/save_backup_rules_tests.cpp"
++        "${PROJECT_SOURCE_DIR}/src/save_backup_rules.cpp"
++    )
++    target_include_directories(librecomp_wcw_tests PRIVATE "${PROJECT_SOURCE_DIR}/include" "${PROJECT_SOURCE_DIR}/tests/wcw")
++    set(LIBRECOMP_WCW_TESTS_STAMP "${CMAKE_CURRENT_BINARY_DIR}/librecomp_wcw_tests.passed")
++    add_custom_command(
++        OUTPUT "${LIBRECOMP_WCW_TESTS_STAMP}"
++        COMMAND librecomp_wcw_tests
++        COMMAND ${CMAKE_COMMAND} -E touch "${LIBRECOMP_WCW_TESTS_STAMP}"
++        DEPENDS librecomp_wcw_tests
++        COMMENT "Running librecomp wcw unit tests"
++        VERBATIM
++    )
++    add_custom_target(librecomp_wcw_tests_run DEPENDS "${LIBRECOMP_WCW_TESTS_STAMP}")
++    add_dependencies(librecomp librecomp_wcw_tests_run)
++endif()
 diff --git a/librecomp/include/librecomp/mods.hpp b/librecomp/include/librecomp/mods.hpp
-index 37556bd..e3acf87 100644
+index 37556bd..f6c11bb 100644
 --- a/librecomp/include/librecomp/mods.hpp
 +++ b/librecomp/include/librecomp/mods.hpp
-@@ -397,6 +397,12 @@ namespace recomp {
+@@ -11,6 +11,7 @@
+ #include <unordered_set>
+ #include <unordered_map>
+ #include <array>
++#include <span>
+ #include <cstddef>
+ #include <variant>
+ #include <mutex>
+@@ -397,6 +398,12 @@ namespace recomp {
                  const std::unordered_map<uint32_t, uint16_t>& section_vrom_map,
                  const std::unordered_map<recomp_func_t*, overlays::BasePatchedFunction>& base_patched_funcs,
                  std::span<const uint8_t> decompressed_rom);
@@ -41,7 +79,7 @@ index 37556bd..e3acf87 100644
              void dirty_mod_configuration_thread_process();
              void rebuild_mod_order_lookup();
  
-@@ -429,6 +435,8 @@ namespace recomp {
+@@ -429,6 +436,8 @@ namespace recomp {
              std::unique_ptr<LiveRecompilerCodeHandle> regenerated_code_handle;
              // Code handle for base patched code that was regenerated to add hooks.
              std::unique_ptr<LiveRecompilerCodeHandle> base_patched_code_handle;
@@ -50,7 +88,7 @@ index 37556bd..e3acf87 100644
              // Map of hook definition to the entry hook slot's index.
              std::unordered_map<HookDefinition, size_t> hook_slots;
              // Tracks which hook slots have already been processed. Used to regenerate vanilla functions as needed
-@@ -627,6 +635,10 @@ namespace recomp {
+@@ -627,6 +636,17 @@ namespace recomp {
          void close_mods();
          std::filesystem::path get_mods_directory();
          std::optional<ModDetails> get_details_for_mod(const std::string& mod_id);
@@ -58,6 +96,13 @@ index 37556bd..e3acf87 100644
 +        // empty when none is active. A hack can change the save layout, so its saves (and the
 +        // pak images next to them) are kept apart from the stock game's.
 +        std::u8string get_rom_patch_save_subfolder();
++        // [wcw romhack] Functions the port repaired offline: its post-recompile pipeline (fix_switches,
++        // fix_selfentry, ...) and hand-edits, i.e. the game's RecompiledFuncs/repaired_functions.txt. A ROM-patch
++        // mod that changes one has it recompiled from the patched ROM by the live recompiler, which has none of
++        // those repairs, so the result can miscompile or lose a hand-edit. Warn: log each one and load the mod.
++        // Refuse: don't load the mod (FailedToLoadPatch). Call before the mods are loaded; later calls replace the list.
++        enum class RepairedFunctionPolicy { Warn, Refuse };
++        void register_repaired_functions(std::span<recomp_func_t* const> funcs, RepairedFunctionPolicy policy);
          std::vector<ModDetails> get_all_mod_details(const std::string& mod_game_id);
          size_t game_mode_count(const std::string& mod_game_id, bool include_disabled);
          recomp::Version get_mod_version(size_t mod_index);
@@ -85,6 +130,169 @@ index 35703bd..daba598 100644
 +extern "C" bool wcw_try_swap_overlay(uint32_t rom_off, int32_t ram_addr);
  
  #endif
+diff --git a/librecomp/include/librecomp/save_backup_rules.hpp b/librecomp/include/librecomp/save_backup_rules.hpp
+new file mode 100644
+index 0000000..552b8d5
+--- /dev/null
++++ b/librecomp/include/librecomp/save_backup_rules.hpp
+@@ -0,0 +1,59 @@
++#ifndef __RECOMP_SAVE_BACKUP_RULES_HPP__
++#define __RECOMP_SAVE_BACKUP_RULES_HPP__
++
++// [wcw saves] Pure rules for automatic save backups (aki-roadmap#50): backup file names, which backups to keep, when a
++// backup is due. No file I/O here (that is save_backups.cpp), so they are unit tested
++// (librecomp/tests/save_backup_rules_tests.cpp, run on every build).
++
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <vector>
++
++namespace recomp {
++    namespace save_backups {
++        // How many backups are kept per save file (the oldest beyond this are deleted).
++        constexpr size_t MaxBackupsPerFile = 10;
++        // A change-triggered backup is taken at most this often per save file (a launch backup always is).
++        constexpr int64_t MinChangeBackupIntervalSeconds = 10 * 60;
++
++        // A local date and time to the second, as written in backup names.
++        struct Timestamp {
++            int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
++            bool operator==(const Timestamp &other) const = default;
++            // Seconds since 1970-01-01 00:00:00 of the same (local) clock, proleptic Gregorian: orders timestamps and
++            // gives exact differences.
++            int64_t sort_key() const;
++        };
++
++        // Seconds between two timestamps (b - a), exact for any two dates.
++        int64_t seconds_between(const Timestamp &a, const Timestamp &b);
++
++        // "wwf.nomercy.us.bin" + 2026-10-14 03:15:02 -> "wwf.nomercy.us.20261014-031502.bin"; the stem is the save
++        // file name without its final ".bin" (".pak.bin" files keep ".pak" in the stem, so they never collide with the
++        // main save's backups).
++        std::string backup_file_name(const std::string &save_file_name, const Timestamp &when);
++
++        // The timestamp of a backup of save_file_name, if candidate is one; nullopt for anything else (another save
++        // file's backups, the pak file's backups, stray files, malformed dates).
++        std::optional<Timestamp> parse_backup_file_name(const std::string &save_file_name, const std::string &candidate);
++
++        // Backups to delete so at most keep remain: the oldest first. names are backup file names of one save file.
++        std::vector<std::string> backups_to_delete(const std::string &save_file_name, const std::vector<std::string> &names, size_t keep);
++
++        // Backups of one save file, newest first (what the restore menu lists).
++        std::vector<std::string> backups_newest_first(const std::string &save_file_name, const std::vector<std::string> &names);
++
++        enum class BackupReason { Launch, Change, BeforeRestore };
++
++        // Whether a backup is due now. Launch and BeforeRestore: always (when the save file exists). Change: when there
++        // is no backup yet, or the newest one is at least MinChangeBackupIntervalSeconds old (a game that saves
++        // constantly would otherwise rotate every backup out within minutes).
++        bool backup_due(BackupReason reason, const std::optional<Timestamp> &newest_backup, const Timestamp &now);
++
++        // "2026-10-14 03:15:02" for menus.
++        std::string display_time(const Timestamp &when);
++    }
++}
++
++#endif
+diff --git a/librecomp/include/librecomp/save_backups.hpp b/librecomp/include/librecomp/save_backups.hpp
+new file mode 100644
+index 0000000..5d33cc4
+--- /dev/null
++++ b/librecomp/include/librecomp/save_backups.hpp
+@@ -0,0 +1,60 @@
++#ifndef __RECOMP_SAVE_BACKUPS_HPP__
++#define __RECOMP_SAVE_BACKUPS_HPP__
++
++// [wcw saves] Automatic save backups (aki-roadmap#50). Timestamped copies of the game's save files (the cartridge
++// save <game>.bin and the Controller Pak image <game>.pak.bin) go to a backups/ folder next to them:
++// - at launch, before the game touches them;
++// - when the game writes them, at most every MinChangeBackupIntervalSeconds per file;
++// - before a restore replaces one (so a restore can be undone).
++// The newest MaxBackupsPerFile per file are kept. A restore picked in the menu is applied the next time the game
++// starts, before it reads its saves, so the running game can't overwrite it. Rules: save_backup_rules.hpp.
++
++#include <filesystem>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "librecomp/save_backup_rules.hpp"
++
++namespace recomp {
++    namespace save_backups {
++        struct BackupEntry {
++            std::filesystem::path save_file;   // the file it restores (e.g. saves/wwf.nomercy.us.bin)
++            std::filesystem::path backup_file; // saves/backups/wwf.nomercy.us.20261014-031502.bin
++            Timestamp when;
++            bool controller_pak = false;       // a .pak.bin (Controller Pak) backup
++        };
++
++        // The game's main save file: the running game's (ultramodern::get_save_file_path) once it has started, else
++        // the registered game's default location (the stock saves folder). Empty if neither is known.
++        std::filesystem::path main_save_file();
++
++        // Back up save_file now if it exists and the rules say a backup is due; then delete the oldest beyond
++        // MaxBackupsPerFile. Returns whether a backup was written. Errors are logged, never thrown.
++        bool backup_save_file(const std::filesystem::path &save_file, BackupReason reason);
++
++        // At game start: apply a pending restore, then take the launch backups of the main save and its pak file.
++        void on_game_start(const std::filesystem::path &main_save);
++
++        // The backups of the main save and its .pak.bin, newest first.
++        std::vector<BackupEntry> list_backups(const std::filesystem::path &main_save);
++
++        // When save_file was last written, or nullopt if it doesn't exist.
++        std::optional<Timestamp> last_write_time(const std::filesystem::path &save_file);
++
++        // Schedule entry to replace its save file the next time the game starts (one pending restore at a time; a new
++        // request replaces it). Returns false if it couldn't be recorded.
++        bool request_restore(const BackupEntry &entry);
++
++        // The pending restore for main_save's folder, if any.
++        std::optional<BackupEntry> pending_restore(const std::filesystem::path &main_save);
++
++        // Cancel a pending restore.
++        void cancel_restore(const std::filesystem::path &main_save);
++
++        // Now, on the local clock.
++        Timestamp now();
++    }
++}
++
++#endif
+diff --git a/librecomp/include/librecomp/startup_shutdown.hpp b/librecomp/include/librecomp/startup_shutdown.hpp
+new file mode 100644
+index 0000000..3bc006b
+--- /dev/null
++++ b/librecomp/include/librecomp/startup_shutdown.hpp
+@@ -0,0 +1,26 @@
++#ifndef __LIBRECOMP_STARTUP_SHUTDOWN_HPP__
++#define __LIBRECOMP_STARTUP_SHUTDOWN_HPP__
++
++#include <atomic>
++
++namespace recomp {
++    // [wcw fix] jessetbh/aki-roadmap#73. A quit (WCW_QUIT_AFTER, or closing the window
++    // before a game is picked) can land while the game start thread is still in
++    // ultramodern::preinit, which waits for the gfx thread to create the renderer. On
++    // Windows that creation touches the main thread's window (RT64's
++    // ApplicationWindow::setFullScreen calls SetWindowLongPtr), which only completes once
++    // the main thread processes window messages. recomp::start used to stop pumping as
++    // soon as `exited` was set and then block joining the game thread: a deadlock.
++    //
++    // Keep calling pump() until startup_done is true, then return. Shutdown proceeds as
++    // before afterwards, so a quit after startup behaves exactly as it used to.
++    template <typename Pump, typename Sleep>
++    void pump_until_startup_done(const std::atomic_bool& startup_done, Pump&& pump, Sleep&& sleep) {
++        while (!startup_done.load()) {
++            sleep();
++            pump();
++        }
++    }
++}
++
++#endif
 diff --git a/librecomp/src/ai.cpp b/librecomp/src/ai.cpp
 index 0195f2b..f5c4a50 100644
 --- a/librecomp/src/ai.cpp
@@ -184,7 +392,7 @@ index 4d6a01d..9e2dc24 100644
 +    ctx->f0.d = ret;
 +}
 diff --git a/librecomp/src/mods.cpp b/librecomp/src/mods.cpp
-index 0f7de83..e0e7790 100644
+index 0f7de83..3d6df3e 100644
 --- a/librecomp/src/mods.cpp
 +++ b/librecomp/src/mods.cpp
 @@ -1571,8 +1571,16 @@ void recomp::mods::ModContext::set_latest_game_mode_id(const std::string& game_m
@@ -234,10 +442,19 @@ index 0f7de83..e0e7790 100644
      }
  
      // Check that mod dependencies are met.
-@@ -2066,6 +2096,99 @@ std::unique_ptr<recomp::mods::LiveRecompilerCodeHandle> apply_regenlist(Regenera
+@@ -2066,6 +2096,130 @@ std::unique_ptr<recomp::mods::LiveRecompilerCodeHandle> apply_regenlist(Regenera
      return regenerated_code_handle;
  }
  
++// [wcw romhack] The game's offline-repaired functions (register_repaired_functions).
++static std::unordered_set<recomp_func_t*> repaired_functions{};
++static recomp::mods::RepairedFunctionPolicy repaired_function_policy = recomp::mods::RepairedFunctionPolicy::Warn;
++
++void recomp::mods::register_repaired_functions(std::span<recomp_func_t* const> funcs, RepairedFunctionPolicy policy) {
++    repaired_functions = std::unordered_set<recomp_func_t*>(funcs.begin(), funcs.end());
++    repaired_function_policy = policy;
++}
++
 +// [wcw romhack] A ROM patch can change code as well as data, but the recompiled functions are
 +// built from the unpatched ROM. Every recompiled function whose ROM bytes the patch changed is
 +// recompiled from the patched ROM with the live recompiler and replaces the static one. Only
@@ -251,6 +468,7 @@ index 0f7de83..e0e7790 100644
 +{
 +    RegeneratedList regenlist{};
 +    size_t num_skipped = 0;
++    std::vector<uint32_t> repaired_changed{};
 +    for (size_t section_index = 0; section_index < recomp::overlays::num_code_sections(); section_index++) {
 +        const SectionTableEntry& section = recomp::overlays::get_code_section(static_cast<uint16_t>(section_index));
 +        bool section_added = false;
@@ -275,6 +493,11 @@ index 0f7de83..e0e7790 100644
 +                    mod_id.c_str(), section.ram_addr + func.offset);
 +                num_skipped++;
 +                continue;
++            }
++
++            // Repaired offline by the port: recompiling it from the patch drops the repair.
++            if (repaired_functions.contains(func.func)) {
++                repaired_changed.push_back(section.ram_addr + func.offset);
 +            }
 +
 +            if (!section_added) {
@@ -313,6 +536,22 @@ index 0f7de83..e0e7790 100644
 +        mod_id.c_str(), regenlist.functions.size(), num_skipped);
 +    if (regenlist.functions.empty()) {
 +        return {};
++    }
++
++    if (!repaired_changed.empty()) {
++        std::string addresses{};
++        for (uint32_t addr : repaired_changed) {
++            char text[16];
++            snprintf(text, sizeof(text), "%s0x%08X", addresses.empty() ? "" : ", ", addr);
++            addresses += text;
++            fprintf(stderr, "[romhack] %s: 0x%08X was repaired by the port offline; recompiling it from the patch drops that repair\n",
++                mod_id.c_str(), addr);
++        }
++
++        if (repaired_function_policy == RepairedFunctionPolicy::Refuse) {
++            return { ModLoadErrorDetails{ mod_id, ModLoadError::FailedToLoadPatch,
++                "changes " + std::to_string(repaired_changed.size()) + " function(s) the port repaired (" + addresses + "); it needs a full recompile" } };
++        }
 +    }
 +
 +    for (const RegeneratedSection& section : regenlist.sections) {
@@ -488,19 +727,20 @@ index 8c8e5d1..ec6176b 100644
      for (auto it = loaded_sections.begin(); it != loaded_sections.end();) {
          const auto& section = sections_info.code_sections[it->section_table_index];
 diff --git a/librecomp/src/pi.cpp b/librecomp/src/pi.cpp
-index 62656ad..f6705d1 100644
+index 62656ad..232b0a0 100644
 --- a/librecomp/src/pi.cpp
 +++ b/librecomp/src/pi.cpp
-@@ -8,6 +8,8 @@
+@@ -8,6 +8,9 @@
  #include "librecomp/addresses.hpp"
  #include "librecomp/game.hpp"
  #include "librecomp/files.hpp"
 +#include "librecomp/overlays.hpp"
 +#include "librecomp/mods.hpp"
++#include "librecomp/save_backups.hpp"
  #include <ultramodern/ultra64.h>
  #include <ultramodern/ultramodern.hpp>
  
-@@ -63,6 +65,28 @@ extern "C" void osCreatePiManager_recomp(uint8_t* rdram, recomp_context* ctx) {
+@@ -63,6 +66,28 @@ extern "C" void osCreatePiManager_recomp(uint8_t* rdram, recomp_context* ctx) {
  
  void recomp::do_rom_read(uint8_t* rdram, gpr ram_address, uint32_t physical_addr, size_t num_bytes) {
      // TODO use word copies when possible
@@ -529,7 +769,18 @@ index 62656ad..f6705d1 100644
  
      // TODO handle misaligned DMA
      assert((physical_addr & 0x1) == 0 && "Only PI DMA from aligned ROM addresses is currently supported");
-@@ -195,6 +219,15 @@ void save_read(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t coun
+@@ -131,6 +156,10 @@ void update_save_file() {
+     if (saving_failed) {
+         ultramodern::error_handling::message_box("Failed to write to the save file. Check your file permissions and whether the save folder has been moved to Dropbox or similar, as this can cause issues.");
+     }
++    else {
++        // [wcw saves] Timestamped backup on change, rate-limited (aki-roadmap#50).
++        recomp::save_backups::backup_save_file(ultramodern::get_save_file_path(), recomp::save_backups::BackupReason::Change);
++    }
+ }
+ 
+ extern std::atomic_bool exited;
+@@ -195,6 +224,15 @@ void save_read(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t coun
      }
  }
  
@@ -545,20 +796,39 @@ index 62656ad..f6705d1 100644
  void save_clear(uint32_t start, uint32_t size, char value) {
      assert(start + size < save_context.save_buffer.size());
  
-@@ -241,7 +274,8 @@ void read_save_file() {
+@@ -241,7 +279,12 @@ void read_save_file() {
  }
  
  void ultramodern::init_saving(RDRAM_ARG1) {
 -    set_save_file_path(u8"", recomp::current_game_id());
 +    // [wcw romhack] A ROM-patch mod's saves live in saves/<mod id>/.
 +    set_save_file_path(recomp::mods::get_rom_patch_save_subfolder(), recomp::current_game_id());
++
++    // [wcw saves] Apply a restore picked in the menu, then back up the save files before the game reads them
++    // (aki-roadmap#50).
++    recomp::save_backups::on_game_start(ultramodern::get_save_file_path());
  
      save_context.save_buffer.resize(get_save_size(recomp::get_save_type()));
  
-@@ -266,6 +300,40 @@ void ultramodern::join_saving_thread() {
-     }
- }
- 
+@@ -263,6 +306,52 @@ void ultramodern::change_save_file(const std::u8string& subfolder, const std::u8
+ void ultramodern::join_saving_thread() {
+     if (save_context.saving_thread.joinable()) {
+         save_context.saving_thread.join();
++
++        // [wcw fix] The saving thread stops as soon as quit() is called, but game threads could
++        // still write the save until they park (aki-roadmap#3). recomp::start joins this after
++        // parking them, so flush any write that came in after the saving thread's last pass.
++        bool save_buffer_updated = false;
++        while (save_context.write_sempahore.tryWait()) {
++            save_buffer_updated = true;
++        }
++        if (save_buffer_updated) {
++            fprintf(stderr, "[wcw] shutdown: flushing save writes made after quit\n");
++            update_save_file();
++        }
++    }
++}
++
 +// [wcw] The AKI games (WCW World Tour rom 0xA21750/0xA69570, Revenge rom 0x3C770/0x834A0) have
 +// two CPU overlays that BOTH load to vram 0x80090000 (see each port's disasm docs and
 +// RecompiledFuncs/recomp_overlays.inl). The game DMAs the overlay code there and jumps to it;
@@ -590,13 +860,10 @@ index 62656ad..f6705d1 100644
 +            (rom_off >= 0xD2720u && rom_off < 0x13D1D0u))) {
 +            fprintf(stderr, "[wcw2k][ovl?] unmatched DMA rom=0x%06X -> 0x%08X\n", rom_off, dst);
 +        }
-+    }
-+}
-+
- void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_addr, uint32_t size, uint32_t direction) {
-     // TODO asynchronous transfer
-     // TODO implement unaligned DMA correctly
-@@ -273,6 +341,7 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
+     }
+ }
+ 
+@@ -273,6 +362,7 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
          if (physical_addr >= recomp::rom_base) {
              // read cart rom
              recomp::do_rom_read(rdram, rdram_address, physical_addr, size);
@@ -605,10 +872,42 @@ index 62656ad..f6705d1 100644
              // Send a message to the mq to indicate that the transfer completed
              ultramodern::enqueue_external_message(mq, 0, false, true);
 diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
-index 1200f77..34c8acb 100644
+index 1200f77..aad9c57 100644
 --- a/librecomp/src/recomp.cpp
 +++ b/librecomp/src/recomp.cpp
-@@ -498,6 +498,11 @@ void init(uint8_t* rdram, recomp_context* ctx, gpr entrypoint) {
+@@ -23,6 +23,8 @@
+ #include "ultramodern/error_handling.hpp"
+ #include "librecomp/addresses.hpp"
+ #include "librecomp/mods.hpp"
++#include "librecomp/save_backups.hpp"
++#include "librecomp/startup_shutdown.hpp"
+ #include "recompiler/live_recompiler.h"
+ 
+ #ifdef _WIN32
+@@ -55,6 +57,22 @@ std::filesystem::path config_path;
+ std::unordered_map<std::u8string, recomp::GameEntry> game_roms {};
+ // The global mod context.
+ std::unique_ptr<recomp::mods::ModContext> mod_context = std::make_unique<recomp::mods::ModContext>();
++
++// [wcw saves] The save file the backup menu works on (save_backups.hpp): the running game's, or before a game has
++// started, the first registered game's stock save (the ports register one game).
++std::filesystem::path recomp::save_backups::main_save_file() {
++    std::filesystem::path running = ultramodern::get_save_file_path();
++    if (!running.empty()) {
++        return running;
++    }
++
++    std::lock_guard<std::mutex> lock(game_roms_mutex);
++    if (game_roms.empty() || config_path.empty()) {
++        return {};
++    }
++
++    return config_path / u8"saves" / (game_roms.begin()->first + u8".bin");
++}
+ // The project's version.
+ recomp::Version project_version;
+ // The current game's save type.
+@@ -498,6 +516,11 @@ void init(uint8_t* rdram, recomp_context* ctx, gpr entrypoint) {
      // Load overlays in the first 1MB
      load_overlays(0x1000, (int32_t)entrypoint, 1024 * 1024);
  
@@ -620,12 +919,459 @@ index 1200f77..34c8acb 100644
      // Initial 1MB DMA (rom address 0x1000 = physical address 0x10001000)
      recomp::do_rom_read(rdram, entrypoint, 0x10001000, 0x100000);
  
+@@ -549,6 +572,9 @@ bool ultramodern::is_game_started() {
+ }
+ 
+ std::atomic_bool exited = false;
++// [wcw fix] Set by the game start thread once ultramodern::preinit has returned (the gfx
++// thread has finished creating the renderer). See recomp::pump_until_startup_done.
++static std::atomic_bool preinit_done = false;
+ moodycamel::LightweightSemaphore graphics_shutdown_ready;
+ 
+ void ultramodern::quit() {
+@@ -841,12 +867,15 @@ void recomp::start(
+     uint8_t* rdram;
+     bool alloc_failed;
+ #ifdef _WIN32
+-    rdram = reinterpret_cast<uint8_t*>(VirtualAlloc(nullptr, allocation_size, MEM_COMMIT | MEM_RESERVE, PAGE_NOACCESS));
+-    DWORD old_protect = 0;
++    // [wcw fix] Reserve the whole range but commit only mem_size (aki-roadmap#7). Committing all of allocation_size
++    // (4 GB) charged it to the process's private bytes and the system commit limit even though the guard region past
++    // mem_size is PAGE_NOACCESS and never touched: a fresh game showed ~4.5 GB private bytes with RT off. Reserved,
++    // uncommitted pages fault on access just like committed PAGE_NOACCESS ones, so invalid addresses are still caught.
++    rdram = reinterpret_cast<uint8_t*>(VirtualAlloc(nullptr, allocation_size, MEM_RESERVE, PAGE_NOACCESS));
+     alloc_failed = (rdram == nullptr);
+     if (!alloc_failed) {
+-        // VirtualProtect returns 0 on failure.
+-        alloc_failed = (VirtualProtect(rdram, mem_size, PAGE_READWRITE, &old_protect) == 0);
++        // VirtualAlloc returns nullptr on failure; committed pages are zero-initialized.
++        alloc_failed = (VirtualAlloc(rdram, mem_size, MEM_COMMIT, PAGE_READWRITE) == nullptr);
+         if (alloc_failed) {
+             VirtualFree(rdram, 0, MEM_RELEASE);
+         }
+@@ -878,6 +907,7 @@ void recomp::start(
+         ultramodern::set_native_thread_name("Game Start Thread");
+ 
+         ultramodern::preinit(rdram, window_handle);
++        preinit_done.store(true);
+ 
+         recomp_context context{};
+ 
+@@ -885,20 +915,41 @@ void recomp::start(
+         while (!wait_for_game_started(rdram, &context)) {}
+     }, window_handle, rdram};
+ 
+-    while (!exited) {
+-        ultramodern::sleep_milliseconds(1);
++    auto pump_gfx = [&gfx_callbacks, &gfx_data]() {
+         if (gfx_callbacks.update_gfx != nullptr) {
+             gfx_callbacks.update_gfx(gfx_data);
+         }
++    };
++    auto sleep_1ms = []() { ultramodern::sleep_milliseconds(1); };
++
++    while (!exited) {
++        sleep_1ms();
++        pump_gfx();
+     }
+ 
++    // [wcw fix] jessetbh/aki-roadmap#73: a quit during startup must keep the window's messages
++    // flowing until the renderer exists, or the gfx thread (stuck in a cross-thread window
++    // call) and this thread (joining the game thread) deadlock.
++    recomp::pump_until_startup_done(preinit_done, pump_gfx, sleep_1ms);
++
+     graphics_shutdown_ready.signal();
+ 
+     game_thread.join();
++    // [wcw fix] Shutdown ordering (aki-roadmap#3): stop everything that reads rdram before
++    // releasing it. Game threads park first (their last save writes land before the final
++    // flush in join_saving_thread), then the host threads that serve them stop.
++    bool game_threads_parked = ultramodern::park_game_threads(std::chrono::milliseconds{2000});
+     ultramodern::join_event_threads();
++    ultramodern::join_timer_thread();
+     ultramodern::join_thread_cleaner_thread();
+     ultramodern::join_saving_thread();
+-    
++
++    if (!game_threads_parked) {
++        // A game thread is still running and may read rdram; leave it mapped for the OS to
++        // reclaim at process exit.
++        return;
++    }
++
+     // Free rdram.
+     bool free_failed;
+ #ifdef _WIN32
+diff --git a/librecomp/src/save_backup_rules.cpp b/librecomp/src/save_backup_rules.cpp
+new file mode 100644
+index 0000000..d5244d5
+--- /dev/null
++++ b/librecomp/src/save_backup_rules.cpp
+@@ -0,0 +1,138 @@
++#include "librecomp/save_backup_rules.hpp"
++
++#include <algorithm>
++#include <cstdio>
++
++namespace recomp {
++    namespace save_backups {
++        // Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's days_from_civil).
++        static int64_t days_from_civil(int64_t y, int64_t m, int64_t d) {
++            y -= (m <= 2) ? 1 : 0;
++            const int64_t era = ((y >= 0) ? y : (y - 399)) / 400;
++            const int64_t yoe = y - era * 400;
++            const int64_t doy = (153 * (m + ((m > 2) ? -3 : 9)) + 2) / 5 + d - 1;
++            const int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
++            return era * 146097 + doe - 719468;
++        }
++
++        int64_t Timestamp::sort_key() const {
++            return days_from_civil(year, month, day) * 86400 + int64_t(hour) * 3600 + int64_t(minute) * 60 + second;
++        }
++
++        int64_t seconds_between(const Timestamp &a, const Timestamp &b) {
++            return b.sort_key() - a.sort_key();
++        }
++
++        static std::string stem_of(const std::string &save_file_name) {
++            const std::string ext = ".bin";
++            if ((save_file_name.size() > ext.size()) && (save_file_name.compare(save_file_name.size() - ext.size(), ext.size(), ext) == 0)) {
++                return save_file_name.substr(0, save_file_name.size() - ext.size());
++            }
++
++            return save_file_name;
++        }
++
++        std::string backup_file_name(const std::string &save_file_name, const Timestamp &when) {
++            char stamp[32];
++            snprintf(stamp, sizeof(stamp), "%04d%02d%02d-%02d%02d%02d", when.year, when.month, when.day, when.hour, when.minute, when.second);
++            return stem_of(save_file_name) + "." + stamp + ".bin";
++        }
++
++        static bool parse_digits(const std::string &s, size_t pos, size_t count, int &out) {
++            out = 0;
++            for (size_t i = pos; i < pos + count; i++) {
++                if ((s[i] < '0') || (s[i] > '9')) {
++                    return false;
++                }
++
++                out = out * 10 + (s[i] - '0');
++            }
++
++            return true;
++        }
++
++        std::optional<Timestamp> parse_backup_file_name(const std::string &save_file_name, const std::string &candidate) {
++            // <stem>.YYYYMMDD-HHMMSS.bin
++            const std::string stem = stem_of(save_file_name);
++            const size_t stampLength = 15;
++            const std::string ext = ".bin";
++            if (candidate.size() != stem.size() + 1 + stampLength + ext.size()) {
++                return std::nullopt;
++            }
++
++            if ((candidate.compare(0, stem.size(), stem) != 0) || (candidate[stem.size()] != '.') ||
++                (candidate.compare(candidate.size() - ext.size(), ext.size(), ext) != 0))
++            {
++                return std::nullopt;
++            }
++
++            const size_t p = stem.size() + 1;
++            Timestamp t;
++            if (!parse_digits(candidate, p, 4, t.year) || !parse_digits(candidate, p + 4, 2, t.month) || !parse_digits(candidate, p + 6, 2, t.day) ||
++                (candidate[p + 8] != '-') || !parse_digits(candidate, p + 9, 2, t.hour) || !parse_digits(candidate, p + 11, 2, t.minute) ||
++                !parse_digits(candidate, p + 13, 2, t.second))
++            {
++                return std::nullopt;
++            }
++
++            if ((t.month < 1) || (t.month > 12) || (t.day < 1) || (t.day > 31) || (t.hour > 23) || (t.minute > 59) || (t.second > 60)) {
++                return std::nullopt;
++            }
++
++            return t;
++        }
++
++        std::vector<std::string> backups_newest_first(const std::string &save_file_name, const std::vector<std::string> &names) {
++            std::vector<std::pair<int64_t, std::string>> dated;
++            for (const std::string &name : names) {
++                if (std::optional<Timestamp> t = parse_backup_file_name(save_file_name, name)) {
++                    dated.emplace_back(t->sort_key(), name);
++                }
++            }
++
++            // Newest first; equal times by name so the order is stable.
++            std::sort(dated.begin(), dated.end(), [](const auto &a, const auto &b) {
++                return (a.first != b.first) ? (a.first > b.first) : (a.second > b.second);
++            });
++
++            std::vector<std::string> out;
++            for (auto &d : dated) {
++                out.push_back(std::move(d.second));
++            }
++
++            return out;
++        }
++
++        std::vector<std::string> backups_to_delete(const std::string &save_file_name, const std::vector<std::string> &names, size_t keep) {
++            std::vector<std::string> sorted = backups_newest_first(save_file_name, names);
++            if (sorted.size() <= keep) {
++                return {};
++            }
++
++            // Oldest first.
++            std::vector<std::string> out(sorted.begin() + keep, sorted.end());
++            std::reverse(out.begin(), out.end());
++            return out;
++        }
++
++        bool backup_due(BackupReason reason, const std::optional<Timestamp> &newest_backup, const Timestamp &now) {
++            if (reason != BackupReason::Change) {
++                return true;
++            }
++
++            if (!newest_backup.has_value()) {
++                return true;
++            }
++
++            // A clock set back (newest backup "in the future") counts as old enough: never stop backing up.
++            const int64_t age = seconds_between(*newest_backup, now);
++            return (age < 0) || (age >= MinChangeBackupIntervalSeconds);
++        }
++
++        std::string display_time(const Timestamp &when) {
++            char text[32];
++            snprintf(text, sizeof(text), "%04d-%02d-%02d %02d:%02d:%02d", when.year, when.month, when.day, when.hour, when.minute, when.second);
++            return text;
++        }
++    }
++}
+diff --git a/librecomp/src/save_backups.cpp b/librecomp/src/save_backups.cpp
+new file mode 100644
+index 0000000..0751323
+--- /dev/null
++++ b/librecomp/src/save_backups.cpp
+@@ -0,0 +1,214 @@
++#include "librecomp/save_backups.hpp"
++
++#include <chrono>
++#include <cstdio>
++#include <ctime>
++#include <fstream>
++#include <mutex>
++#include <system_error>
++
++namespace recomp {
++    namespace save_backups {
++        // Backups (and the pending-restore note) of all files in one save folder.
++        static std::mutex backups_mutex;
++        static const char *RestoreNoteName = "restore.txt";
++
++        static std::filesystem::path backups_folder(const std::filesystem::path &save_file) {
++            return save_file.parent_path() / "backups";
++        }
++
++        static std::filesystem::path pak_file_of(const std::filesystem::path &main_save) {
++            std::filesystem::path p = main_save;
++            p.replace_extension(".pak.bin");
++            return p;
++        }
++
++        static Timestamp from_time_t(std::time_t t) {
++            std::tm local{};
++#ifdef _WIN32
++            localtime_s(&local, &t);
++#else
++            localtime_r(&t, &local);
++#endif
++            return Timestamp{ local.tm_year + 1900, local.tm_mon + 1, local.tm_mday, local.tm_hour, local.tm_min, local.tm_sec };
++        }
++
++        Timestamp now() {
++            return from_time_t(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
++        }
++
++        static std::vector<std::string> backup_names_in(const std::filesystem::path &folder) {
++            std::vector<std::string> names;
++            std::error_code ec;
++            for (std::filesystem::directory_iterator it(folder, ec), end; !ec && (it != end); it.increment(ec)) {
++                if (it->is_regular_file(ec)) {
++                    names.push_back(it->path().filename().string());
++                }
++            }
++
++            return names;
++        }
++
++        bool backup_save_file(const std::filesystem::path &save_file, BackupReason reason) {
++            std::lock_guard lock{ backups_mutex };
++            std::error_code ec;
++            if (save_file.empty() || !std::filesystem::is_regular_file(save_file, ec)) {
++                return false;
++            }
++
++            const std::filesystem::path folder = backups_folder(save_file);
++            const std::string save_name = save_file.filename().string();
++            const std::vector<std::string> existing = backup_names_in(folder);
++            const std::vector<std::string> newest = backups_newest_first(save_name, existing);
++            std::optional<Timestamp> newest_time;
++            if (!newest.empty()) {
++                newest_time = parse_backup_file_name(save_name, newest.front());
++            }
++
++            const Timestamp when = now();
++            if (!backup_due(reason, newest_time, when)) {
++                return false;
++            }
++
++            std::filesystem::create_directories(folder, ec);
++            const std::filesystem::path target = folder / backup_file_name(save_name, when);
++            std::filesystem::copy_file(save_file, target, std::filesystem::copy_options::overwrite_existing, ec);
++            if (ec) {
++                fprintf(stderr, "[saves] backup of %s failed: %s\n", save_name.c_str(), ec.message().c_str());
++                return false;
++            }
++
++            std::vector<std::string> names = existing;
++            names.push_back(target.filename().string());
++            for (const std::string &old : backups_to_delete(save_name, names, MaxBackupsPerFile)) {
++                std::filesystem::remove(folder / old, ec);
++            }
++
++            fprintf(stderr, "[saves] backed up %s -> backups/%s\n", save_name.c_str(), target.filename().string().c_str());
++            return true;
++        }
++
++        std::vector<BackupEntry> list_backups(const std::filesystem::path &main_save) {
++            std::lock_guard lock{ backups_mutex };
++            std::vector<BackupEntry> out;
++            if (main_save.empty()) {
++                return out;
++            }
++
++            const std::filesystem::path folder = backups_folder(main_save);
++            const std::vector<std::string> names = backup_names_in(folder);
++            for (const std::filesystem::path &save_file : { main_save, pak_file_of(main_save) }) {
++                const std::string save_name = save_file.filename().string();
++                for (const std::string &name : backups_newest_first(save_name, names)) {
++                    out.push_back(BackupEntry{ save_file, folder / name, *parse_backup_file_name(save_name, name), save_file != main_save });
++                }
++            }
++
++            std::stable_sort(out.begin(), out.end(), [](const BackupEntry &a, const BackupEntry &b) {
++                return a.when.sort_key() > b.when.sort_key();
++            });
++
++            return out;
++        }
++
++        std::optional<Timestamp> last_write_time(const std::filesystem::path &save_file) {
++            std::error_code ec;
++            const auto ftime = std::filesystem::last_write_time(save_file, ec);
++            if (ec) {
++                return std::nullopt;
++            }
++
++            const auto sys = std::chrono::clock_cast<std::chrono::system_clock>(ftime);
++            return from_time_t(std::chrono::system_clock::to_time_t(sys));
++        }
++
++        // The note holds two lines: the save file's name and the backup's name (both in the save's folder tree).
++        bool request_restore(const BackupEntry &entry) {
++            std::lock_guard lock{ backups_mutex };
++            std::error_code ec;
++            const std::filesystem::path folder = backups_folder(entry.save_file);
++            std::filesystem::create_directories(folder, ec);
++            std::ofstream note(folder / RestoreNoteName, std::ios::trunc);
++            if (!note.good()) {
++                return false;
++            }
++
++            note << entry.save_file.filename().string() << "\n" << entry.backup_file.filename().string() << "\n";
++            fprintf(stderr, "[saves] restore of %s scheduled for the next start\n", entry.backup_file.filename().string().c_str());
++            return note.good();
++        }
++
++        std::optional<BackupEntry> pending_restore(const std::filesystem::path &main_save) {
++            if (main_save.empty()) {
++                return std::nullopt;
++            }
++
++            const std::filesystem::path folder = backups_folder(main_save);
++            std::ifstream note(folder / RestoreNoteName);
++            std::string save_name, backup_name;
++            if (!note.good() || !std::getline(note, save_name) || !std::getline(note, backup_name)) {
++                return std::nullopt;
++            }
++
++            // Only files of this game's save folder, named like its own backups.
++            const std::filesystem::path save_file = main_save.parent_path() / save_name;
++            if ((save_file != main_save) && (save_file != pak_file_of(main_save))) {
++                return std::nullopt;
++            }
++
++            const std::optional<Timestamp> when = parse_backup_file_name(save_name, backup_name);
++            if (!when.has_value()) {
++                return std::nullopt;
++            }
++
++            return BackupEntry{ save_file, folder / backup_name, *when, save_file != main_save };
++        }
++
++        void cancel_restore(const std::filesystem::path &main_save) {
++            std::lock_guard lock{ backups_mutex };
++            std::error_code ec;
++            std::filesystem::remove(backups_folder(main_save) / RestoreNoteName, ec);
++        }
++
++        // Returns the file it restored (empty if none).
++        static std::filesystem::path apply_pending_restore(const std::filesystem::path &main_save) {
++            const std::optional<BackupEntry> entry = pending_restore(main_save);
++            cancel_restore(main_save);
++            if (!entry.has_value()) {
++                return {};
++            }
++
++            std::error_code ec;
++            if (!std::filesystem::is_regular_file(entry->backup_file, ec)) {
++                fprintf(stderr, "[saves] restore skipped: %s is gone\n", entry->backup_file.filename().string().c_str());
++                return {};
++            }
++
++            // Keep what's there now, so the restore can be undone from the same menu.
++            backup_save_file(entry->save_file, BackupReason::BeforeRestore);
++            std::filesystem::copy_file(entry->backup_file, entry->save_file, std::filesystem::copy_options::overwrite_existing, ec);
++            if (ec) {
++                fprintf(stderr, "[saves] restore of %s failed: %s\n", entry->backup_file.filename().string().c_str(), ec.message().c_str());
++                return {};
++            }
++
++            fprintf(stderr, "[saves] restored %s from backups/%s\n", entry->save_file.filename().string().c_str(), entry->backup_file.filename().string().c_str());
++            return entry->save_file;
++        }
++
++        void on_game_start(const std::filesystem::path &main_save) {
++            if (main_save.empty()) {
++                return;
++            }
++
++            // A just-restored file is already a backup, and its before-restore backup was taken this second: a launch
++            // backup would get the same name and overwrite it.
++            const std::filesystem::path restored = apply_pending_restore(main_save);
++            for (const std::filesystem::path &save_file : { main_save, pak_file_of(main_save) }) {
++                if (save_file != restored) {
++                    backup_save_file(save_file, BackupReason::Launch);
++                }
++            }
++        }
++    }
++}
 diff --git a/librecomp/src/si.cpp b/librecomp/src/si.cpp
 new file mode 100644
-index 0000000..1adf436
+index 0000000..a7fb08b
 --- /dev/null
 +++ b/librecomp/src/si.cpp
-@@ -0,0 +1,375 @@
+@@ -0,0 +1,380 @@
 +// [wcw] SI / PIF (joybus) emulation for games that use the RAW libultra SI primitives
 +// (__osSiRawStartDma / __osSiDeviceBusy) instead of the high-level osCont* API.
 +//
@@ -650,6 +1396,7 @@ index 0000000..1adf436
 +
 +#include "helpers.hpp"
 +#include "librecomp/files.hpp"
++#include "librecomp/save_backups.hpp"
 +
 +#define MAXCONTROLLERS 4
 +
@@ -738,6 +1485,10 @@ index 0000000..1adf436
 +    }
 +    if (failed) {
 +        fprintf(stderr, "[wcw2k][pak] FAILED to write pak image %s\n", path.string().c_str());
++    }
++    else {
++        // [wcw saves] Timestamped backup on change, rate-limited (aki-roadmap#50).
++        recomp::save_backups::backup_save_file(path, recomp::save_backups::BackupReason::Change);
 +    }
 +}
 +
@@ -1031,6 +1782,341 @@ index ae0f44f..aa13222 100644
      if (task->t.type == M_GFXTASK) {
          //printf("[sp] Gfx task: %08X\n", (uint32_t)ctx->r4);
      } else if (task->t.type == M_AUDTASK) {
+diff --git a/librecomp/src/vi.cpp b/librecomp/src/vi.cpp
+index 1f3a4cf..fbcea9f 100644
+--- a/librecomp/src/vi.cpp
++++ b/librecomp/src/vi.cpp
+@@ -47,6 +47,8 @@ extern uint64_t total_vis;
+ extern "C" void wait_one_frame(uint8_t* rdram, recomp_context* ctx) {
+     uint64_t cur_vis = total_vis;
+     while (cur_vis == total_vis) {
++        // [wcw fix] The VI thread is gone after quit(); park instead of spinning on it (aki-roadmap#3).
++        ultramodern::park_game_thread_if_quitting();
+         std::this_thread::yield();
+     }
+ }
+diff --git a/librecomp/tests/wcw/save_backup_rules_tests.cpp b/librecomp/tests/wcw/save_backup_rules_tests.cpp
+new file mode 100644
+index 0000000..6d5a504
+--- /dev/null
++++ b/librecomp/tests/wcw/save_backup_rules_tests.cpp
+@@ -0,0 +1,127 @@
++//
++// librecomp
++//
++
++// [wcw] Unit tests for librecomp/save_backup_rules (automatic save backups, aki-roadmap#50). Built and run as part of
++// every librecomp build (LIBRECOMP_WCW_TESTS); a failure fails the build.
++
++#include "librecomp/save_backup_rules.hpp"
++
++#include <algorithm>
++#include <string>
++#include <vector>
++
++#include "wcw_test.h"
++
++using namespace recomp::save_backups;
++
++static Timestamp at(int y, int mo, int d, int h, int mi, int s) {
++    return Timestamp{ y, mo, d, h, mi, s };
++}
++
++// Names
++
++TEST_CASE("names: a backup is the save's name with a sortable timestamp before .bin") {
++    CHECK(backup_file_name("wwf.nomercy.us.bin", at(2026, 10, 14, 3, 15, 2)) == "wwf.nomercy.us.20261014-031502.bin");
++    CHECK(backup_file_name("wwf.nomercy.us.pak.bin", at(2026, 1, 2, 23, 59, 59)) == "wwf.nomercy.us.pak.20260102-235959.bin");
++}
++
++TEST_CASE("names: a backup name parses back to its timestamp") {
++    const Timestamp t = at(2026, 10, 14, 3, 15, 2);
++    const auto parsed = parse_backup_file_name("wwf.nomercy.us.bin", backup_file_name("wwf.nomercy.us.bin", t));
++    CHECK(parsed.has_value());
++    CHECK(parsed.has_value() && (*parsed == t));
++}
++
++TEST_CASE("names: the main save and its pak file never claim each other's backups") {
++    const std::string mainBackup = backup_file_name("wcw.bin", at(2026, 10, 14, 3, 15, 2));
++    const std::string pakBackup = backup_file_name("wcw.pak.bin", at(2026, 10, 14, 3, 15, 2));
++    CHECK(!parse_backup_file_name("wcw.bin", pakBackup).has_value());
++    CHECK(!parse_backup_file_name("wcw.pak.bin", mainBackup).has_value());
++    CHECK(parse_backup_file_name("wcw.pak.bin", pakBackup).has_value());
++}
++
++TEST_CASE("names: other files are not backups (no restore of stray or malformed files)") {
++    const std::string save = "vpw.vpw2.jp.bin";
++    CHECK(!parse_backup_file_name(save, "vpw.vpw2.jp.bin").has_value());
++    CHECK(!parse_backup_file_name(save, "vpw.vpw2.jp.bin.bak").has_value());
++    CHECK(!parse_backup_file_name(save, "restore.txt").has_value());
++    CHECK(!parse_backup_file_name(save, "vpw.vpw2.jp.2026101-031502.bin").has_value());
++    CHECK(!parse_backup_file_name(save, "vpw.vpw2.jp.20261014_031502.bin").has_value());
++    CHECK(!parse_backup_file_name(save, "vpw.vpw2.jp.20261314-031502.bin").has_value());
++    CHECK(!parse_backup_file_name(save, "vpw.vpw2.jp.20261014-251502.bin").has_value());
++    CHECK(!parse_backup_file_name(save, "other.20261014-031502.bin").has_value());
++}
++
++// Rotation
++
++TEST_CASE("rotation: listing is newest first, across days and years") {
++    const std::string save = "s.bin";
++    const std::vector<std::string> names = {
++        backup_file_name(save, at(2025, 12, 31, 23, 0, 0)),
++        backup_file_name(save, at(2026, 1, 1, 0, 0, 1)),
++        "s.bin", "junk.txt",
++        backup_file_name(save, at(2026, 1, 1, 0, 0, 0)),
++    };
++    const std::vector<std::string> sorted = backups_newest_first(save, names);
++    CHECK_EQ(sorted.size(), size_t(3));
++    CHECK(sorted[0] == backup_file_name(save, at(2026, 1, 1, 0, 0, 1)));
++    CHECK(sorted[2] == backup_file_name(save, at(2025, 12, 31, 23, 0, 0)));
++}
++
++TEST_CASE("rotation: the oldest beyond the limit are deleted, oldest first") {
++    const std::string save = "s.bin";
++    std::vector<std::string> names;
++    for (int m = 0; m < 13; m++) {
++        names.push_back(backup_file_name(save, at(2026, 10, 14, 12, m, 0)));
++    }
++    std::reverse(names.begin(), names.end());
++
++    const std::vector<std::string> doomed = backups_to_delete(save, names, MaxBackupsPerFile);
++    CHECK_EQ(doomed.size(), size_t(3));
++    CHECK(doomed[0] == backup_file_name(save, at(2026, 10, 14, 12, 0, 0)));
++    CHECK(doomed[2] == backup_file_name(save, at(2026, 10, 14, 12, 2, 0)));
++}
++
++TEST_CASE("rotation: never deletes another file's backups or anything that isn't a backup") {
++    const std::string save = "s.bin";
++    std::vector<std::string> names = { "s.pak.20200101-000000.bin", "s.bin", "notes.txt" };
++    for (int m = 0; m < 12; m++) {
++        names.push_back(backup_file_name(save, at(2026, 10, 14, 12, m, 0)));
++    }
++    for (const std::string &name : backups_to_delete(save, names, MaxBackupsPerFile)) {
++        CHECK(parse_backup_file_name(save, name).has_value());
++    }
++    CHECK(backups_to_delete(save, { "s.bin", "notes.txt" }, MaxBackupsPerFile).empty());
++}
++
++// When a backup is due
++
++TEST_CASE("due: launch and before-restore backups are always taken") {
++    const Timestamp now = at(2026, 10, 14, 3, 0, 0);
++    CHECK(backup_due(BackupReason::Launch, now, now));
++    CHECK(backup_due(BackupReason::BeforeRestore, now, now));
++    CHECK(backup_due(BackupReason::Launch, std::nullopt, now));
++}
++
++TEST_CASE("due: change backups are rate-limited so a game that saves constantly can't rotate out every backup") {
++    const Timestamp now = at(2026, 10, 14, 3, 30, 0);
++    CHECK(backup_due(BackupReason::Change, std::nullopt, now));
++    CHECK(!backup_due(BackupReason::Change, at(2026, 10, 14, 3, 25, 0), now));
++    CHECK(!backup_due(BackupReason::Change, at(2026, 10, 14, 3, 20, 1), now));
++    CHECK(backup_due(BackupReason::Change, at(2026, 10, 14, 3, 20, 0), now));
++    // Across midnight and month ends.
++    CHECK(backup_due(BackupReason::Change, at(2026, 9, 30, 23, 55, 0), at(2026, 10, 1, 0, 5, 0)));
++    CHECK(!backup_due(BackupReason::Change, at(2026, 9, 30, 23, 55, 0), at(2026, 10, 1, 0, 4, 59)));
++}
++
++TEST_CASE("due: a clock set back never stops change backups") {
++    CHECK(backup_due(BackupReason::Change, at(2027, 1, 1, 0, 0, 0), at(2026, 10, 14, 3, 0, 0)));
++}
++
++TEST_CASE("time: exact differences, including leap days") {
++    CHECK_EQ(seconds_between(at(2024, 2, 28, 0, 0, 0), at(2024, 3, 1, 0, 0, 0)), int64_t(2 * 86400));
++    CHECK_EQ(seconds_between(at(2026, 2, 28, 0, 0, 0), at(2026, 3, 1, 0, 0, 0)), int64_t(86400));
++    CHECK_EQ(at(1970, 1, 1, 0, 0, 1).sort_key(), int64_t(1));
++    CHECK(display_time(at(2026, 10, 14, 3, 15, 2)) == "2026-10-14 03:15:02");
++}
+diff --git a/librecomp/tests/wcw/startup_shutdown_tests.cpp b/librecomp/tests/wcw/startup_shutdown_tests.cpp
+new file mode 100644
+index 0000000..710fd51
+--- /dev/null
++++ b/librecomp/tests/wcw/startup_shutdown_tests.cpp
+@@ -0,0 +1,102 @@
++//
++// N64ModernRuntime (librecomp)
++//
++
++// [wcw] Unit tests for librecomp/startup_shutdown.hpp (quitting while the game is still starting up). Built and run
++// as part of every librecomp build (LIBRECOMP_WCW_TESTS); a failure fails the build. Each test names the bug it
++// guards against where there was one.
++
++#include "librecomp/startup_shutdown.hpp"
++
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <mutex>
++#include <thread>
++
++#include "wcw_test.h"
++
++using namespace std::chrono_literals;
++
++namespace {
++    // A cross-thread call that only completes once the owner thread services it, like a Win32 SendMessage to a
++    // window owned by the main thread: the caller blocks until the owner pumps its messages.
++    struct OwnerThreadCall {
++        std::mutex mutex;
++        std::condition_variable cv;
++        bool pending = false;
++        bool serviced = false;
++
++        void call() {
++            std::unique_lock lock{ mutex };
++            pending = true;
++            cv.wait(lock, [this] { return serviced; });
++        }
++
++        void service() {
++            std::lock_guard lock{ mutex };
++            if (pending && !serviced) {
++                serviced = true;
++                cv.notify_all();
++            }
++        }
++    };
++
++    void sleep_1ms() {
++        std::this_thread::sleep_for(1ms);
++    }
++}
++
++TEST_CASE("quit during startup: shutdown completes while the renderer still needs the window (#73 hang)") {
++    // The game start thread (preinit) waits on the gfx thread, which makes a window call that only the main thread
++    // can service. Quit has already been requested, so the main thread has left its normal pump loop: it must keep
++    // pumping until startup is done, then join. The old code went straight to the join and hung forever.
++    OwnerThreadCall window_call;
++    std::atomic_bool startup_done = false;
++    std::thread game_start_thread{ [&] {
++        window_call.call();          // RT64 ApplicationWindow::setFullScreen -> SetWindowLongPtr
++        startup_done.store(true);    // ultramodern::preinit returned
++    } };
++
++    std::atomic_bool shutdown_finished = false;
++    std::thread main_thread{ [&] {
++        recomp::pump_until_startup_done(startup_done, [&] { window_call.service(); }, sleep_1ms);
++        game_start_thread.join();
++        shutdown_finished.store(true);
++    } };
++
++    const auto deadline = std::chrono::steady_clock::now() + 5s;
++    while (!shutdown_finished.load() && std::chrono::steady_clock::now() < deadline) {
++        std::this_thread::sleep_for(1ms);
++    }
++    CHECK(shutdown_finished.load());
++
++    // On failure, break the deadlock ourselves so the test binary still exits and reports.
++    window_call.service();
++    main_thread.join();
++}
++
++TEST_CASE("quit after startup: no extra pumping, shutdown goes straight on as before") {
++    std::atomic_bool startup_done = true;
++    int pumps = 0;
++    int sleeps = 0;
++    recomp::pump_until_startup_done(startup_done, [&] { pumps++; }, [&] { sleeps++; });
++    CHECK_EQ(pumps, 0);
++    CHECK_EQ(sleeps, 0);
++}
++
++TEST_CASE("quit during startup: pumping stops as soon as startup is done") {
++    std::atomic_bool startup_done = false;
++    int pumps = 0;
++    recomp::pump_until_startup_done(startup_done, [&] {
++        pumps++;
++        if (pumps == 3) {
++            startup_done.store(true);
++        }
++    }, [] {});
++    CHECK_EQ(pumps, 3);
++}
++
++int main() {
++    return WcwTest::runAll("librecomp wcw tests");
++}
+diff --git a/librecomp/tests/wcw/wcw_test.h b/librecomp/tests/wcw/wcw_test.h
+new file mode 100644
+index 0000000..0db070c
+--- /dev/null
++++ b/librecomp/tests/wcw/wcw_test.h
+@@ -0,0 +1,75 @@
++//
++// N64ModernRuntime (librecomp)
++//
++
++// [wcw] Minimal unit test harness for the wcw tests: TEST_CASE registers a test, CHECK / CHECK_NEAR record failures
++// without stopping the test, and runAll() runs everything and returns the process exit code.
++
++#pragma once
++
++#include <cmath>
++#include <cstdio>
++#include <functional>
++#include <string>
++#include <vector>
++
++namespace WcwTest {
++    struct Case {
++        const char *name;
++        std::function<void()> body;
++    };
++
++    inline std::vector<Case> &cases() {
++        static std::vector<Case> list;
++        return list;
++    }
++
++    inline int &failures() {
++        static int count = 0;
++        return count;
++    }
++
++    struct Registrar {
++        Registrar(const char *name, std::function<void()> body) {
++            cases().push_back({ name, std::move(body) });
++        }
++    };
++
++    inline void fail(const char *file, int line, const std::string &message) {
++        fprintf(stderr, "  FAILED %s:%d: %s\n", file, line, message.c_str());
++        failures()++;
++    }
++
++    inline int runAll(const char *suite) {
++        int failedCases = 0;
++        for (const Case &c : cases()) {
++            const int before = failures();
++            c.body();
++            if (failures() != before) {
++                fprintf(stderr, "[%s] FAIL %s\n", suite, c.name);
++                failedCases++;
++            }
++        }
++
++        fprintf(stderr, "[%s] %zu tests, %d failed\n", suite, cases().size(), failedCases);
++        return (failedCases == 0) ? 0 : 1;
++    }
++};
++
++#define WCW_TEST_CONCAT2(a, b) a##b
++#define WCW_TEST_CONCAT(a, b) WCW_TEST_CONCAT2(a, b)
++#define TEST_CASE(name) \
++    static void WCW_TEST_CONCAT(wcwTest_, __LINE__)(); \
++    static WcwTest::Registrar WCW_TEST_CONCAT(wcwTestRegistrar_, __LINE__)(name, WCW_TEST_CONCAT(wcwTest_, __LINE__)); \
++    static void WCW_TEST_CONCAT(wcwTest_, __LINE__)()
++
++#define CHECK(expr) \
++    do { if (!(expr)) { WcwTest::fail(__FILE__, __LINE__, #expr); } } while (0)
++
++#define CHECK_EQ(a, b) \
++    do { const auto wcwA = (a); const auto wcwB = (b); if (!(wcwA == wcwB)) { \
++        WcwTest::fail(__FILE__, __LINE__, std::string(#a " == " #b " (") + std::to_string(wcwA) + " vs " + std::to_string(wcwB) + ")"); } } while (0)
++
++#define CHECK_NEAR(a, b, eps) \
++    do { const double wcwA = double(a); const double wcwB = double(b); if (!(std::fabs(wcwA - wcwB) <= double(eps))) { \
++        WcwTest::fail(__FILE__, __LINE__, std::string(#a " ~= " #b " (") + std::to_string(wcwA) + " vs " + std::to_string(wcwB) + ")"); } } while (0)
 diff --git a/ultramodern/include/ultramodern/input.hpp b/ultramodern/include/ultramodern/input.hpp
 index 1dab1b8..8fb216d 100644
 --- a/ultramodern/include/ultramodern/input.hpp
@@ -1055,7 +2141,7 @@ index 1dab1b8..8fb216d 100644
  }
  
 diff --git a/ultramodern/include/ultramodern/ultramodern.hpp b/ultramodern/include/ultramodern/ultramodern.hpp
-index 3b28af3..4663452 100644
+index 3b28af3..56efc8b 100644
 --- a/ultramodern/include/ultramodern/ultramodern.hpp
 +++ b/ultramodern/include/ultramodern/ultramodern.hpp
 @@ -57,6 +57,15 @@ void wait_for_external_message(RDRAM_ARG1);
@@ -1087,6 +2173,22 @@ index 3b28af3..4663452 100644
  
  struct audio_callbacks_t {
      using queue_samples_t = void(int16_t*, size_t);
+@@ -126,6 +141,15 @@ void quit();
+ void join_event_threads();
+ void join_thread_cleaner_thread();
+ void join_saving_thread();
++// [wcw fix] Shutdown ordering (aki-roadmap#3). After quit(), game threads stop at their next
++// scheduler point instead of running on; park_game_threads wakes the blocked ones so they get
++// there too, and returns whether every game thread stopped within the timeout. rdram may only
++// be released when it returns true. join_timer_thread stops the timer thread, which reads
++// OSTimers in rdram.
++void park_game_thread_if_quitting();
++bool park_game_threads(std::chrono::milliseconds timeout);
++void wake_external_message_waiters(int count);
++void join_timer_thread();
+ 
+ void set_audio_callbacks(const audio_callbacks_t& callbacks);
+ 
 diff --git a/ultramodern/src/audio.cpp b/ultramodern/src/audio.cpp
 index 3198be0..966711a 100644
 --- a/ultramodern/src/audio.cpp
@@ -1532,7 +2634,7 @@ index a170407..07b6997 100644
      ultramodern::send_si_message();
  
 diff --git a/ultramodern/src/mesgqueue.cpp b/ultramodern/src/mesgqueue.cpp
-index 961de3d..f054a6e 100644
+index 961de3d..cf62b38 100644
 --- a/ultramodern/src/mesgqueue.cpp
 +++ b/ultramodern/src/mesgqueue.cpp
 @@ -1,4 +1,12 @@
@@ -1548,7 +2650,7 @@ index 961de3d..f054a6e 100644
  
  #include "blockingconcurrentqueue.h"
  
-@@ -10,34 +18,180 @@ struct QueuedMessage {
+@@ -10,48 +18,219 @@ struct QueuedMessage {
      OSMesg mesg;
      bool jam;
      bool requeue_if_blocked;
@@ -1579,6 +2681,14 @@ index 961de3d..f054a6e 100644
  void ultramodern::enqueue_external_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, bool requeue_if_blocked) {
 -    external_messages.enqueue({mq, msg, jam, requeue_if_blocked});
 +    external_messages.enqueue({mq, msg, jam, requeue_if_blocked, wcw_steady_ms()});
++}
++
++// [wcw fix] Shutdown (aki-roadmap#3): wake threads blocked in wait_for_external_message so they
++// reach its park check. The null-queue messages are never delivered: every consumer parks first.
++void ultramodern::wake_external_message_waiters(int count) {
++    for (int i = 0; i < count; i++) {
++        external_messages.enqueue({NULLPTR, NULLPTR, false, false, wcw_steady_ms()});
++    }
  }
  
  bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block);
@@ -1615,6 +2725,7 @@ index 961de3d..f054a6e 100644
 +}
 +
  void dequeue_external_messages(RDRAM_ARG1) {
++    ultramodern::park_game_thread_if_quitting(); // [wcw fix] see park_game_threads
      QueuedMessage to_send;
      std::vector<QueuedMessage> requeued_messages{};
 +    int64_t now_ms = wcw_steady_ms();
@@ -1706,6 +2817,7 @@ index 961de3d..f054a6e 100644
      external_messages.wait_dequeue(to_send);
 -    if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
 -        external_messages.enqueue(to_send);
++    ultramodern::park_game_thread_if_quitting(); // [wcw fix] see park_game_threads
 +    int64_t now_ms = wcw_steady_ms();
 +    do {
 +        if (do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false)) {
@@ -1733,9 +2845,10 @@ index 961de3d..f054a6e 100644
      }
  }
  
-@@ -45,13 +199,27 @@ void ultramodern::wait_for_external_message_timed(RDRAM_ARG u32 millis) {
+ void ultramodern::wait_for_external_message_timed(RDRAM_ARG u32 millis) {
      QueuedMessage to_send;
      if (external_messages.wait_dequeue_timed(to_send, std::chrono::milliseconds{millis})) {
++        ultramodern::park_game_thread_if_quitting(); // [wcw fix] see park_game_threads
          if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
 -            external_messages.enqueue(to_send);
 +            // [wcw fix] Same grace-window drop as dequeue_external_messages above.
@@ -1762,7 +2875,7 @@ index 961de3d..f054a6e 100644
      mq->blocked_on_recv = NULLPTR;
      mq->blocked_on_send = NULLPTR;
      mq->msgCount = count;
-@@ -72,22 +240,68 @@ s32 MQ_IS_FULL(OSMesgQueue* mq) {
+@@ -72,22 +251,68 @@ s32 MQ_IS_FULL(OSMesgQueue* mq) {
      return MQ_GET_COUNT(mq) >= mq->msgCount;
  }
  
@@ -1831,7 +2944,7 @@ index 961de3d..f054a6e 100644
      
      if (jam) {
          // Jams insert at the head of the message queue's buffer.
-@@ -105,7 +319,11 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block) {
+@@ -105,7 +330,11 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block) {
      // If any threads were blocked on receiving from this message queue, pop the first one and schedule it.
      PTR(PTR(OSThread)) blocked_queue = GET_MEMBER(OSMesgQueue, mq_, blocked_on_recv);
      if (!ultramodern::thread_queue_empty(PASS_RDRAM blocked_queue)) {
@@ -1844,7 +2957,7 @@ index 961de3d..f054a6e 100644
      }
      
      return true;
-@@ -122,6 +340,10 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
+@@ -122,6 +351,10 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
          // Otherwise, yield this thread in a loop until the queue is no longer full
          while (MQ_IS_EMPTY(mq)) {
              debug_printf("[Message Queue] Thread %d is blocked on receive\n", TO_PTR(OSThread, ultramodern::this_thread())->id);
@@ -1855,7 +2968,7 @@ index 961de3d..f054a6e 100644
              ultramodern::thread_queue_insert(PASS_RDRAM GET_MEMBER(OSMesgQueue, mq_, blocked_on_recv), ultramodern::this_thread());
              ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
          }
-@@ -137,7 +359,11 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
+@@ -137,7 +370,11 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
      // If any threads were blocked on sending to this message queue, pop the first one and schedule it.
      PTR(PTR(OSThread)) blocked_queue = GET_MEMBER(OSMesgQueue, mq_, blocked_on_send);
      if (!ultramodern::thread_queue_empty(PASS_RDRAM blocked_queue)) {
@@ -1868,7 +2981,7 @@ index 961de3d..f054a6e 100644
      }
  
      return true;
-@@ -146,7 +372,19 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
+@@ -146,7 +383,19 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
  extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags) {
      OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
      bool jam = false;
@@ -1889,7 +3002,7 @@ index 961de3d..f054a6e 100644
      // Don't directly send to the message queue if this isn't a game thread to avoid contention.
      if (!ultramodern::is_game_thread()) {
          ultramodern::enqueue_external_message(mq_, msg, jam, false);
-@@ -156,9 +394,21 @@ extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags)
+@@ -156,9 +405,21 @@ extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags)
      // Handle any messages that have been received from an external thread.
      dequeue_external_messages(PASS_RDRAM1);
  
@@ -1912,7 +3025,7 @@ index 961de3d..f054a6e 100644
      // Check the queue to see if this thread should swap execution to another.
      ultramodern::check_running_queue(PASS_RDRAM1);
  
-@@ -195,11 +445,26 @@ extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32
+@@ -195,11 +456,26 @@ extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32
      // Handle any messages that have been received from an external thread.
      dequeue_external_messages(PASS_RDRAM1);
  
@@ -1941,7 +3054,7 @@ index 961de3d..f054a6e 100644
      return received ? 0 : -1;
  }
 diff --git a/ultramodern/src/scheduling.cpp b/ultramodern/src/scheduling.cpp
-index a22f747..4acc64d 100644
+index a22f747..30aec48 100644
 --- a/ultramodern/src/scheduling.cpp
 +++ b/ultramodern/src/scheduling.cpp
 @@ -2,6 +2,10 @@
@@ -1964,10 +3077,11 @@ index a22f747..4acc64d 100644
      ultramodern::thread_queue_insert(PASS_RDRAM ultramodern::running_queue, ultramodern::this_thread());
      TO_PTR(OSThread, ultramodern::this_thread())->state = OSThreadState::QUEUED;
      // Unpause the target thread and wait for this one to be unpaused.
-@@ -16,10 +22,21 @@ void swap_to_thread(RDRAM_ARG OSThread *to) {
+@@ -16,10 +22,22 @@ void swap_to_thread(RDRAM_ARG OSThread *to) {
  }
  
  void ultramodern::check_running_queue(RDRAM_ARG1) {
++    ultramodern::park_game_thread_if_quitting(); // [wcw fix] see park_game_threads in threads.cpp
 +    // [wcw2k] a starvation-valve-boosted thread keeps the CPU for its boost window
 +    // (see wcw2k_pop_starved in threads.cpp) — skipping the priority preemption here
 +    // is what lets it do a frame of work instead of one OS call per valve fire.
@@ -2046,7 +3160,7 @@ index f9c0fa1..c6749e4 100644
      TO_PTR(OSThread, ret)->queue = NULLPTR;
      debug_printf("[Thread Queue] Popped thread %d from queue 0x%08X\n", TO_PTR(OSThread, ret)->id, (uintptr_t)queue_);
 diff --git a/ultramodern/src/threads.cpp b/ultramodern/src/threads.cpp
-index 812c556..4d8cd97 100644
+index 812c556..5401def 100644
 --- a/ultramodern/src/threads.cpp
 +++ b/ultramodern/src/threads.cpp
 @@ -1,5 +1,8 @@
@@ -2058,7 +3172,34 @@ index 812c556..4d8cd97 100644
  #include <cassert>
  #include <string>
  
-@@ -92,7 +95,8 @@ void ultramodern::set_native_thread_priority(ThreadPriority pri) {
+@@ -34,6 +37,26 @@ thread_local bool is_main_thread = false;
+ thread_local bool is_game_thread = false;
+ thread_local PTR(OSThread) thread_self = NULLPTR;
+ 
++// [wcw fix] Shutdown ordering (aki-roadmap#3). recomp::start used to release rdram while game
++// threads were still alive: the one running kept running, and the idle thread kept cycling
++// undeliverable external messages through do_send, which reads the target queue in rdram — an
++// access violation at rdram+<queue>+8 (validCount) when quitting mid-match. Now a game thread
++// that reaches a scheduler point after quit() parks there for good, and rdram is only released
++// once every live game thread has parked. Parked threads end with the process.
++extern std::atomic_bool exited;
++static std::atomic_int live_game_threads{0};
++static std::atomic_int parked_game_threads{0};
++
++void ultramodern::park_game_thread_if_quitting() {
++    if (!is_game_thread || !exited.load()) {
++        return;
++    }
++    parked_game_threads.fetch_add(1);
++    for (;;) {
++        std::this_thread::sleep_for(std::chrono::hours(1));
++    }
++}
++
+ void ultramodern::set_main_thread() {
+     ::is_game_thread = true;
+     is_main_thread = true;
+@@ -92,7 +115,8 @@ void ultramodern::set_native_thread_priority(ThreadPriority pri) {
              throw std::runtime_error("Invalid thread priority!");
              break;
      }
@@ -2068,7 +3209,7 @@ index 812c556..4d8cd97 100644
  }
  #elif defined(__linux__)
  #include <sys/prctl.h>
-@@ -146,45 +150,377 @@ void ultramodern::set_native_thread_name(const std::string& name) {
+@@ -146,47 +170,382 @@ void ultramodern::set_native_thread_name(const std::string& name) {
  void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
  #endif
  
@@ -2078,6 +3219,8 @@ index 812c556..4d8cd97 100644
 +
  void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
      thread_context->running.wait();
++    ultramodern::park_game_thread_if_quitting(); // [wcw fix] see park_game_threads
++
      // If this thread's context was replaced by another thread or deleted, destroy it again from its own context.
      // This will trigger thread cleanup instead.
 -    if (TO_PTR(OSThread, ultramodern::this_thread())->context != thread_context) {
@@ -2137,9 +3280,12 @@ index 812c556..4d8cd97 100644
 +    auto it = wcw2k_context_map.find((int32_t)t_);
 +    if (it != wcw2k_context_map.end()) {
 +        it->second.priority = pri;
-+    }
+     }
 +}
-+
+ 
+-    OSThread* to_run = TO_PTR(OSThread, ultramodern::thread_queue_pop(PASS_RDRAM ultramodern::running_queue));
+-    debug_printf("[Scheduling] Resuming execution of thread %d\n", to_run->id);
+-    to_run->context->running.signal();
 +static void wcw2k_unregister_context(PTR(OSThread) t_, UltraThreadContext* context) {
 +    std::lock_guard lock{wcw2k_context_map_mutex};
 +    auto it = wcw2k_context_map.find((int32_t)t_);
@@ -2183,7 +3329,7 @@ index 812c556..4d8cd97 100644
 +        t->context = it->second.context;
 +        t->priority = it->second.priority;
 +        t->id = it->second.id;
-     }
++    }
 +    return it->second.context;
 +}
 +
@@ -2235,10 +3381,7 @@ index 812c556..4d8cd97 100644
 +    return (int32_t)t_ == wcw2k_boosted_thread.load(std::memory_order_relaxed) &&
 +           wcw2k_now_ms() < wcw2k_boost_until.load(std::memory_order_relaxed);
 +}
- 
--    OSThread* to_run = TO_PTR(OSThread, ultramodern::thread_queue_pop(PASS_RDRAM ultramodern::running_queue));
--    debug_printf("[Scheduling] Resuming execution of thread %d\n", to_run->id);
--    to_run->context->running.signal();
++
 +void ultramodern::wcw2k_note_thread_queued(PTR(OSThread) t_) {
 +    std::lock_guard lock{wcw2k_queued_since_mutex};
 +    wcw2k_queued_since[(int32_t)t_] = wcw2k_now_ms();
@@ -2457,8 +3600,11 @@ index 812c556..4d8cd97 100644
 +    fprintf(stderr, "[wcw][thread] id=%d entry=0x%08X pri=%d struct=0x%08X sp=0x%08X\n", self->id, (unsigned)(uint32_t)entrypoint, self->priority, (uint32_t)self_, (uint32_t)self->sp);
      thread_self = self_;
      is_game_thread = true;
++    live_game_threads.fetch_add(1); // [wcw fix] see park_game_threads
  
-@@ -218,7 +554,11 @@ static void _thread_func(RDRAM_ARG PTR(OSThread) self_, PTR(thread_func_t) entry
+     // Set the thread name
+     ultramodern::set_native_thread_name(ultramodern::threads::get_game_thread_name(self));
+@@ -218,12 +577,17 @@ static void _thread_func(RDRAM_ARG PTR(OSThread) self_, PTR(thread_func_t) entry
  
      // Check if the thread hasn't been destroyed or replaced. If so, then the thread terminated or destroyed itself,
      // so mark this thread as destroyed and run the next queued thread.
@@ -2471,7 +3617,13 @@ index 812c556..4d8cd97 100644
          self->context = nullptr;
          run_next_thread(PASS_RDRAM1);
      }
-@@ -239,7 +579,7 @@ extern "C" void osStartThread(RDRAM_ARG PTR(OSThread) t_) {
+ 
+     // Dispose of this thread now that it's completed or terminated.
++    live_game_threads.fetch_sub(1); // [wcw fix] see park_game_threads
+     ultramodern::cleanup_thread(thread_context);
+ }
+ 
+@@ -239,7 +603,7 @@ extern "C" void osStartThread(RDRAM_ARG PTR(OSThread) t_) {
      // Otherwise, immediately start the thread and terminate this one.
      else {
          t->state = OSThreadState::QUEUED;
@@ -2480,7 +3632,7 @@ index 812c556..4d8cd97 100644
          //throw ultramodern::thread_terminated{};
      }
  }
-@@ -248,6 +588,13 @@ extern "C" void osCreateThread(RDRAM_ARG PTR(OSThread) t_, OSId id, PTR(thread_f
+@@ -248,6 +612,13 @@ extern "C" void osCreateThread(RDRAM_ARG PTR(OSThread) t_, OSId id, PTR(thread_f
      debug_printf("[os] Create Thread %d\n", id);
      OSThread *t = TO_PTR(OSThread, t_);
      
@@ -2494,7 +3646,7 @@ index 812c556..4d8cd97 100644
      t->next = NULLPTR;
      t->queue = NULLPTR;
      t->priority = pri;
-@@ -259,6 +606,7 @@ extern "C" void osCreateThread(RDRAM_ARG PTR(OSThread) t_, OSId id, PTR(thread_f
+@@ -259,6 +630,7 @@ extern "C" void osCreateThread(RDRAM_ARG PTR(OSThread) t_, OSId id, PTR(thread_f
      // Pass the context as an argument to the thread function to ensure that it can't get cleared before the thread captures its value.
      UltraThreadContext* context = new UltraThreadContext{};
      t->context = context;
@@ -2502,7 +3654,7 @@ index 812c556..4d8cd97 100644
      context->host_thread = std::thread{_thread_func, PASS_RDRAM t_, entrypoint, arg, t->context};
  
      // Wait until the thread is initialized to indicate that it's ready to be started.
-@@ -284,6 +632,9 @@ extern "C" void osDestroyThread(RDRAM_ARG PTR(OSThread) t_) {
+@@ -284,6 +656,9 @@ extern "C" void osDestroyThread(RDRAM_ARG PTR(OSThread) t_) {
          t_ = thread_self;
      }
      OSThread* t = TO_PTR(OSThread, t_);
@@ -2512,7 +3664,7 @@ index 812c556..4d8cd97 100644
      // Check if the thread is destroying itself (arg is null or thread_self)
      if (t_ == thread_self) {
          throw ultramodern::thread_terminated{};
-@@ -293,7 +644,10 @@ extern "C" void osDestroyThread(RDRAM_ARG PTR(OSThread) t_) {
+@@ -293,7 +668,10 @@ extern "C" void osDestroyThread(RDRAM_ARG PTR(OSThread) t_) {
          ultramodern::thread_queue_remove(PASS_RDRAM t->queue, t_);
      }
      // Check if the thread has already been destroyed to prevent destroying it again.
@@ -2524,7 +3676,7 @@ index 812c556..4d8cd97 100644
      if (cur_context != nullptr) {
          // Mark the target thread as destroyed and resume it. When it starts it'll check this and terminate itself instead of resuming.
          t->context = nullptr;
-@@ -309,6 +663,7 @@ extern "C" void osSetThreadPri(RDRAM_ARG PTR(OSThread) t_, OSPri pri) {
+@@ -309,6 +687,7 @@ extern "C" void osSetThreadPri(RDRAM_ARG PTR(OSThread) t_, OSPri pri) {
  
      if (t->priority != pri) {
          t->priority = pri;
@@ -2532,11 +3684,120 @@ index 812c556..4d8cd97 100644
  
          if (t_ != ultramodern::this_thread() && t->state != OSThreadState::STOPPED) {
              ultramodern::thread_queue_remove(PASS_RDRAM t->queue, t_);
+@@ -365,3 +744,35 @@ void ultramodern::cleanup_thread(UltraThreadContext *cur_context) {
+ void ultramodern::join_thread_cleaner_thread() {
+     thread_cleaner_thread.join();
+ }
++
++// [wcw fix] Called after quit(). Running game threads park at their next OS call; blocked ones
++// are woken here (their context's running semaphore, and the external message queue for the idle
++// thread) so they reach the park check in wait_for_resumed / wait_for_external_message. A thread
++// that never makes another OS call (a pure busy loop) can't be stopped: then this times out and
++// the caller must keep rdram mapped.
++bool ultramodern::park_game_threads(std::chrono::milliseconds timeout) {
++    auto deadline = std::chrono::steady_clock::now() + timeout;
++    while (true) {
++        {
++            std::lock_guard lock{wcw2k_context_map_mutex};
++            for (auto& [thread, record] : wcw2k_context_map) {
++                if (record.context != nullptr) {
++                    record.context->running.signal();
++                }
++            }
++        }
++        ultramodern::wake_external_message_waiters(live_game_threads.load());
++
++        int live = live_game_threads.load();
++        int parked = parked_game_threads.load();
++        if (parked >= live) {
++            fprintf(stderr, "[wcw] shutdown: %d game threads stopped\n", parked);
++            return true;
++        }
++        if (std::chrono::steady_clock::now() >= deadline) {
++            fprintf(stderr, "[wcw] shutdown: %d of %d game threads stopped; keeping rdram mapped\n", parked, live);
++            return false;
++        }
++        std::this_thread::sleep_for(std::chrono::milliseconds(5));
++    }
++}
 diff --git a/ultramodern/src/timer.cpp b/ultramodern/src/timer.cpp
-index 276301b..1dcdb8e 100644
+index 276301b..40d90ee 100644
 --- a/ultramodern/src/timer.cpp
 +++ b/ultramodern/src/timer.cpp
-@@ -192,6 +192,14 @@ extern "C" int osSetTimer(RDRAM_ARG PTR(OSTimer) t_, OSTime countdown, OSTime in
+@@ -37,7 +37,11 @@ struct RemoveTimerAction {
+     PTR(OSTimer) timer;
+ };
+ 
+-using Action = std::variant<AddTimerAction, RemoveTimerAction>;
++// [wcw fix] Ends the timer thread at shutdown (aki-roadmap#3): it reads OSTimers in rdram, so it
++// has to stop before rdram is released. It used to be detached and run forever.
++struct ExitTimerAction {};
++
++using Action = std::variant<AddTimerAction, RemoveTimerAction, ExitTimerAction>;
+ 
+ struct {
+     std::thread thread;
+@@ -87,6 +91,8 @@ void timer_thread(RDRAM_ARG1) {
+     // Ordered set of timers that are currently active
+     std::set<PTR(OSTimer), decltype(timer_sort)> active_timers{timer_sort};
+     
++    bool exit_requested = false;
++
+     // Lambda to process a timer action to handle adding and removing timers
+     auto process_timer_action = [&](const Action& action) {
+         // Determine the action type and act on it
+@@ -94,6 +100,8 @@ void timer_thread(RDRAM_ARG1) {
+             active_timers.insert(add_action->timer);
+         } else if (const auto* remove_action = std::get_if<RemoveTimerAction>(&action)) {
+             active_timers.erase(remove_action->timer);
++        } else if (std::get_if<ExitTimerAction>(&action)) {
++            exit_requested = true;
+         }
+     };
+ 
+@@ -105,11 +113,15 @@ void timer_thread(RDRAM_ARG1) {
+         }
+ 
+         // If there's no timer to act on, wait for one to come in from the action queue
+-        while (active_timers.empty()) {
++        while (active_timers.empty() && !exit_requested) {
+             timer_context.action_queue.wait_dequeue(cur_action);
+             process_timer_action(cur_action);
+         }
+ 
++        if (exit_requested) {
++            return;
++        }
++
+         // Get the timer that's closest to running out
+         PTR(OSTimer) cur_timer_ = *active_timers.begin();
+         OSTimer* cur_timer = TO_PTR(OSTimer, cur_timer_);
+@@ -127,6 +139,9 @@ void timer_thread(RDRAM_ARG1) {
+             active_timers.insert(cur_timer_);
+             // Process the new action
+             process_timer_action(cur_action);
++            if (exit_requested) {
++                return;
++            }
+         }
+         else {
+             // Waiting for the timer completed, so send the timer's message to its message queue
+@@ -142,7 +157,13 @@ void timer_thread(RDRAM_ARG1) {
+ 
+ void ultramodern::init_timers(RDRAM_ARG1) {
+     timer_context.thread = std::thread{ timer_thread, PASS_RDRAM1 };
+-    timer_context.thread.detach();
++}
++
++void ultramodern::join_timer_thread() {
++    if (timer_context.thread.joinable()) {
++        timer_context.action_queue.enqueue(ExitTimerAction{});
++        timer_context.thread.join();
++    }
+ }
+ 
+ uint32_t ultramodern::get_speed_multiplier() {
+@@ -192,6 +213,14 @@ extern "C" int osSetTimer(RDRAM_ARG PTR(OSTimer) t_, OSTime countdown, OSTime in
      t->mq = mq;
      t->msg = msg;
  
