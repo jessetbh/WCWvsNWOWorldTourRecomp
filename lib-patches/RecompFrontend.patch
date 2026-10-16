@@ -269,7 +269,7 @@ index c89956e..73c8376 100644
          return profile_index;
      }
 diff --git a/recompui/CMakeLists.txt b/recompui/CMakeLists.txt
-index b9c5458..3c86215 100644
+index b9c5458..7763a4e 100644
 --- a/recompui/CMakeLists.txt
 +++ b/recompui/CMakeLists.txt
 @@ -98,6 +98,7 @@ target_include_directories(recompui PUBLIC
@@ -280,13 +280,14 @@ index b9c5458..3c86215 100644
  
  target_include_directories(recompui PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include/recompui")
  
-@@ -121,3 +122,34 @@ target_link_libraries(recompui PUBLIC
+@@ -121,3 +122,41 @@ target_link_libraries(recompui PUBLIC
      lunasvg
      miniz
  )
 +
-+# [wcw] Unit tests for the Framerate, resolution and MSAA options' rules and the graphics presets (tests/). They build
-+# and run as part of every recompui build, so a failing test fails the game's build. RECOMPUI_WCW_TESTS=OFF skips them.
++# [wcw] Unit tests for the Framerate, resolution and MSAA options' rules, the graphics presets, the save backup list and
++# radio options' states (tests/). They build and run as part of every recompui build, so a failing test fails the game's
++# build. RECOMPUI_WCW_TESTS=OFF skips them.
 +option(RECOMPUI_WCW_TESTS "Build and run the wcw unit tests with recompui" ON)
 +if (RECOMPUI_WCW_TESTS AND NOT CMAKE_CROSSCOMPILING)
 +    add_executable(recompui_wcw_tests
@@ -296,10 +297,16 @@ index b9c5458..3c86215 100644
 +        ${CMAKE_CURRENT_SOURCE_DIR}/src/config/graphics_rules.cpp
 +        ${CMAKE_CURRENT_SOURCE_DIR}/tests/graphics_presets_tests.cpp
 +        ${CMAKE_CURRENT_SOURCE_DIR}/src/config/graphics_presets.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/tests/save_backup_menu_tests.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/src/config/save_backup_menu.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/tests/radio_rules_tests.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/src/elements/radio_rules.cpp
 +    )
 +    target_include_directories(recompui_wcw_tests PRIVATE
 +        ${CMAKE_CURRENT_SOURCE_DIR}/src/config
++        ${CMAKE_CURRENT_SOURCE_DIR}/src/elements
 +        ${CMAKE_CURRENT_SOURCE_DIR}/tests
++        ${RECOMP_FRONTEND_N64MODERNRUNTIME_PATH}/librecomp/include
 +        ${RECOMP_FRONTEND_N64MODERNRUNTIME_PATH}/ultramodern/include
 +        ${RECOMP_FRONTEND_N64MODERNRUNTIME_PATH}/thirdparty
 +    )
@@ -316,21 +323,19 @@ index b9c5458..3c86215 100644
 +    add_dependencies(recompui recompui_wcw_tests_run)
 +endif()
 diff --git a/recompui/include/recompui/config.h b/recompui/include/recompui/config.h
-index 38b84f5..3136b9f 100644
+index 38b84f5..fdd3fc2 100644
 --- a/recompui/include/recompui/config.h
 +++ b/recompui/include/recompui/config.h
-@@ -18,7 +18,9 @@ namespace recompui {
+@@ -18,7 +18,7 @@ namespace recompui {
                  inline const std::string mouse_sensitivity = "mouse_sensitivity";
                  inline const std::string joystick_deadzone = "joystick_deadzone";
                  inline const std::string background_input_mode = "background_input_mode";
 -        
-+                // [wcw saves] An action, not a setting: picking a backup opens a confirmation (aki-roadmap#50).
-+                inline const std::string restore_save_backup = "restore_save_backup";
 +
                  inline const std::string debug_mode = "debug_mode";
              }
  
-@@ -51,6 +53,8 @@ namespace recompui {
+@@ -51,6 +51,8 @@ namespace recompui {
      
              namespace options {
                  inline const std::string developer_mode = "developer_mode";
@@ -339,7 +344,7 @@ index 38b84f5..3136b9f 100644
                  inline const std::string res_option = "res_option";
                  inline const std::string wm_option = "wm_option";
                  inline const std::string hr_option = "hr_option";
-@@ -61,11 +65,32 @@ namespace recompui {
+@@ -61,11 +63,32 @@ namespace recompui {
                  inline const std::string hpfb_option = "hpfb_option";
                  inline const std::string rr_manual_value = "rr_manual_value";
                  inline const std::string ds_option = "ds_option";
@@ -372,6 +377,30 @@ index 38b84f5..3136b9f 100644
          }
  
          namespace sound {
+@@ -95,6 +118,23 @@ namespace recompui {
+          */
+         recomp::config::Config &create_config_tab(const std::string &name, const std::string &id, bool requires_confirmation);
+ 
++        /**
++         * @brief [wcw] A button row at the bottom of a tab made with create_config_tab, for something the player does
++         * rather than sets (General > Restore a Backup). It shows a name and a button like an option's, and its
++         * description in the tab's description panel.
++         */
++        struct ConfigTabAction {
++            std::string name;
++            std::string description;
++            std::string button_label;
++            std::function<void()> on_pressed;
++        };
++
++        /**
++         * @brief [wcw] Adds an action to the tab of the config with this ID (after its options, in the order added).
++         */
++        void add_config_tab_action(const std::string &config_id, ConfigTabAction action);
++
+         /**
+          * @brief Adds a new tab to the config modal. This is for manually rendering your own tab's UI.
+          * 
 diff --git a/recompui/include/recompui/program_config.h b/recompui/include/recompui/program_config.h
 index 03f5048..e240cc3 100644
 --- a/recompui/include/recompui/program_config.h
@@ -476,6 +505,192 @@ index 277a421..f5d6ad6 100644
                  recompui::config::open();
              }
          }
+diff --git a/recompui/src/composites/ui_save_backups_modal.cpp b/recompui/src/composites/ui_save_backups_modal.cpp
+new file mode 100644
+index 0000000..5b95284
+--- /dev/null
++++ b/recompui/src/composites/ui_save_backups_modal.cpp
+@@ -0,0 +1,166 @@
++#include "ui_save_backups_modal.h"
++
++#include "librecomp/save_backups.hpp"
++#include "recompui/recompui.h"
++#include "elements/ui_modal.h"
++#include "elements/ui_label.h"
++#include "config/ui_config_option.h"
++#include "config/save_backup_menu.h"
++
++namespace recompui {
++    namespace save_backups = recomp::save_backups;
++
++    static Modal *backups_modal = nullptr;
++    // What had focus before the dialog opened (the Restore a Backup button), to give it back on close.
++    static Element *return_focus = nullptr;
++
++    static void close_save_backups_modal() {
++        if (backups_modal != nullptr && backups_modal->is_open_now()) {
++            backups_modal->close();
++        }
++    }
++
++    static void confirm_restore(const save_backups::BackupEntry &entry) {
++        const config::save_backup_menu::Entry menu_entry{ entry.when, entry.controller_pak };
++        recompui::open_choice_prompt(
++            "Restore a Backup",
++            config::save_backup_menu::confirm_text(menu_entry, save_backups::now()),
++            "Restore",
++            "Cancel",
++            [entry]() {
++                const bool ok = save_backups::request_restore(entry);
++                close_save_backups_modal();
++                recompui::open_info_prompt("Restore a Backup", ok ?
++                    "Done: the backup is restored the next time the game starts." :
++                    "Couldn't schedule the restore (check the save folder's permissions).",
++                    "OK", {}, recompui::ButtonStyle::Primary);
++            },
++            {},
++            recompui::ButtonStyle::Success, recompui::ButtonStyle::Danger, true);
++    }
++
++    // Fills the dialog for the backups on disk now. Must be called with the modal's context open; returns the element
++    // to focus.
++    static Element *fill_modal(ContextId context) {
++        Element *header_left = backups_modal->get_header()->get_left();
++        header_left->clear_children();
++        header_left->set_padding(16.0f);
++        header_left->set_padding_left(20.0f);
++        context.create_element<Label>(header_left, "Restore a Backup", theme::Typography::Header3);
++
++        Element *header_right = backups_modal->get_header()->get_right();
++        header_right->clear_children();
++        header_right->set_padding(16.0f);
++        Button *close_button = context.create_element<Button>(header_right, "Close", ButtonStyle::Secondary, ButtonSize::Medium);
++        close_button->add_pressed_callback(close_save_backups_modal);
++
++        Element *body = backups_modal->get_body();
++        body->clear_children();
++
++        Element *column = context.create_element<Element>(body, 0, "div", false);
++        column->set_display(Display::Flex);
++        column->set_flex_direction(FlexDirection::Column);
++        column->set_width(100.0f, Unit::Percent);
++        column->set_padding(20.0f);
++        column->set_padding_top(4.0f);
++        column->set_gap(16.0f);
++        column->set_as_navigation_container(NavigationType::Vertical);
++
++        const std::filesystem::path main_save = save_backups::main_save_file();
++        const std::vector<save_backups::BackupEntry> backups = save_backups::list_backups(main_save);
++        if (backups.empty()) {
++            context.create_element<Label>(column, "No backups yet", theme::Typography::LabelMD);
++            Label *hint = context.create_element<Label>(column,
++                "Your saves are backed up automatically when the game starts and while you play.", theme::Typography::Body);
++            hint->set_color(theme::color::TextDim);
++            return close_button;
++        }
++
++        Label *hint = context.create_element<Label>(column,
++            "Pick a backup to restore. Newest first; the restore happens the next time the game starts.", theme::Typography::Body);
++        hint->set_color(theme::color::TextDim);
++
++        const std::optional<save_backups::BackupEntry> pending = save_backups::pending_restore(main_save);
++        std::vector<config::save_backup_menu::Entry> entries;
++        for (const save_backups::BackupEntry &backup : backups) {
++            const bool is_pending = pending.has_value() && (pending->backup_file == backup.backup_file);
++            entries.push_back({ backup.when, backup.controller_pak, is_pending });
++        }
++        const std::vector<config::save_backup_menu::Row> rows = config::save_backup_menu::rows(entries, save_backups::now());
++
++        Element *list = context.create_element<Element>(column, 0, "div", false);
++        list->set_display(Display::Flex);
++        list->set_flex_direction(FlexDirection::Column);
++        list->set_width(100.0f, Unit::Percent);
++        list->set_max_height(560.0f);
++        list->set_overflow_y(Overflow::Auto);
++        list->set_gap(8.0f);
++        list->set_padding(4.0f);
++        list->set_as_navigation_container(NavigationType::Vertical);
++
++        Element *first_row = nullptr;
++        for (size_t i = 0; i < backups.size(); i++) {
++            const config::save_backup_menu::Row &row = rows[i];
++            ReportingButton *button = context.create_element<ReportingButton>(list, row.time, ButtonStyle::Tertiary, ButtonSize::Medium);
++            button->set_width(100.0f, Unit::Percent);
++            button->set_justify_content(JustifyContent::SpaceBetween);
++            button->set_flex_shrink(0.0f);
++
++            std::string detail = row.file;
++            if (!row.note.empty()) {
++                detail = detail.empty() ? row.note : (detail + " - " + row.note);
++            }
++            if (!detail.empty()) {
++                Label *detail_label = context.create_element<Label>(button, detail, theme::Typography::LabelSM);
++                detail_label->set_color(row.note.empty() ? theme::color::TextDim : theme::color::Primary);
++            }
++
++            const save_backups::BackupEntry entry = backups[i];
++            button->add_pressed_callback([entry]() { confirm_restore(entry); });
++            if (first_row == nullptr) {
++                first_row = button;
++            }
++        }
++
++        return first_row;
++    }
++
++    void open_save_backups_modal() {
++        ContextId prev_context = try_close_current_context();
++        return_focus = nullptr;
++        if (prev_context != ContextId::null()) {
++            // get_focused_element needs its context open.
++            prev_context.open();
++            return_focus = prev_context.get_focused_element();
++            prev_context.close();
++        }
++
++        const bool created = (backups_modal == nullptr);
++        if (created) {
++            backups_modal = Modal::create_modal(ModalType::Prompt);
++            backups_modal->set_on_close_callback([]() {
++                if (return_focus != nullptr) {
++                    return_focus->focus();
++                    return_focus = nullptr;
++                }
++            });
++        }
++
++        ContextId modal_context = backups_modal->modal_root_context;
++        modal_context.open();
++        if (created) {
++            // Renders the menu action hints, so it needs the modal's context open.
++            backups_modal->set_menu_action_callback(MenuAction::Back, close_save_backups_modal, "Back");
++        }
++        Element *focus = fill_modal(modal_context);
++        modal_context.close();
++
++        if (prev_context != ContextId::null()) {
++            prev_context.open();
++        }
++        backups_modal->open();
++        if (focus != nullptr) {
++            focus->focus();
++        }
++    }
++}
+diff --git a/recompui/src/composites/ui_save_backups_modal.h b/recompui/src/composites/ui_save_backups_modal.h
+new file mode 100644
+index 0000000..b4a4ad4
+--- /dev/null
++++ b/recompui/src/composites/ui_save_backups_modal.h
+@@ -0,0 +1,8 @@
++#pragma once
++
++namespace recompui {
++    // [wcw saves] General > Restore a Backup (aki-roadmap#50): a dialog listing the automatic save backups by date,
++    // newest first. Picking one asks to confirm and schedules the restore for the next game start. Rows:
++    // config/save_backup_menu.h; backups: librecomp save_backups.hpp.
++    void open_save_backups_modal();
++}
 diff --git a/recompui/src/config/framerate_rules.cpp b/recompui/src/config/framerate_rules.cpp
 new file mode 100644
 index 0000000..00234ae
@@ -546,10 +761,10 @@ index 0000000..80cf16b
 +};
 diff --git a/recompui/src/config/graphics_presets.cpp b/recompui/src/config/graphics_presets.cpp
 new file mode 100644
-index 0000000..190a4a8
+index 0000000..9ece40b
 --- /dev/null
 +++ b/recompui/src/config/graphics_presets.cpp
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,102 @@
 +#include "graphics_presets.h"
 +
 +#include <algorithm>
@@ -635,13 +850,29 @@ index 0000000..190a4a8
 +
 +        return Preset::Custom;
 +    }
++
++    const char *label(Preset preset) {
++        switch (preset) {
++        case Preset::Authentic:
++            return "Authentic";
++        case Preset::Enhanced:
++            return "Enhanced";
++        case Preset::EnhancedRayTracing:
++            return "Enhanced RT";
++        case Preset::Max:
++            return "Max";
++        case Preset::Custom:
++        default:
++            return "Custom";
++        }
++    }
 +};
 diff --git a/recompui/src/config/graphics_presets.h b/recompui/src/config/graphics_presets.h
 new file mode 100644
-index 0000000..3a78930
+index 0000000..77778ab
 --- /dev/null
 +++ b/recompui/src/config/graphics_presets.h
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,105 @@
 +#pragma once
 +
 +#include <cstdint>
@@ -742,6 +973,10 @@ index 0000000..3a78930
 +
 +    // The first preset the options match, or Custom.
 +    Preset matching_preset(const Settings &current, const Limits &limits);
++
++    // The preset's name in the menu, short enough for all five to fit on one row: Authentic / Enhanced / Enhanced RT /
++    // Max / Custom.
++    const char *label(Preset preset);
 +};
 diff --git a/recompui/src/config/graphics_rules.cpp b/recompui/src/config/graphics_rules.cpp
 new file mode 100644
@@ -794,107 +1029,413 @@ index 0000000..f3b6c66
 +    // Whether an MSAA level can be picked on a device whose highest supported level is device_max.
 +    bool msaa_level_supported(ultramodern::renderer::Antialiasing level, ultramodern::renderer::Antialiasing device_max);
 +};
+diff --git a/recompui/src/config/save_backup_menu.cpp b/recompui/src/config/save_backup_menu.cpp
+new file mode 100644
+index 0000000..589e5d5
+--- /dev/null
++++ b/recompui/src/config/save_backup_menu.cpp
+@@ -0,0 +1,80 @@
++#include "save_backup_menu.h"
++
++#include <cstdio>
++
++namespace recompui::config::save_backup_menu {
++    static const char *month_name(int month) {
++        static const char *names[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
++        return (month >= 1 && month <= 12) ? names[month - 1] : "???";
++    }
++
++    std::string display_time(const Timestamp &when, const Timestamp &now, bool with_seconds) {
++        const int hour12 = (when.hour % 12 == 0) ? 12 : (when.hour % 12);
++        const char *am_pm = (when.hour < 12) ? "AM" : "PM";
++
++        char date[32];
++        if (when.year == now.year) {
++            snprintf(date, sizeof(date), "%s %d", month_name(when.month), when.day);
++        }
++        else {
++            snprintf(date, sizeof(date), "%s %d, %d", month_name(when.month), when.day, when.year);
++        }
++
++        char time[32];
++        if (with_seconds) {
++            snprintf(time, sizeof(time), "%d:%02d:%02d %s", hour12, when.minute, when.second, am_pm);
++        }
++        else {
++            snprintf(time, sizeof(time), "%d:%02d %s", hour12, when.minute, am_pm);
++        }
++
++        return std::string(date) + ", " + time;
++    }
++
++    static std::string file_label(bool controller_pak) {
++        return controller_pak ? "Controller Pak" : "Game save";
++    }
++
++    std::vector<Row> rows(const std::vector<Entry> &entries, const Timestamp &now) {
++        bool any_pak = false;
++        bool any_main = false;
++        for (const Entry &entry : entries) {
++            (entry.controller_pak ? any_pak : any_main) = true;
++        }
++        const bool show_file = any_pak && any_main;
++
++        std::vector<Row> out;
++        out.reserve(entries.size());
++        for (size_t i = 0; i < entries.size(); i++) {
++            const Entry &entry = entries[i];
++            // Two backups of the same file in the same minute (a launch backup right after a restore's) would read the
++            // same; the seconds tell them apart.
++            bool same_minute = false;
++            for (size_t j = 0; j < entries.size(); j++) {
++                const Entry &other = entries[j];
++                if (j != i && (!show_file || other.controller_pak == entry.controller_pak) &&
++                    display_time(other.when, now) == display_time(entry.when, now)) {
++                    same_minute = true;
++                    break;
++                }
++            }
++
++            Row row;
++            row.time = display_time(entry.when, now, same_minute);
++            row.file = show_file ? file_label(entry.controller_pak) : "";
++            row.note = entry.pending ? "Restores at next start" : "";
++            out.push_back(row);
++        }
++
++        return out;
++    }
++
++    std::string file_name_in_text(bool controller_pak) {
++        return controller_pak ? "Controller Pak" : "game save";
++    }
++
++    std::string confirm_text(const Entry &entry, const Timestamp &now) {
++        return "Restore the " + file_name_in_text(entry.controller_pak) + " backup from " + display_time(entry.when, now) +
++            "? It's restored the next time the game starts, and your current save is backed up first.";
++    }
++}
+diff --git a/recompui/src/config/save_backup_menu.h b/recompui/src/config/save_backup_menu.h
+new file mode 100644
+index 0000000..9ac0413
+--- /dev/null
++++ b/recompui/src/config/save_backup_menu.h
+@@ -0,0 +1,38 @@
++#pragma once
++
++#include <string>
++#include <vector>
++
++#include "librecomp/save_backup_rules.hpp"
++
++// [wcw saves] What General > Restore a Backup lists (aki-roadmap#50): one row per backup with its date and time in
++// words, and which file it covers when that matters. Kept free of UI and file I/O so it can be unit tested
++// (recompui/tests); the backup list itself comes from librecomp save_backups.hpp, newest first.
++namespace recompui::config::save_backup_menu {
++    using recomp::save_backups::Timestamp;
++
++    // "Oct 15, 8:54 PM". The year is added when it isn't now's year ("Dec 31, 2025, 11:05 PM"), and the seconds when
++    // with_seconds is set ("Oct 15, 8:54:07 PM").
++    std::string display_time(const Timestamp &when, const Timestamp &now, bool with_seconds = false);
++
++    struct Entry {
++        Timestamp when;
++        bool controller_pak = false;
++        bool pending = false; // the restore already scheduled for the next start
++    };
++
++    struct Row {
++        std::string time; // display_time, with seconds only where two rows would otherwise read the same
++        std::string file; // "Game save" / "Controller Pak"; empty when every backup is of the same file
++        std::string note; // "Restores at next start" for the pending one, else empty
++    };
++
++    // One row per entry, in the same order.
++    std::vector<Row> rows(const std::vector<Entry> &entries, const Timestamp &now);
++
++    // "game save" / "Controller Pak", for sentences.
++    std::string file_name_in_text(bool controller_pak);
++
++    // The confirmation question for restoring entry.
++    std::string confirm_text(const Entry &entry, const Timestamp &now);
++}
+diff --git a/recompui/src/config/ui_config.cpp b/recompui/src/config/ui_config.cpp
+index 6c84c05..ee15d76 100644
+--- a/recompui/src/config/ui_config.cpp
++++ b/recompui/src/config/ui_config.cpp
+@@ -15,6 +15,8 @@ struct PendingTab {
+     bool hidden = false;
+ };
+ static std::vector<PendingTab> pending_tabs;
++// [wcw] Button rows of the config tabs (config::add_config_tab_action), by config ID.
++static std::vector<std::pair<std::string, recompui::config::ConfigTabAction>> tab_actions;
+ static bool loaded_configs = false;
+ 
+ namespace recompui {
+@@ -64,7 +66,13 @@ namespace recompui {
+             id,
+             // Create contents
+             [id](recompui::ContextId context, Element* parent) {
+-                context.create_element<ConfigPageOptionsMenu>(parent, get_config_ptr(id), true);
++                std::vector<config::ConfigTabAction> actions;
++                for (const auto &[config_id, action] : tab_actions) {
++                    if (config_id == id) {
++                        actions.push_back(action);
++                    }
++                }
++                context.create_element<ConfigPageOptionsMenu>(parent, get_config_ptr(id), true, std::move(actions));
+             },
+             // Can close
+             [id, name](TabCloseContext close_context) {
+@@ -107,6 +115,10 @@ namespace recompui {
+         return new_config;
+     }
+ 
++    void config::add_config_tab_action(const std::string &config_id, ConfigTabAction action) {
++        tab_actions.emplace_back(config_id, std::move(action));
++    }
++
+     void config::finalize() {
+         if (loaded_configs) {
+             throw std::runtime_error("Configurations have already been loaded.");
+diff --git a/recompui/src/config/ui_config_option.cpp b/recompui/src/config/ui_config_option.cpp
+index 86428c9..d95b2b6 100644
+--- a/recompui/src/config/ui_config_option.cpp
++++ b/recompui/src/config/ui_config_option.cpp
+@@ -178,9 +178,11 @@ void ConfigOptionEnum::update_enum_disabled() {
+     bool all_disabled = get_disabled();
+     auto &enum_opt = config->get_option_config<recomp::config::ConfigOptionEnum>(option_index);
+     for (uint32_t i = 0; i < enum_opt.options.size(); i++) {
+-        bool enum_disabled = all_disabled || config->get_enum_option_disabled(option_index, i);
+         auto opt_element = radio->get_option_element(i);
+-        opt_element->set_enabled(!enum_disabled);
++        opt_element->set_enabled(!all_disabled);
++        // [wcw] A disabled value of an enabled option is locked rather than disabled: it can't be picked, but when it is
++        // the current value (the graphics preset's Custom) it still shows as the selected one (radio_rules.h).
++        opt_element->set_locked(config->get_enum_option_disabled(option_index, i));
+     }
+ };
+ 
+@@ -301,4 +303,69 @@ void ConfigOptionBool::update_disabled() {
+     toggle->set_enabled(!disabled);
+ };
+ 
++// ReportingButton
++ReportingButton::ReportingButton(ResourceId rid, Element *parent, const std::string &text, ButtonStyle style, ButtonSize size) :
++    Button(rid, parent, text, style, size) {}
++
++void ReportingButton::process_event(const Event &e) {
++    Button::process_event(e);
++    switch (e.type) {
++    case EventType::Focus:
++        if (std::get<EventFocus>(e.variant).active) {
++            scroll_into_view();
++            if (on_attention) {
++                on_attention();
++            }
++        }
++        break;
++    case EventType::Hover:
++        if (std::get<EventHover>(e.variant).active && on_attention) {
++            on_attention();
++        }
++        break;
++    default:
++        break;
++    }
++}
++
++// ConfigActionElement
++ConfigActionElement::ConfigActionElement(ResourceId rid, Element *parent, const config::ConfigTabAction &action, std::function<void()> on_hover) :
++    Element(rid, parent, Events(EventType::Hover), "div", false),
++    on_hover(std::move(on_hover))
++{
++    set_display(Display::Flex);
++    set_position(Position::Relative);
++    set_flex_direction(FlexDirection::Column);
++    set_align_items(AlignItems::FlexStart);
++    set_justify_content(JustifyContent::FlexStart);
++    set_padding_top(config_option_element_margin_vertical);
++    set_padding_left(12.0f);
++    set_padding_right(12.0f);
++    set_padding_bottom(config_option_element_margin_vertical);
++    set_height_auto();
++    set_width(100.0f, Unit::Percent);
++    set_as_navigation_container(NavigationType::Auto);
++
++    ContextId context = recompui::get_current_context();
++    Label *name_label = context.create_element<Label>(this, action.name, theme::Typography::LabelMD);
++    name_label->set_margin_bottom(12.0f);
++
++    button = context.create_element<ReportingButton>(this, action.button_label, ButtonStyle::Secondary, ButtonSize::Medium);
++    button->set_white_space(WhiteSpace::Nowrap);
++    button->set_flex_shrink(0.0f);
++    button->set_attention_callback(this->on_hover);
++    std::function<void()> on_pressed = action.on_pressed;
++    button->add_pressed_callback([on_pressed]() {
++        if (on_pressed) {
++            on_pressed();
++        }
++    });
++}
++
++void ConfigActionElement::process_event(const Event &e) {
++    if (e.type == EventType::Hover && std::get<EventHover>(e.variant).active && on_hover) {
++        on_hover();
++    }
++}
++
+ } // namespace recompui
+diff --git a/recompui/src/config/ui_config_option.h b/recompui/src/config/ui_config_option.h
+index 0561657..9c3faf2 100644
+--- a/recompui/src/config/ui_config_option.h
++++ b/recompui/src/config/ui_config_option.h
+@@ -7,6 +7,8 @@
+ #include "elements/ui_text_input.h"
+ #include "elements/ui_slider.h"
+ #include "elements/ui_toggle.h"
++#include "elements/ui_button.h"
++#include "recompui/config.h"
+ 
+ namespace recompui {
+     using set_option_value_t = std::function<void(const std::string &option_id, recomp::config::ConfigValueVariant value)>;
+@@ -129,4 +131,27 @@ public:
+     void update_disabled() override;
+ };
+ 
++// [wcw] A button that reports when it gets focus or the mouse, and scrolls itself into view on focus (config tab
++// actions, the save backup list).
++class ReportingButton : public Button {
++protected:
++    std::function<void()> on_attention = nullptr;
++    void process_event(const Event &e) override;
++    std::string_view get_type_name() override { return "ReportingButton"; }
++public:
++    ReportingButton(ResourceId rid, Element *parent, const std::string &text, ButtonStyle style, ButtonSize size = ButtonSize::Default);
++    void set_attention_callback(std::function<void()> callback) { on_attention = std::move(callback); }
++};
++
++// [wcw] A config tab action (config::add_config_tab_action): its name over a button, laid out like an option.
++class ConfigActionElement : public Element {
++protected:
++    ReportingButton *button = nullptr;
++    std::function<void()> on_hover;
++    void process_event(const Event &e) override;
++    std::string_view get_type_name() override { return "ConfigActionElement"; }
++public:
++    ConfigActionElement(ResourceId rid, Element *parent, const config::ConfigTabAction &action, std::function<void()> on_hover);
++};
++
+ } // namespace recompui
+diff --git a/recompui/src/config/ui_config_page_options_menu.cpp b/recompui/src/config/ui_config_page_options_menu.cpp
+index 6ba64e2..ee8e0d8 100644
+--- a/recompui/src/config/ui_config_page_options_menu.cpp
++++ b/recompui/src/config/ui_config_page_options_menu.cpp
+@@ -7,10 +7,12 @@ ConfigPageOptionsMenu::ConfigPageOptionsMenu(
+     ResourceId rid,
+     Element *parent,
+     recomp::config::Config *config,
+-    bool is_internal
++    bool is_internal,
++    std::vector<config::ConfigTabAction> actions
+ ) : ConfigPage(rid, parent, Events(EventType::Hover, EventType::Update, EventType::MenuAction)),
+     config(config),
+-    is_internal(is_internal)
++    is_internal(is_internal),
++    actions(std::move(actions))
+ {
+     ContextId context = recompui::get_current_context();
+     set_as_navigation_container(NavigationType::Vertical);
+@@ -237,6 +239,19 @@ void ConfigPageOptionsMenu::render_config_options() {
+             element->update_hidden();
+             config_option_elements.push_back(element);
+         }
++
++        render_actions(body_left_scroll);
++    }
++}
++
++void ConfigPageOptionsMenu::render_actions(Element *parent) {
++    ContextId context = recompui::get_current_context();
++    for (const config::ConfigTabAction &action : actions) {
++        const std::string description = action.description;
++        context.create_element<ConfigActionElement>(parent, action, [this, description]() {
++            this->description_option_id = "";
++            this->set_description_text(description);
++        });
+     }
+ }
+ 
+diff --git a/recompui/src/config/ui_config_page_options_menu.h b/recompui/src/config/ui_config_page_options_menu.h
+index 49e05db..42cd274 100644
+--- a/recompui/src/config/ui_config_page_options_menu.h
++++ b/recompui/src/config/ui_config_page_options_menu.h
+@@ -6,6 +6,7 @@
+ #include "elements/ui_button.h"
+ #include "librecomp/config.hpp"
+ #include "librecomp/mods.hpp"
++#include "recompui/config.h"
+ 
+ namespace recompui {
+     class ConfigPageOptionsMenu : public ConfigPage {
+@@ -14,6 +15,8 @@ namespace recompui {
+         bool is_internal = false;
+ 
+         std::vector<ConfigOptionElement*> config_option_elements;
++        // [wcw] Button rows after the options (config::add_config_tab_action).
++        std::vector<config::ConfigTabAction> actions;
+         Element *description_container = nullptr;
+         std::string description_option_id = "";
+         Button *apply_button = nullptr;
+@@ -25,6 +28,7 @@ namespace recompui {
+         set_option_value_t bound_set_option_value;
+ 
+         void render_config_options();
++        void render_actions(Element *parent);
+         void render_confirmation_footer();
+         void on_option_hover(const std::string &option_id);
+         void on_set_option_value(const std::string &option_id, recomp::config::ConfigValueVariant value);
+@@ -36,7 +40,8 @@ namespace recompui {
+             ResourceId rid,
+             Element *parent,
+             recomp::config::Config *config,
+-            bool is_internal = false
++            bool is_internal = false,
++            std::vector<config::ConfigTabAction> actions = {}
+         );
+         virtual ~ConfigPageOptionsMenu() = default;
+     };
 diff --git a/recompui/src/config/ui_config_tab_general.cpp b/recompui/src/config/ui_config_tab_general.cpp
-index 296ce0e..a07145b 100644
+index 296ce0e..e825de5 100644
 --- a/recompui/src/config/ui_config_tab_general.cpp
 +++ b/recompui/src/config/ui_config_tab_general.cpp
-@@ -1,5 +1,7 @@
+@@ -1,6 +1,8 @@
  #include "librecomp/config.hpp"
-+#include "librecomp/save_backups.hpp"
  #include "recompui/config.h"
 +#include "recompui/recompui.h"
  #include "util/steam_deck.h"
++#include "composites/ui_save_backups_modal.h"
  
  namespace recompui {
-@@ -25,6 +27,63 @@ namespace config {
-         {BackgroundInputMode::On, "On"},
-     };
  
-+    // [wcw saves] "Restore Save Backup" (aki-roadmap#50): pick the newest, 2nd newest, ... automatic backup; a prompt
-+    // says which file and when, and the restore happens the next time the game starts (librecomp save_backups.hpp).
-+    static EnumOptionVector restore_backup_options = {
-+        {0u, "None", "Choose..."},
-+        {1u, "Newest", "Newest backup"},
-+        {2u, "Backup2", "2nd newest"},
-+        {3u, "Backup3", "3rd newest"},
-+        {4u, "Backup4", "4th newest"},
-+        {5u, "Backup5", "5th newest"},
-+        {6u, "Backup6", "6th newest"},
-+        {7u, "Backup7", "7th newest"},
-+        {8u, "Backup8", "8th newest"},
-+        {9u, "Backup9", "9th newest"},
-+        {10u, "Backup10", "10th newest"},
-+    };
-+
-+    static std::string save_kind(const recomp::save_backups::BackupEntry &entry) {
-+        return entry.controller_pak ? "Controller Pak" : "game save";
-+    }
-+
-+    static void reset_restore_choice() {
-+        get_general_config().update_option_value(general::options::restore_save_backup, 0u);
-+    }
-+
-+    static void on_restore_backup_chosen(uint32_t choice) {
-+        if (choice == 0) {
-+            return;
-+        }
-+
-+        const std::filesystem::path main_save = recomp::save_backups::main_save_file();
-+        const std::vector<recomp::save_backups::BackupEntry> backups = recomp::save_backups::list_backups(main_save);
-+        if ((choice - 1) >= backups.size()) {
-+            const std::string text = backups.empty() ?
-+                "There are no save backups yet. They're made automatically when the game starts and while you play." :
-+                "There are only " + std::to_string(backups.size()) + " save backups.";
-+            recompui::open_info_prompt("Restore Save Backup", text, "OK", reset_restore_choice, recompui::ButtonStyle::Primary);
-+            return;
-+        }
-+
-+        const recomp::save_backups::BackupEntry entry = backups[choice - 1];
-+        std::string text = "Restore the " + save_kind(entry) + " backed up on " + recomp::save_backups::display_time(entry.when) + "?";
-+        if (const std::optional<recomp::save_backups::Timestamp> last = recomp::save_backups::last_write_time(entry.save_file)) {
-+            text += "<br/><br/>The current " + save_kind(entry) + " was last saved on " + recomp::save_backups::display_time(*last) + ".";
-+        }
-+        text += "<br/><br/>It will be restored the next time the game starts. The current save is backed up first, so you can undo this.";
-+        recompui::open_choice_prompt("Restore Save Backup", text, "Restore", "Cancel",
-+            [entry]() {
-+                const bool ok = recomp::save_backups::request_restore(entry);
-+                reset_restore_choice();
-+                recompui::open_notification("Restore Save Backup", ok ?
-+                    "Restore scheduled: it happens the next time the game starts." :
-+                    "Couldn't schedule the restore (check the save folder's permissions).");
-+            },
-+            reset_restore_choice,
-+            recompui::ButtonStyle::Success, recompui::ButtonStyle::Danger, true);
-+    }
-+
-     template <typename T = uint32_t>
-     T get_general_config_enum_value(const std::string& option_id) {
-         return static_cast<T>(std::get<uint32_t>(get_general_config().get_option_value(option_id)));
-@@ -139,6 +198,22 @@ namespace config {
+@@ -139,6 +141,15 @@ namespace config {
              BackgroundInputMode::On
          );
  
-+        config.add_enum_option(
-+            general::options::restore_save_backup,
-+            "Restore Save Backup",
-+            "Your saves are backed up automatically when the game starts and while you play (the last 10 of each, in "
-+            "the <b>saves\\backups</b> folder). Pick one to restore it: you'll be asked to confirm, and the restore "
-+            "happens the next time the game starts.",
-+            restore_backup_options,
-+            0u
-+        );
-+        config.add_option_change_callback(general::options::restore_save_backup,
-+            [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant, recomp::config::OptionChangeContext change_context) {
-+                if (change_context == recomp::config::OptionChangeContext::Permanent) {
-+                    on_restore_backup_chosen(std::get<uint32_t>(cur_value));
-+                }
-+            });
++        // [wcw saves] Restore a backup (aki-roadmap#50): a button that opens the backup list, not a setting.
++        add_config_tab_action(general::id, ConfigTabAction{
++            .name = "Restore Save Backup",
++            .description = "Your saves are backed up automatically when the game starts and while you play. "
++                "Pick a backup by its date to restore it the next time the game starts.",
++            .button_label = "Restore a backup...",
++            .on_pressed = open_save_backups_modal,
++        });
 +
          return config;
      }
  } // namespace config
 diff --git a/recompui/src/config/ui_config_tab_graphics.cpp b/recompui/src/config/ui_config_tab_graphics.cpp
-index 4fdf81f..b5afc53 100644
+index 4fdf81f..c552d45 100644
 --- a/recompui/src/config/ui_config_tab_graphics.cpp
 +++ b/recompui/src/config/ui_config_tab_graphics.cpp
 @@ -1,7 +1,22 @@
@@ -1154,11 +1695,11 @@ index 4fdf81f..b5afc53 100644
 +        static bool syncing_preset = false;
 +
 +        static EnumOptionVector preset_options = {
-+            {presets::Preset::Authentic, "Authentic", "Authentic"},
-+            {presets::Preset::Enhanced, "Enhanced", "Enhanced"},
-+            {presets::Preset::EnhancedRayTracing, "EnhancedRayTracing", "Enhanced Ray Tracing"},
-+            {presets::Preset::Max, "Max", "Max"},
-+            {presets::Preset::Custom, "Custom", "Custom"},
++            {presets::Preset::Authentic, "Authentic", presets::label(presets::Preset::Authentic)},
++            {presets::Preset::Enhanced, "Enhanced", presets::label(presets::Preset::Enhanced)},
++            {presets::Preset::EnhancedRayTracing, "EnhancedRayTracing", presets::label(presets::Preset::EnhancedRayTracing)},
++            {presets::Preset::Max, "Max", presets::label(presets::Preset::Max)},
++            {presets::Preset::Custom, "Custom", presets::label(presets::Preset::Custom)},
 +        };
 +
 +        // The options a preset sets.
@@ -1318,7 +1859,9 @@ index 4fdf81f..b5afc53 100644
 +                    if (!recompui::graphics_rules::msaa_level_supported(level, max_msaa)) {
 +                        config.update_enum_option_disabled(graphics::options::msaa_option, static_cast<uint32_t>(level), true);
 +                    }
-+                }
+                 }
+-                if (max_msaa < RT64::UserConfiguration::Antialiasing::MSAA4X) {
+-                    config.update_enum_option_disabled(graphics::options::msaa_option, static_cast<uint32_t>(ultramodern::renderer::Antialiasing::MSAA4X), true);
 +            }
 +        }
 +
@@ -1368,9 +1911,7 @@ index 4fdf81f..b5afc53 100644
 +                    if (status.display.fullFrameNits > 0.0f) {
 +                        readout += ", " + format_nits(status.display.fullFrameNits) + " full-screen";
 +                    }
-                 }
--                if (max_msaa < RT64::UserConfiguration::Antialiasing::MSAA4X) {
--                    config.update_enum_option_disabled(graphics::options::msaa_option, static_cast<uint32_t>(ultramodern::renderer::Antialiasing::MSAA4X), true);
++                }
 +                else {
 +                    readout += "peak brightness not reported (assuming " + format_nits(RT64::WcwLogic::HdrUnknownPeakNits) + ")";
                  }
@@ -1410,7 +1951,7 @@ index 4fdf81f..b5afc53 100644
 +        void graphics::apply_hdr_settings() {
 +            if (!created_graphics_config) {
 +                return;
-+            }
+             }
 +
 +            RT64::HdrOutput::Settings hdr_settings;
 +            hdr_settings.enabled = get_graphics_enum_value<HdrOption>(graphics::options::hdr_option) == HdrOption::On;
@@ -1424,7 +1965,7 @@ index 4fdf81f..b5afc53 100644
 +            std::string status;
 +            if (active) {
 +                status = "<br /><br /><recomp-color success>HDR is active.</recomp-color>";
-             }
++            }
 +            else if (requested) {
 +                status = "<br /><br /><recomp-color warning>Windows HDR is off for this display, so the game is using SDR.</recomp-color> "
 +                    "Turn on \"Use HDR\" in Windows display settings, then restart the game.";
@@ -1460,7 +2001,7 @@ index 4fdf81f..b5afc53 100644
  
              config.add_bool_option(
                  graphics::options::developer_mode,
-@@ -232,6 +676,37 @@ namespace recompui {
+@@ -232,6 +676,43 @@ namespace recompui {
                  true
              );
  
@@ -1470,20 +2011,26 @@ index 4fdf81f..b5afc53 100644
 +            config.add_enum_option(
 +                graphics::options::preset,
 +                "Preset",
-+                "Sets the main graphics options in one go; you can still change any of them afterwards. "
-+                "<recomp-color primary>Authentic</recomp-color>: the game as it shipped, in 4:3 at 30 fps on a simulated composite TV (the CRT filter). "
-+                "<recomp-color primary>Enhanced</recomp-color> (the default): widescreen, smooth motion (60 fps where the game offers it) and MSAA 4x, without ray tracing. "
-+                "<recomp-color primary>Enhanced Ray Tracing</recomp-color>: Enhanced with ray-traced shadows and ambient occlusion (Balanced). "
-+                "<recomp-color primary>Max</recomp-color>: Enhanced Ray Tracing at 120 fps on a 120 Hz or faster display, with Ultra ray tracing and HDR (Auto). "
-+                "<recomp-color primary>Custom</recomp-color> shows when the options match none of these."
++                "Sets the main graphics options in one go; you can still change any of them afterwards."
 +                "<br />"
 +                "<br />"
-+                "<recomp-color primary>Ray tracing needs an RTX-class GPU with D3D12, and HDR needs Windows HDR and a restart of the game; without them those parts have no effect.</recomp-color>",
++                "<recomp-color primary>Authentic</recomp-color>: 4:3, 30 fps, CRT filter."
++                "<br />"
++                "<recomp-color primary>Enhanced</recomp-color> (default): widescreen, smooth motion, MSAA 4x."
++                "<br />"
++                "<recomp-color primary>Enhanced RT</recomp-color>: Enhanced plus ray tracing (Balanced)."
++                "<br />"
++                "<recomp-color primary>Max</recomp-color>: Ultra ray tracing, HDR, 120 fps on a fast display."
++                "<br />"
++                "<recomp-color primary>Custom</recomp-color>: your own mix (shown when no preset matches)."
++                "<br />"
++                "<br />"
++                "Ray tracing needs an RTX-class GPU with D3D12; HDR needs Windows HDR and a game restart.",
 +                preset_options,
 +                presets::Preset::Enhanced
 +            );
 +            {
-+                // Custom is only ever shown, never picked.
++                // Custom is only ever shown, never picked: a locked value (radio_rules.h), drawn as selected when current.
 +                config.update_enum_option_disabled(graphics::options::preset, static_cast<uint32_t>(presets::Preset::Custom), true);
 +                config.add_option_change_callback(
 +                    graphics::options::preset,
@@ -1498,7 +2045,7 @@ index 4fdf81f..b5afc53 100644
              config.add_enum_option(
                  graphics::options::res_option,
                  "Resolution",
-@@ -252,7 +727,7 @@ namespace recompui {
+@@ -252,7 +733,7 @@ namespace recompui {
              config.add_enum_option(
                  graphics::options::ds_option,
                  "Downsampling Quality",
@@ -1507,7 +2054,7 @@ index 4fdf81f..b5afc53 100644
                  "<br />"
                  "<br />"
                  "Note: <recomp-color primary>4x</recomp-color> downsampling quality at <recomp-color primary>Original 2x</recomp-color> resolution may cause performance issues on low end devices, as it will cause the game to render <recomp-color warning>at almost 4k internal resolution</recomp-color>.",
-@@ -268,7 +743,8 @@ namespace recompui {
+@@ -268,7 +749,8 @@ namespace recompui {
                      }
                  );
  
@@ -1517,7 +2064,7 @@ index 4fdf81f..b5afc53 100644
                      graphics::options::ds_option,
                      graphics::options::res_option,
                      ultramodern::renderer::Resolution::Auto
-@@ -283,12 +759,46 @@ namespace recompui {
+@@ -283,12 +765,46 @@ namespace recompui {
                  });
              }
  
@@ -1565,7 +2112,7 @@ index 4fdf81f..b5afc53 100644
              );
  
              config.add_enum_option(
-@@ -299,12 +809,16 @@ namespace recompui {
+@@ -299,12 +815,16 @@ namespace recompui {
                  wm_default()
              );
  
@@ -1586,7 +2133,7 @@ index 4fdf81f..b5afc53 100644
              );
  
              config.add_number_option(
-@@ -314,12 +828,28 @@ namespace recompui {
+@@ -314,12 +834,28 @@ namespace recompui {
                  20.0, 240.0, 1.0, 0, false, 60.0
              );
              {
@@ -1621,7 +2168,7 @@ index 4fdf81f..b5afc53 100644
              }
  
              config.add_enum_option(
-@@ -330,7 +860,7 @@ namespace recompui {
+@@ -330,7 +866,7 @@ namespace recompui {
                  "<br />"
                  "<recomp-color primary>Note: This option won't be available if your GPU does not support programmable MSAA sample positions, as it is currently required to avoid rendering glitches.</recomp-color>",
                  antialiasing_options,
@@ -1630,7 +2177,7 @@ index 4fdf81f..b5afc53 100644
              );
  
              config.add_enum_option(
-@@ -359,6 +889,177 @@ namespace recompui {
+@@ -359,6 +895,177 @@ namespace recompui {
                  true
              );
  
@@ -1808,6 +2355,165 @@ index 4fdf81f..b5afc53 100644
              return config;
          }
      }
+diff --git a/recompui/src/elements/radio_rules.cpp b/recompui/src/elements/radio_rules.cpp
+new file mode 100644
+index 0000000..35578f7
+--- /dev/null
++++ b/recompui/src/elements/radio_rules.cpp
+@@ -0,0 +1,15 @@
++#include "radio_rules.h"
++
++namespace recompui::radio_rules {
++    OptionState option_state(bool enabled, bool locked, bool checked) {
++        if (!enabled) {
++            return { .looks_disabled = true, .focusable = false, .pickable = false };
++        }
++
++        if (locked) {
++            return { .looks_disabled = !checked, .focusable = checked, .pickable = false };
++        }
++
++        return { .looks_disabled = false, .focusable = true, .pickable = true };
++    }
++}
+diff --git a/recompui/src/elements/radio_rules.h b/recompui/src/elements/radio_rules.h
+new file mode 100644
+index 0000000..e47f9b0
+--- /dev/null
++++ b/recompui/src/elements/radio_rules.h
+@@ -0,0 +1,17 @@
++#pragma once
++
++// [wcw] How one radio option looks and behaves. Kept free of UI state so it can be unit tested (recompui/tests);
++// RadioOption calls it.
++namespace recompui::radio_rules {
++    struct OptionState {
++        bool looks_disabled; // greyed out
++        bool focusable;
++        bool pickable;       // clicking or pressing it selects it
++    };
++
++    // enabled: the option (and its radio) is enabled. locked: the value can be shown but not picked, like the graphics
++    // preset's Custom. checked: it is the current value.
++    // A locked value that is current looks and focuses like any selected value (so controller focus lands on it, not
++    // on its neighbour), but pressing it does nothing. A locked value that isn't current looks disabled.
++    OptionState option_state(bool enabled, bool locked, bool checked);
++}
+diff --git a/recompui/src/elements/ui_modal.cpp b/recompui/src/elements/ui_modal.cpp
+index b057f46..11f4af2 100644
+--- a/recompui/src/elements/ui_modal.cpp
++++ b/recompui/src/elements/ui_modal.cpp
+@@ -39,6 +39,7 @@ constexpr float modal_page_padding = 64.0f;
+ constexpr float modal_page_base_height = 1080.0f;
+ constexpr float modal_height = modal_page_base_height - (modal_page_padding * 2.0f);
+ constexpr float modal_width = modal_page_base_height * 16.0f / 9.0f;
++constexpr float prompt_modal_width = 900.0f;
+ 
+ Modal::Modal(
+     ResourceId rid,
+@@ -88,6 +89,15 @@ Modal::Modal(
+     modal_element->set_as_navigation_container(NavigationType::Vertical);
+     modal_element->set_nav_wrapping(true);
+ 
++    // [wcw] A Prompt modal is a dialog: as tall as its contents (up to the page) and narrower.
++    if (modal_type == ModalType::Prompt) {
++        modal_element->set_flex(0.0f, 1.0f);
++        modal_element->set_flex_basis_auto();
++        modal_element->set_max_width(prompt_modal_width);
++        modal_element->set_height_auto();
++        modal_element->set_max_height(100, Unit::Percent);
++    }
++
+     header = context.create_element<ConfigHeaderFooter>(modal_element, true);
+     header->set_padding_top(0.0f);
+     header->set_padding_bottom(0.0f);
+diff --git a/recompui/src/elements/ui_radio.cpp b/recompui/src/elements/ui_radio.cpp
+index 7e5c18d..4f419cb 100644
+--- a/recompui/src/elements/ui_radio.cpp
++++ b/recompui/src/elements/ui_radio.cpp
+@@ -1,6 +1,7 @@
+ #include "overloaded.h"
+ #include "ui_radio.h"
+ #include "ui_utils.h"
++#include "radio_rules.h"
+ 
+ namespace recompui {
+ 
+@@ -46,29 +47,36 @@ namespace recompui {
+     void RadioOption::set_selected_state(bool enable) {
+         set_style_enabled(checked_state, enable);
+         set_as_primary_focus(enable);
++        checked = enable;
++        refresh_state();
++    }
++
++    void RadioOption::set_locked(bool locked) {
++        this->locked = locked;
++        refresh_state();
++    }
++
++    void RadioOption::refresh_state() {
++        const radio_rules::OptionState state = radio_rules::option_state(enabled_state, locked, checked);
++        set_style_enabled(disabled_state, state.looks_disabled);
++        set_cursor(state.pickable ? Cursor::Pointer : Cursor::None);
++        set_focusable(state.focusable);
+     }
+ 
+     void RadioOption::process_event(const Event &e) {
+         switch (e.type) {
+         case EventType::Click:
+-            pressed_callback(index);
++            if (radio_rules::option_state(enabled_state, locked, checked).pickable) {
++                pressed_callback(index);
++            }
+             break;
+         case EventType::Hover:
+             set_style_enabled(hover_state, std::get<EventHover>(e.variant).active);
+             break;
+-        case EventType::Enable: {
+-            bool enable_active = std::get<EventEnable>(e.variant).active;
+-            set_style_enabled(disabled_state, !enable_active);
+-            if (enable_active) {
+-                set_cursor(Cursor::Pointer);
+-                set_focusable(true);
+-            }
+-            else {
+-                set_cursor(Cursor::None);
+-                set_focusable(false);
+-            }
++        case EventType::Enable:
++            enabled_state = std::get<EventEnable>(e.variant).active;
++            refresh_state();
+             break;
+-        }
+         case EventType::Focus:
+             {
+                 bool active = std::get<EventFocus>(e.variant).active;
+diff --git a/recompui/src/elements/ui_radio.h b/recompui/src/elements/ui_radio.h
+index 4a4033b..6c4c6ff 100644
+--- a/recompui/src/elements/ui_radio.h
++++ b/recompui/src/elements/ui_radio.h
+@@ -13,6 +13,11 @@ namespace recompui {
+         std::function<void(uint32_t)> pressed_callback = nullptr;
+         std::function<void(bool)> focus_callback = nullptr;
+         uint32_t index = 0;
++        // [wcw] Inputs of radio_rules::option_state.
++        bool enabled_state = true;
++        bool locked = false;
++        bool checked = false;
++        void refresh_state();
+     protected:
+         virtual void process_event(const Event &e) override;
+         std::string_view get_type_name() override { return "LabelRadioOption"; }
+@@ -21,6 +26,8 @@ namespace recompui {
+         void set_pressed_callback(std::function<void(uint32_t)> callback);
+         void set_focus_callback(std::function<void(bool)> callback);
+         void set_selected_state(bool enable);
++        // [wcw] A locked value can be shown but not picked (radio_rules.h).
++        void set_locked(bool locked);
+     };
+ 
+     class Radio : public Container {
 diff --git a/recompui/src/renderer/rt64_render_context.cpp b/recompui/src/renderer/rt64_render_context.cpp
 index a7954c7..d899e2a 100644
 --- a/recompui/src/renderer/rt64_render_context.cpp
@@ -2217,10 +2923,10 @@ index 0000000..4047081
 +}
 diff --git a/recompui/tests/graphics_presets_tests.cpp b/recompui/tests/graphics_presets_tests.cpp
 new file mode 100644
-index 0000000..147d383
+index 0000000..51c8851
 --- /dev/null
 +++ b/recompui/tests/graphics_presets_tests.cpp
-@@ -0,0 +1,256 @@
+@@ -0,0 +1,271 @@
 +// [wcw] Unit tests for the graphics presets (src/config/graphics_presets). Built and run as part of every recompui
 +// build (RECOMPUI_WCW_TESTS); a failure fails the build.
 +
@@ -2477,6 +3183,21 @@ index 0000000..147d383
 +    s.framerate = RefreshRate::Display;
 +    CHECK_EQ(val(matching_preset(s, limits)), val(Preset::Custom));
 +}
++
++TEST_CASE("the preset labels are the short ones, so the row fits on one line") {
++    CHECK(std::string(label(Preset::Authentic)) == "Authentic");
++    CHECK(std::string(label(Preset::Enhanced)) == "Enhanced");
++    CHECK(std::string(label(Preset::EnhancedRayTracing)) == "Enhanced RT");
++    CHECK(std::string(label(Preset::Max)) == "Max");
++    CHECK(std::string(label(Preset::Custom)) == "Custom");
++    // "Enhanced Ray Tracing" wrapped onto two lines in the menu.
++    size_t total = 0;
++    for (Preset p : { Preset::Authentic, Preset::Enhanced, Preset::EnhancedRayTracing, Preset::Max, Preset::Custom }) {
++        CHECK(std::string(label(p)).size() <= 11);
++        total += std::string(label(p)).size();
++    }
++    CHECK(total <= 40);
++}
 diff --git a/recompui/tests/graphics_rules_tests.cpp b/recompui/tests/graphics_rules_tests.cpp
 new file mode 100644
 index 0000000..d617ed0
@@ -2526,6 +3247,145 @@ index 0000000..d617ed0
 +    CHECK(msaa_level_supported(Antialiasing::MSAA2X, Antialiasing::MSAA2X));
 +    CHECK(!msaa_level_supported(Antialiasing::MSAA2X, Antialiasing::None));
 +    CHECK(msaa_level_supported(Antialiasing::None, Antialiasing::None));
++}
+diff --git a/recompui/tests/radio_rules_tests.cpp b/recompui/tests/radio_rules_tests.cpp
+new file mode 100644
+index 0000000..9ebce7a
+--- /dev/null
++++ b/recompui/tests/radio_rules_tests.cpp
+@@ -0,0 +1,43 @@
++// [wcw] Unit tests for how radio options look and behave (src/elements/radio_rules). Built and run as part of every
++// recompui build (RECOMPUI_WCW_TESTS); a failure fails the build.
++
++#include "radio_rules.h"
++
++#include "wcw_test.h"
++
++using namespace recompui::radio_rules;
++
++TEST_CASE("a normal option is pickable whether or not it is current") {
++    for (bool checked : { false, true }) {
++        const OptionState s = option_state(true, false, checked);
++        CHECK(!s.looks_disabled);
++        CHECK(s.focusable);
++        CHECK(s.pickable);
++    }
++}
++
++TEST_CASE("a disabled option looks disabled and can't be focused, even when current") {
++    for (bool locked : { false, true }) {
++        for (bool checked : { false, true }) {
++            const OptionState s = option_state(false, locked, checked);
++            CHECK(s.looks_disabled);
++            CHECK(!s.focusable);
++            CHECK(!s.pickable);
++        }
++    }
++}
++
++TEST_CASE("a locked value that is current looks selected and takes focus, but can't be picked") {
++    // The graphics preset's Custom: it was drawn greyed out while current, and controller focus landed on Authentic.
++    const OptionState s = option_state(true, true, true);
++    CHECK(!s.looks_disabled);
++    CHECK(s.focusable);
++    CHECK(!s.pickable);
++}
++
++TEST_CASE("a locked value that isn't current looks disabled and is skipped") {
++    const OptionState s = option_state(true, true, false);
++    CHECK(s.looks_disabled);
++    CHECK(!s.focusable);
++    CHECK(!s.pickable);
++}
+diff --git a/recompui/tests/save_backup_menu_tests.cpp b/recompui/tests/save_backup_menu_tests.cpp
+new file mode 100644
+index 0000000..6324a6b
+--- /dev/null
++++ b/recompui/tests/save_backup_menu_tests.cpp
+@@ -0,0 +1,84 @@
++// [wcw] Unit tests for the save backup list (src/config/save_backup_menu). Built and run as part of every recompui
++// build (RECOMPUI_WCW_TESTS); a failure fails the build.
++
++#include "save_backup_menu.h"
++
++#include "wcw_test.h"
++
++using namespace recompui::config::save_backup_menu;
++
++static Timestamp at(int year, int month, int day, int hour, int minute, int second = 0) {
++    Timestamp t;
++    t.year = year; t.month = month; t.day = day; t.hour = hour; t.minute = minute; t.second = second;
++    return t;
++}
++
++static const Timestamp now = at(2026, 10, 15, 21, 0);
++
++TEST_CASE("dates read like Oct 15, 8:54 PM") {
++    CHECK(display_time(at(2026, 10, 15, 20, 54, 7), now) == "Oct 15, 8:54 PM");
++    CHECK(display_time(at(2026, 1, 3, 9, 5), now) == "Jan 3, 9:05 AM");
++    CHECK(display_time(at(2026, 12, 31, 23, 59), now) == "Dec 31, 11:59 PM");
++}
++
++TEST_CASE("midnight and noon are 12, not 0") {
++    CHECK(display_time(at(2026, 10, 15, 0, 0), now) == "Oct 15, 12:00 AM");
++    CHECK(display_time(at(2026, 10, 15, 12, 30), now) == "Oct 15, 12:30 PM");
++}
++
++TEST_CASE("another year's date shows the year") {
++    CHECK(display_time(at(2025, 12, 31, 23, 5), now) == "Dec 31, 2025, 11:05 PM");
++}
++
++TEST_CASE("seconds when asked") {
++    CHECK(display_time(at(2026, 10, 15, 20, 54, 7), now, true) == "Oct 15, 8:54:07 PM");
++}
++
++TEST_CASE("rows keep the order and say nothing about the file when all backups are of the game save") {
++    const std::vector<Row> r = rows({ { at(2026, 10, 15, 20, 54) }, { at(2026, 10, 14, 8, 1) } }, now);
++    CHECK_EQ(r.size(), size_t(2));
++    CHECK(r[0].time == "Oct 15, 8:54 PM");
++    CHECK(r[1].time == "Oct 14, 8:01 AM");
++    CHECK(r[0].file.empty());
++    CHECK(r[1].file.empty());
++    CHECK(r[0].note.empty());
++}
++
++TEST_CASE("with game save and Controller Pak backups each row says which file") {
++    // A launch backs up both files in the same second; the file tells them apart, so no seconds are needed.
++    const std::vector<Row> r = rows({
++        { at(2026, 10, 15, 20, 54, 3), false },
++        { at(2026, 10, 15, 20, 54, 3), true },
++    }, now);
++    CHECK(r[0].file == "Game save");
++    CHECK(r[1].file == "Controller Pak");
++    CHECK(r[0].time == "Oct 15, 8:54 PM");
++    CHECK(r[1].time == "Oct 15, 8:54 PM");
++}
++
++TEST_CASE("two backups of the same file in the same minute get their seconds") {
++    const std::vector<Row> r = rows({
++        { at(2026, 10, 15, 20, 54, 40) },
++        { at(2026, 10, 15, 20, 54, 2) },
++        { at(2026, 10, 15, 20, 40, 0) },
++    }, now);
++    CHECK(r[0].time == "Oct 15, 8:54:40 PM");
++    CHECK(r[1].time == "Oct 15, 8:54:02 PM");
++    CHECK(r[2].time == "Oct 15, 8:40 PM");
++}
++
++TEST_CASE("the pending restore is marked") {
++    const std::vector<Row> r = rows({ { at(2026, 10, 15, 20, 54), false, false }, { at(2026, 10, 14, 8, 1), false, true } }, now);
++    CHECK(r[0].note.empty());
++    CHECK(r[1].note == "Restores at next start");
++}
++
++TEST_CASE("no backups, no rows") {
++    CHECK(rows({}, now).empty());
++}
++
++TEST_CASE("the confirmation names the file and the date") {
++    CHECK(confirm_text({ at(2026, 10, 15, 20, 54) }, now) ==
++        "Restore the game save backup from Oct 15, 8:54 PM? It's restored the next time the game starts, and your current save is backed up first.");
++    CHECK(confirm_text({ at(2026, 10, 15, 20, 54), true }, now).find("Controller Pak backup from Oct 15, 8:54 PM?") != std::string::npos);
 +}
 diff --git a/recompui/tests/wcw_test.h b/recompui/tests/wcw_test.h
 new file mode 100644
