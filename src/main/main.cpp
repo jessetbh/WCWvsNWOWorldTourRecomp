@@ -574,11 +574,43 @@ static void register_mod_input_exports() {
     recomp::overlays::register_base_export("recomp_set_movement_rotation", mod_set_movement_rotation);
 }
 
+// [wcw] Texture packs (aki-roadmap#48). A pack is a folder or an .rtz (a zip) with rt64.json at its root, in the mods
+// folder or installed from the Mods menu; it shows up there and can be switched on and off while playing (the
+// Zelda64Recomp registration). --dump-textures (or WCW_TEX_DUMP=<folder>) saves every texture the game draws as
+// <rt64 hash>.png in <app folder>/texture_dump/pack: edit the PNGs you want to change, delete the rest, and copy the
+// pack folder (any name) into mods.
+static void register_texture_packs(const std::filesystem::path& app_folder, bool dump_textures) {
+    recomp::mods::ModContentType texture_pack_content_type{
+        .content_filename = "rt64.json",
+        .allow_runtime_toggle = true,
+        .on_enabled = [](recomp::mods::ModContext& context, const recomp::mods::ModHandle& mod) { recompui::renderer::enable_texture_pack(context, mod); },
+        .on_disabled = [](recomp::mods::ModContext&, const recomp::mods::ModHandle& mod) { recompui::renderer::disable_texture_pack(mod); },
+        .on_reordered = [](recomp::mods::ModContext&) { recompui::renderer::trigger_texture_pack_update(); },
+    };
+    const recomp::mods::ModContentTypeId texture_pack_type = recomp::mods::register_mod_content_type(texture_pack_content_type);
+    recomp::mods::register_mod_container_type("rtz", std::vector{ texture_pack_type }, false);
+
+    if (dump_textures && (getenv("WCW_TEX_DUMP") == nullptr)) {
+        // Read by RT64 (getenv) when the renderer starts.
+        const std::filesystem::path dump_folder = app_folder / "texture_dump";
+        const std::string dump_folder_u8 = reinterpret_cast<const char*>(dump_folder.u8string().c_str());
+#ifdef _WIN32
+        _putenv_s("WCW_TEX_DUMP", dump_folder_u8.c_str());
+#else
+        setenv("WCW_TEX_DUMP", dump_folder_u8.c_str(), 1);
+#endif
+    }
+}
+
 int main(int argc, char** argv) {
     bool show_console = false;
+    bool dump_textures = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--show-console") == 0) {
             show_console = true;
+        }
+        else if (strcmp(argv[i], "--dump-textures") == 0) {
+            dump_textures = true;
         }
     }
     (void)show_console;
@@ -707,6 +739,7 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(app_folder, app_folder_ec);
     recomp::register_config_path(app_folder);
     install_bundled_mods(app_folder);
+    register_texture_packs(app_folder, dump_textures);
     register_mod_input_exports();
     wcw::register_wcw_overlays();
     wcw::register_wcw_patches();

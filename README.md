@@ -287,6 +287,26 @@ the window):
 New mods are switched on by default. Mods are applied when the game starts, so restart after changing them. To
 remove a mod, delete its file.
 
+#### Texture packs
+
+The game loads RT64 texture packs: replacement textures, for example HD versions. A pack is a folder or an `.rtz`
+file (a zip) with an `rt64.json` at its root. Copy it into the mods folder, or install an `.rtz` from the Mods menu.
+It shows up in the Mods menu and can be switched on and off while you play.
+
+To make your own:
+
+1. **Dump.** Start the game with `--dump-textures` (for example, a shortcut to `WCWRecompiled.exe --dump-textures`).
+   Every texture the game draws is saved once, as a PNG named by its hash, in `texture_dump\pack\` next to the
+   mods folder. Play the screens you want to change, then quit. Start the game without the option to stop dumping.
+2. **Edit.** Change the PNGs in any image editor. Keep the file names. Any size works (2x or 4x gives HD
+   textures); keep the aspect ratio. Delete the PNGs you didn't change.
+3. **Load.** Copy the `pack` folder into the mods folder and give it a name: that's the pack's name in the Mods menu.
+
+The dump folder also holds raw texture data, which RT64's `texture_hasher --rice` uses to map packs made for other
+emulators (Rice/GLideN64 file names) to this game's textures; see RT64's
+[texture pack guide](https://github.com/rt64/rt64/blob/main/TEXTURE-PACKS.md). Dumped textures are the game's own
+art: don't share packs that contain unedited dumps.
+
 #### Making your own mod
 
 A mod is a small C program compiled for the N64's MIPS CPU. The runtime links it into the recompiled game, where it
