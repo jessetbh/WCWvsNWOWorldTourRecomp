@@ -591,6 +591,9 @@ static void fetch_conversion_codes() {
         return;
     }
     fetched = true;
+    if (recomp::mods::active_native_codes_ready()) {
+        return; // the runtime runs these itself, every frame (aki_conversion_apply)
+    }
     std::string text = recomp::mods::active_conversion_codes();
     if (text.empty()) {
         return;
@@ -625,6 +628,13 @@ static void mod_conversion_codes(uint8_t* rdram, recomp_context* ctx) {
     ctx->r2 = addr;
 }
 
+// void aki_conversion_apply(void): runs the conversion's native codes table once (librecomp conversion_codes.hpp:
+// codes written for this port's revision, any number of them). The cheats mod calls it from its frame hook.
+static void mod_conversion_apply(uint8_t* rdram, recomp_context* ctx) {
+    constexpr uint32_t rdram_size = 0x800000; // 8 MB (Expansion Pak), the cheats engine's range
+    recomp::mods::apply_active_native_codes(rdram, rdram_size);
+}
+
 // void aki_conversion_log(const char* msg): one line in the game's log.
 static void mod_conversion_log(uint8_t* rdram, recomp_context* ctx) {
     fprintf(stderr, "[conversion] %s\n", _arg_string<0>(rdram, ctx).c_str());
@@ -633,6 +643,7 @@ static void mod_conversion_log(uint8_t* rdram, recomp_context* ctx) {
 static void register_conversion_exports() {
     recomp::overlays::register_base_export("aki_conversion_codes", mod_conversion_codes);
     recomp::overlays::register_base_export("aki_conversion_log", mod_conversion_log);
+    recomp::overlays::register_base_export("aki_conversion_apply", mod_conversion_apply);
 }
 
 // [wcw] Texture packs (aki-roadmap#48). A pack is a folder or an .rtz (a zip) with rt64.json at its root, in the mods
