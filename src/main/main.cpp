@@ -37,6 +37,8 @@
 #include "librecomp/rsp.hpp"
 #include "librecomp/helpers.hpp"
 #include "librecomp/overlays.hpp"
+#include "librecomp/conversion.hpp"
+#include "librecomp/addresses.hpp" // recomp::alloc (conversion codes export)
 #include "ovl_patches.hpp"
 #include "icon_bytes.h"
 #include "logo_bytes.h"
@@ -574,6 +576,65 @@ static void register_mod_input_exports() {
     recomp::overlays::register_base_export("recomp_set_movement_rotation", mod_set_movement_rotation);
 }
 
+// [wcw fullconv] Conversion codes. AKI_CONVERSION=<id> (set by AKI Launcher) names an installed conversion,
+// <app folder>/conversions/<id>/aki.json. The runtime's loader (librecomp conversion.cpp) owns that manifest: the id
+// rules and the codes file path. When the conversion has a codes component, its text goes to the AkiMods cheats engine
+// (aki_cheats, built with AKI_HOST_CONVERSION), which applies it every frame. Grammar and contract: AkiMods
+// mods/cheats/README.md, "Codes files". Without AKI_CONVERSION, or without codes, aki_conversion_codes returns NULL.
+static std::string conversion_codes_text;
+static bool conversion_has_codes = false;
+
+// Fetched the first time the cheats mod asks (after the mod scan has loaded the conversion).
+static void fetch_conversion_codes() {
+    static bool fetched = false;
+    if (fetched) {
+        return;
+    }
+    fetched = true;
+    std::string text = recomp::mods::active_conversion_codes();
+    if (text.empty()) {
+        return;
+    }
+    constexpr size_t max_codes_bytes = 1024 * 1024;
+    if (text.size() > max_codes_bytes) {
+        fprintf(stderr, "[conversion] codes file is over 1 MB; ignored\n");
+        return;
+    }
+    text.erase(std::remove(text.begin(), text.end(), '\0'), text.end()); // the mod reads a C string
+    conversion_codes_text = std::move(text);
+    conversion_has_codes = true;
+    fprintf(stderr, "[conversion] codes (%zu bytes) handed to the cheats engine\n", conversion_codes_text.size());
+}
+
+// char* aki_conversion_codes(void): the codes text as a NUL-terminated string in the recomp heap (the mod frees it
+// with recomp_free), or NULL.
+static void mod_conversion_codes(uint8_t* rdram, recomp_context* ctx) {
+    fetch_conversion_codes();
+    if (!conversion_has_codes) {
+        ctx->r2 = 0;
+        return;
+    }
+    const std::string& s = conversion_codes_text;
+    const size_t alloc_size = (s.size() + 1 + 15) & ~size_t(15);
+    const gpr offset = reinterpret_cast<uint8_t*>(recomp::alloc(rdram, alloc_size)) - rdram;
+    const gpr addr = offset + 0xFFFFFFFF80000000ULL;
+    for (size_t i = 0; i < s.size(); i++) {
+        MEM_B(i, addr) = s[i];
+    }
+    MEM_B(s.size(), addr) = 0;
+    ctx->r2 = addr;
+}
+
+// void aki_conversion_log(const char* msg): one line in the game's log.
+static void mod_conversion_log(uint8_t* rdram, recomp_context* ctx) {
+    fprintf(stderr, "[conversion] %s\n", _arg_string<0>(rdram, ctx).c_str());
+}
+
+static void register_conversion_exports() {
+    recomp::overlays::register_base_export("aki_conversion_codes", mod_conversion_codes);
+    recomp::overlays::register_base_export("aki_conversion_log", mod_conversion_log);
+}
+
 // [wcw] Texture packs (aki-roadmap#48). A pack is a folder or an .rtz (a zip) with rt64.json at its root, in the mods
 // folder or installed from the Mods menu; it shows up there and can be switched on and off while playing (the
 // Zelda64Recomp registration). --dump-textures (or WCW_TEX_DUMP=<folder>) saves every texture the game draws as
@@ -739,8 +800,11 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(app_folder, app_folder_ec);
     recomp::register_config_path(app_folder);
     install_bundled_mods(app_folder);
+    // [wcw fullconv] Codes in a conversion (AKI_CONVERSION) only run when written for this ROM revision.
+    recomp::mods::set_port_rom_revision("wt-rev0");
     register_texture_packs(app_folder, dump_textures);
     register_mod_input_exports();
+    register_conversion_exports();
     wcw::register_wcw_overlays();
     wcw::register_wcw_patches();
 
