@@ -1156,10 +1156,10 @@ index 0000000..f827267
 +};
 diff --git a/src/common/rt64_wcw_logic.h b/src/common/rt64_wcw_logic.h
 new file mode 100644
-index 0000000..5040ec4
+index 0000000..64baec3
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.h
-@@ -0,0 +1,685 @@
+@@ -0,0 +1,719 @@
 +//
 +// RT64
 +//
@@ -1750,6 +1750,40 @@ index 0000000..5040ec4
 +    // "<hash>.png" or ".dds" when the dump started. A second dump session used to rewrite every PNG and lose the
 +    // player's edits, because only the per-session set was checked.
 +    TexDumpWrite texDumpWrite(bool dumpedThisSession, bool packFileExists);
++
++    // Display lists (aki-roadmap#116)
++
++    // Most commands the interpreter runs for one display list task. A list that branches back into itself (a hack's
++    // codes writing into display-list memory did: WWF inVasion's Stretched Ringmats + Backstage Assault) never ends.
++    // The interpreter then ran it forever on the render thread, adding projections and draw data on every pass:
++    // ~0.9 GB/s, until the PC ran out of memory. Real hardware would hang the RSP; here the list is ended, so memory
++    // stays bounded and the game sees its task complete. Real tasks are far shorter: the longest measured (WCW_DL_STATS=1,
++    // 2026-10-20) were 4,361 commands in a TNA vs ROH match and 7,768 in Lucha Underground's attract (859,820 codes).
++    constexpr uint64_t DisplayListCommandLimit = 1000000;
++
++    // World transforms one workload may hold: draw calls index them with uint16_t (RSP curTransformIndex, a draw call's
++    // min/maxWorldMatrix), so past 65535 the indices wrap and later stages (frame matching) read the wrong ones and
++    // crash. A looping list reaches that within one pass; no real frame comes close.
++    constexpr uint64_t WorldTransformLimit = 65535;
++
++    // One display list task's budget: take() before each command, with the workload's world transform count; false
++    // once the commands pass the limit or the transforms reach WorldTransformLimit (then the list ends).
++    struct DisplayListBudget {
++        uint64_t limit = DisplayListCommandLimit;
++        uint64_t transformLimit = WorldTransformLimit;
++        uint64_t commands = 0;
++        bool transformsFull = false;
++
++        bool take(uint64_t worldTransforms) {
++            commands++;
++            transformsFull = transformsFull || (worldTransforms >= transformLimit);
++            return (commands <= limit) && !transformsFull;
++        }
++
++        bool exhausted() const {
++            return (commands > limit) || transformsFull;
++        }
++    };
 +
 +    // Graphics device loss
 +
@@ -16662,6 +16696,67 @@ index 00a72f6..6268223 100644
      };
  };
 \ No newline at end of file
+diff --git a/src/hle/rt64_interpreter.cpp b/src/hle/rt64_interpreter.cpp
+index dccaa87..8cb5dc2 100644
+--- a/src/hle/rt64_interpreter.cpp
++++ b/src/hle/rt64_interpreter.cpp
+@@ -3,8 +3,11 @@
+ //
+ 
+ #include "rt64_interpreter.h"
++#include "common/rt64_wcw_logic.h"
+ 
+ #include <cassert>
++#include <cstdio>
++#include <cstdlib>
+ 
+ //#define DUMP_DISPLAY_LISTS
+ 
+@@ -169,7 +172,27 @@ namespace RT64 {
+         DisplayList *dl = dlStart;
+         uint8_t opCode;
+         GBIFunction func;
++        WcwLogic::DisplayListBudget budget; // [wcw] aki-roadmap#116: a list that never ends is ended (see the logic).
++        WorkloadQueue &workloadQueue = *state->ext.workloadQueue;
+         while (dl != nullptr) {
++            // The workload being written can change inside the list (a full sync), so look it up per command.
++            if (!budget.take(workloadQueue.workloads[workloadQueue.writeCursor].drawData.worldTransforms.size())) {
++                static bool logged = false;
++                if (!logged) {
++                    logged = true;
++                    fprintf(stderr, "[wcw] display list at 0x%08X ran past its budget (%llu commands%s; it loops): ended it\n",
++                        dlStartAdddress, (unsigned long long)(budget.commands), budget.transformsFull ? ", world transforms full" : "");
++                }
++
++                // End the task as its G_RDPFULLSYNC would: submit what it recorded (with the draw call that was open)
++                // and interrupt, with no return addresses left over. Cut short without this, the open draw call
++                // carried its world matrix range into the next task's workload, and frame matching read past it.
++                state->returnAddressStack.clear();
++                state->fullSync();
++                state->dpInterrupt();
++                break;
++            }
++
+             opCode = (dl->w0 >> 24);
+ 
+             if ((extendedOpCode != 0) && (opCode == extendedOpCode)) {
+@@ -195,6 +218,16 @@ namespace RT64 {
+             }
+         }
+ 
++        // [wcw] WCW_DL_STATS=1: the longest display list task so far, every 10 s (what DisplayListCommandLimit is measured against).
++        static const bool dlStats = (getenv("WCW_DL_STATS") != nullptr);
++        if (dlStats) {
++            static uint64_t longest = 0, lists = 0;
++            longest = (budget.commands > longest) ? budget.commands : longest;
++            if ((++lists % 600) == 0) {
++                fprintf(stderr, "[wcw] display lists: %llu, longest %llu commands\n", (unsigned long long)(lists), (unsigned long long)(longest));
++            }
++        }
++
+         state->dlCpuProfiler.end();
+     }
+ };
 diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
 index 3227ab1..214a9df 100644
 --- a/src/hle/rt64_present_queue.cpp
@@ -26393,10 +26488,10 @@ index 42cd7b6..728c967 100644
  target_link_libraries(texture_packer PRIVATE libzstd_static)
 diff --git a/tests/wcw/rt64_wcw_logic_tests.cpp b/tests/wcw/rt64_wcw_logic_tests.cpp
 new file mode 100644
-index 0000000..871f743
+index 0000000..dbb2bb1
 --- /dev/null
 +++ b/tests/wcw/rt64_wcw_logic_tests.cpp
-@@ -0,0 +1,1743 @@
+@@ -0,0 +1,1804 @@
 +//
 +// RT64
 +//
@@ -27951,6 +28046,67 @@ index 0000000..871f743
 +    // Once per session, either way.
 +    CHECK(texDumpWrite(true, false) == TexDumpWrite::Nothing);
 +    CHECK(texDumpWrite(true, true) == TexDumpWrite::Nothing);
++}
++
++TEST_CASE("display list budget: a list that loops is ended at the command limit, so the interpreter can't grow memory forever (#116)") {
++    // The interpreter loop: take() before every command; false ends the list.
++    DisplayListBudget budget;
++    budget.limit = 1000;
++    uint64_t run = 0;
++    for (uint64_t i = 0; i < 10 * budget.limit; i++) {   // a list that branches back into itself never ends on its own
++        if (!budget.take(0)) {
++            break;
++        }
++
++        run++;
++    }
++
++    CHECK_EQ(run, uint64_t(1000));
++    CHECK(budget.exhausted());
++    CHECK(!budget.transformsFull);
++}
++
++TEST_CASE("display list budget: a list of exactly the limit runs whole; a new task starts from zero") {
++    DisplayListBudget budget;
++    budget.limit = 3;
++    CHECK(budget.take(0));
++    CHECK(budget.take(0));
++    CHECK(budget.take(0));
++    CHECK(!budget.exhausted());
++    CHECK(!budget.take(0));
++    CHECK(budget.exhausted());
++    DisplayListBudget next;
++    CHECK(next.take(0));
++    CHECK(!next.exhausted());
++    CHECK_EQ(next.limit, DisplayListCommandLimit);
++}
++
++TEST_CASE("display list budget: the list ends before world transform indices (uint16_t) wrap") {
++    // The looping list in WWF inVasion added a matrix every few commands: with only the command limit, its workload
++    // passed 65535 world transforms, the uint16_t indices wrapped, and frame matching crashed on the next frame.
++    DisplayListBudget budget;
++    uint64_t transforms = 0, run = 0;
++    while (budget.take(transforms)) {
++        run++;
++        transforms += (run % 4 == 0) ? 1 : 0;   // one G_MTX per 4 commands
++    }
++
++    CHECK(budget.transformsFull);
++    CHECK(budget.exhausted());
++    CHECK_EQ(transforms, WorldTransformLimit);
++    CHECK(transforms <= uint64_t(UINT16_MAX));
++    // Once full, it stays ended even if the count were to drop (a new workload mid-list).
++    CHECK(!budget.take(0));
++    // Below the limit a list runs on.
++    DisplayListBudget normal;
++    CHECK(normal.take(WorldTransformLimit - 1));
++}
++
++TEST_CASE("display list budget: the default limits are far above real frames") {
++    // The longest real task measured with WCW_DL_STATS=1 (2026-10-20) was 7,768 commands (Lucha Underground's attract).
++    // Keep a wide margin so no real frame is ever cut.
++    CHECK(DisplayListCommandLimit >= 100 * uint64_t(7768));
++    CHECK(WorldTransformLimit <= uint64_t(UINT16_MAX));
 +}
 +
 +// Graphics device loss
