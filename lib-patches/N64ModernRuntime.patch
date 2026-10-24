@@ -13,35 +13,43 @@ index 4b3ed99..f77f97a 100644
  	path = thirdparty/o1heap
  	url = https://github.com/N64Recomp/o1heap
 diff --git a/librecomp/CMakeLists.txt b/librecomp/CMakeLists.txt
-index 716d48b..aa59e72 100644
+index 716d48b..d18b31e 100644
 --- a/librecomp/CMakeLists.txt
 +++ b/librecomp/CMakeLists.txt
-@@ -31,6 +31,9 @@ add_library(librecomp STATIC
+@@ -31,6 +31,11 @@ add_library(librecomp STATIC
      "${CMAKE_CURRENT_SOURCE_DIR}/src/print.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/rsp.cpp"
 +    "${CMAKE_CURRENT_SOURCE_DIR}/src/save_backup_rules.cpp"
++    "${CMAKE_CURRENT_SOURCE_DIR}/src/mod_folder_rules.cpp"
++    "${CMAKE_CURRENT_SOURCE_DIR}/src/mod_enable_rules.cpp"
 +    "${CMAKE_CURRENT_SOURCE_DIR}/src/save_backups.cpp"
 +    "${CMAKE_CURRENT_SOURCE_DIR}/src/si.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/sp.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/ultra_stubs.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/ultra_translation.cpp"
-@@ -65,3 +68,27 @@ add_subdirectory(${PROJECT_SOURCE_DIR}/../N64Recomp ${CMAKE_CURRENT_BINARY_DIR}/
+@@ -65,3 +70,33 @@ add_subdirectory(${PROJECT_SOURCE_DIR}/../N64Recomp ${CMAKE_CURRENT_BINARY_DIR}/
  
  target_link_libraries(librecomp PRIVATE ultramodern N64Recomp LiveRecomp)
  target_link_libraries(librecomp PUBLIC miniz)
 +
 +# [wcw] Unit tests for librecomp's own decision logic (tests/wcw: quitting during startup, jessetbh/aki-roadmap#73;
-+# save backup rules, aki-roadmap#50). Plain C++ (no game, no ROM), built and run as part of every librecomp build, so a
++# save backup rules, aki-roadmap#50; ultramodern's idle external-message wait, aki-roadmap#90; texture pack folders, aki-roadmap#48; dependency auto-enable and folder mod ids, aki-roadmap#100). Plain C++ (no game, no ROM), built and run as part of every librecomp build, so a
 +# failing test fails the game's build (as rt64's and recompui's wcw tests do). LIBRECOMP_WCW_TESTS=OFF skips them.
 +option(LIBRECOMP_WCW_TESTS "Build and run the wcw unit tests with librecomp" ON)
 +if (LIBRECOMP_WCW_TESTS AND NOT CMAKE_CROSSCOMPILING)
 +    add_executable(librecomp_wcw_tests
 +        "${PROJECT_SOURCE_DIR}/tests/wcw/startup_shutdown_tests.cpp"
 +        "${PROJECT_SOURCE_DIR}/tests/wcw/save_backup_rules_tests.cpp"
++        "${PROJECT_SOURCE_DIR}/tests/wcw/external_message_pump_tests.cpp"
++        "${PROJECT_SOURCE_DIR}/tests/wcw/mod_folder_rules_tests.cpp"
++        "${PROJECT_SOURCE_DIR}/tests/wcw/mod_enable_rules_tests.cpp"
 +        "${PROJECT_SOURCE_DIR}/src/save_backup_rules.cpp"
++        "${PROJECT_SOURCE_DIR}/src/mod_folder_rules.cpp"
++        "${PROJECT_SOURCE_DIR}/src/mod_enable_rules.cpp"
 +    )
-+    target_include_directories(librecomp_wcw_tests PRIVATE "${PROJECT_SOURCE_DIR}/include" "${PROJECT_SOURCE_DIR}/tests/wcw")
++    target_include_directories(librecomp_wcw_tests PRIVATE "${PROJECT_SOURCE_DIR}/include" "${PROJECT_SOURCE_DIR}/tests/wcw"
++        "${PROJECT_SOURCE_DIR}/../ultramodern/include" "${PROJECT_SOURCE_DIR}/../thirdparty/concurrentqueue")
 +    set(LIBRECOMP_WCW_TESTS_STAMP "${CMAKE_CURRENT_BINARY_DIR}/librecomp_wcw_tests.passed")
 +    add_custom_command(
 +        OUTPUT "${LIBRECOMP_WCW_TESTS_STAMP}"
@@ -54,8 +62,89 @@ index 716d48b..aa59e72 100644
 +    add_custom_target(librecomp_wcw_tests_run DEPENDS "${LIBRECOMP_WCW_TESTS_STAMP}")
 +    add_dependencies(librecomp librecomp_wcw_tests_run)
 +endif()
+diff --git a/librecomp/include/librecomp/mod_enable_rules.hpp b/librecomp/include/librecomp/mod_enable_rules.hpp
+new file mode 100644
+index 0000000..0553947
+--- /dev/null
++++ b/librecomp/include/librecomp/mod_enable_rules.hpp
+@@ -0,0 +1,32 @@
++#ifndef __RECOMP_MOD_ENABLE_RULES_HPP__
++#define __RECOMP_MOD_ENABLE_RULES_HPP__
++
++// [wcw] Pure rule for the mods that enabling a mod auto-enables (its dependencies, aki-roadmap#100). Unit tested in
++// tests/wcw/mod_enable_rules_tests.cpp.
++
++#include <functional>
++#include <string>
++#include <unordered_set>
++#include <vector>
++
++namespace recomp {
++    namespace mods {
++        namespace enable_rules {
++            // A dependency as the walk sees it: the mod it names, and whether it's skipped (optional, or deprecated
++            // at the version asked for).
++            struct Dependency {
++                std::string mod_id;
++                bool skipped = false;
++            };
++
++            // The mods that enabling mod_id auto-enables, in the order they're found: its dependencies that aren't
++            // skipped, then theirs, leaving out any already in auto_enabled (each one found is added to it).
++            // dependencies_of(id) is empty for a mod that isn't opened. on_enabled fires for each mod returned, with
++            // that mod's own handle: it used to fire with the handle of the mod that depends on it.
++            std::vector<std::string> newly_auto_enabled(const std::string &mod_id,
++                const std::function<std::vector<Dependency>(const std::string &)> &dependencies_of, std::unordered_set<std::string> &auto_enabled);
++        }
++    }
++}
++
++#endif
+diff --git a/librecomp/include/librecomp/mod_folder_rules.hpp b/librecomp/include/librecomp/mod_folder_rules.hpp
+new file mode 100644
+index 0000000..84f67bb
+--- /dev/null
++++ b/librecomp/include/librecomp/mod_folder_rules.hpp
+@@ -0,0 +1,37 @@
++#ifndef __RECOMP_MOD_FOLDER_RULES_HPP__
++#define __RECOMP_MOD_FOLDER_RULES_HPP__
++
++// [wcw] Pure rule for folders in the mods folder that have no mod.json (aki-roadmap#48): a folder holding the content
++// file of a container type that needs no manifest (a texture pack's rt64.json, the .rtz container) opens as that kind
++// of mod, named after the folder, exactly as the zipped container would. Unit tested in tests/wcw/mod_folder_rules_tests.cpp.
++
++#include <cstddef>
++#include <functional>
++#include <string>
++#include <vector>
++
++namespace recomp {
++    namespace mods {
++        namespace folder_rules {
++            // A registered container type: the content types it may hold (empty = any) and whether it needs a mod.json.
++            struct Container {
++                std::vector<size_t> content_types;
++                bool requires_manifest = true;
++            };
++
++            // The content types a folder without a mod.json opens with: every type allowed by a manifest-less container
++            // whose content file (content_filenames[type]) the folder holds. Empty = the folder isn't such a mod (it
++            // then needs a mod.json, as before). Containers that allow any content don't count (no content file to
++            // look for), and each type appears once, in registration order.
++            std::vector<size_t> manifestless_folder_types(const std::vector<Container> &containers,
++                const std::vector<std::string> &content_filenames, const std::function<bool(const std::string &)> &has_file);
++
++            // The mod id (and display name) of a mod without a mod.json, from its file or folder name: a folder keeps
++            // its whole name ("pack.v2"), a container file drops its extension ("pack.v2.rtz" is "pack.v2"). Folders
++            // used to lose everything after their last dot (aki-roadmap#100).
++            std::string manifestless_mod_id(const std::string &file_name, bool is_directory);
++        }
++    }
++}
++
++#endif
 diff --git a/librecomp/include/librecomp/mods.hpp b/librecomp/include/librecomp/mods.hpp
-index 37556bd..f6c11bb 100644
+index 37556bd..fc9fb93 100644
 --- a/librecomp/include/librecomp/mods.hpp
 +++ b/librecomp/include/librecomp/mods.hpp
 @@ -11,6 +11,7 @@
@@ -66,7 +155,24 @@ index 37556bd..f6c11bb 100644
  #include <cstddef>
  #include <variant>
  #include <mutex>
-@@ -397,6 +398,12 @@ namespace recomp {
+@@ -28,6 +29,7 @@
+ #include "librecomp/sections.h"
+ #include "librecomp/overlays.hpp"
+ #include "librecomp/config.hpp"
++#include "librecomp/mod_enable_rules.hpp"
+ 
+ namespace N64Recomp {
+     class Context;
+@@ -388,6 +390,8 @@ namespace recomp {
+             ModOpenError open_mod_from_memory(std::span<const uint8_t> mod_bytes, std::string &error_param, const std::vector<ModContentTypeId> &supported_content_types, bool requires_manifest);
+             ModLoadError load_mod(ModHandle& mod, std::string& error_param);
+             void check_dependencies(ModHandle& mod, std::vector<std::pair<ModLoadError, std::string>>& errors);
++            // [wcw] Callers hold opened_mods_mutex (aki-roadmap#100).
++            std::vector<enable_rules::Dependency> auto_enable_dependencies(const std::string& mod_id);
+             CodeModLoadError init_mod_code(uint8_t* rdram, const std::unordered_map<uint32_t, uint16_t>& section_vrom_map, ModHandle& mod, int32_t load_address, bool hooks_available, uint32_t& ram_used, std::string& error_param);
+             CodeModLoadError load_mod_code(uint8_t* rdram, ModHandle& mod, uint32_t base_event_index, std::string& error_param);
+             CodeModLoadError resolve_code_dependencies(ModHandle& mod, size_t mod_index, const std::unordered_map<recomp_func_t*, recomp::overlays::BasePatchedFunction>& base_patched_funcs, std::string& error_param);
+@@ -397,6 +401,12 @@ namespace recomp {
                  const std::unordered_map<uint32_t, uint16_t>& section_vrom_map,
                  const std::unordered_map<recomp_func_t*, overlays::BasePatchedFunction>& base_patched_funcs,
                  std::span<const uint8_t> decompressed_rom);
@@ -79,7 +185,7 @@ index 37556bd..f6c11bb 100644
              void dirty_mod_configuration_thread_process();
              void rebuild_mod_order_lookup();
  
-@@ -429,6 +436,8 @@ namespace recomp {
+@@ -429,6 +439,8 @@ namespace recomp {
              std::unique_ptr<LiveRecompilerCodeHandle> regenerated_code_handle;
              // Code handle for base patched code that was regenerated to add hooks.
              std::unique_ptr<LiveRecompilerCodeHandle> base_patched_code_handle;
@@ -88,7 +194,7 @@ index 37556bd..f6c11bb 100644
              // Map of hook definition to the entry hook slot's index.
              std::unordered_map<HookDefinition, size_t> hook_slots;
              // Tracks which hook slots have already been processed. Used to regenerate vanilla functions as needed
-@@ -627,6 +636,17 @@ namespace recomp {
+@@ -627,6 +639,17 @@ namespace recomp {
          void close_mods();
          std::filesystem::path get_mods_directory();
          std::optional<ModDetails> get_details_for_mod(const std::string& mod_id);
@@ -391,11 +497,255 @@ index 4d6a01d..9e2dc24 100644
 +
 +    ctx->f0.d = ret;
 +}
+diff --git a/librecomp/src/mod_enable_rules.cpp b/librecomp/src/mod_enable_rules.cpp
+new file mode 100644
+index 0000000..a076342
+--- /dev/null
++++ b/librecomp/src/mod_enable_rules.cpp
+@@ -0,0 +1,22 @@
++#include "librecomp/mod_enable_rules.hpp"
++
++std::vector<std::string> recomp::mods::enable_rules::newly_auto_enabled(const std::string &mod_id,
++    const std::function<std::vector<Dependency>(const std::string &)> &dependencies_of, std::unordered_set<std::string> &auto_enabled) {
++    std::vector<std::string> found;
++    std::vector<std::string> mod_stack;
++    mod_stack.emplace_back(mod_id);
++    while (!mod_stack.empty()) {
++        std::string mod_from_stack = std::move(mod_stack.back());
++        mod_stack.pop_back();
++
++        for (const Dependency &dependency : dependencies_of(mod_from_stack)) {
++            if (!dependency.skipped && !auto_enabled.contains(dependency.mod_id)) {
++                auto_enabled.emplace(dependency.mod_id);
++                mod_stack.emplace_back(dependency.mod_id);
++                found.emplace_back(dependency.mod_id);
++            }
++        }
++    }
++
++    return found;
++}
+diff --git a/librecomp/src/mod_folder_rules.cpp b/librecomp/src/mod_folder_rules.cpp
+new file mode 100644
+index 0000000..40e6f8d
+--- /dev/null
++++ b/librecomp/src/mod_folder_rules.cpp
+@@ -0,0 +1,37 @@
++#include "librecomp/mod_folder_rules.hpp"
++
++#include <algorithm>
++#include <filesystem>
++
++std::vector<size_t> recomp::mods::folder_rules::manifestless_folder_types(const std::vector<Container> &containers,
++    const std::vector<std::string> &content_filenames, const std::function<bool(const std::string &)> &has_file) {
++    std::vector<bool> allowed(content_filenames.size(), false);
++    for (const Container &container : containers) {
++        if (container.requires_manifest) {
++            continue;
++        }
++
++        for (size_t type : container.content_types) {
++            if (type < allowed.size()) {
++                allowed[type] = true;
++            }
++        }
++    }
++
++    std::vector<size_t> types;
++    for (size_t type = 0; type < content_filenames.size(); type++) {
++        if (allowed[type] && !content_filenames[type].empty() && has_file(content_filenames[type])) {
++            types.emplace_back(type);
++        }
++    }
++
++    return types;
++}
++
++std::string recomp::mods::folder_rules::manifestless_mod_id(const std::string &file_name, bool is_directory) {
++    if (is_directory) {
++        return file_name;
++    }
++
++    return std::filesystem::path(file_name).stem().string();
++}
+diff --git a/librecomp/src/mod_manifest.cpp b/librecomp/src/mod_manifest.cpp
+index 71560eb..e323045 100644
+--- a/librecomp/src/mod_manifest.cpp
++++ b/librecomp/src/mod_manifest.cpp
+@@ -5,6 +5,7 @@
+ #include "recompiler/context.h"
+ #include "librecomp/files.hpp"
+ #include "librecomp/mods.hpp"
++#include "librecomp/mod_folder_rules.hpp"
+ 
+ recomp::mods::ZipModFileHandle::~ZipModFileHandle() {
+     if (file_handle) {
+@@ -873,7 +874,10 @@ recomp::mods::ModOpenError recomp::mods::ModContext::open_mod_from_manifest(ModM
+                     manifest.mod_game_ids.emplace_back(key);
+                 }
+ 
+-                manifest.mod_id = manifest.mod_root_path.stem().string();
++                // [wcw] A folder keeps the dots in its name (aki-roadmap#100).
++                std::error_code directory_ec;
++                const bool is_directory = std::filesystem::is_directory(manifest.mod_root_path, directory_ec);
++                manifest.mod_id = folder_rules::manifestless_mod_id(manifest.mod_root_path.filename().string(), is_directory);
+                 manifest.display_name = manifest.mod_id;
+                 manifest.description.clear();
+                 manifest.short_description.clear();
 diff --git a/librecomp/src/mods.cpp b/librecomp/src/mods.cpp
-index 0f7de83..3d6df3e 100644
+index 0f7de83..8d0c12a 100644
 --- a/librecomp/src/mods.cpp
 +++ b/librecomp/src/mods.cpp
-@@ -1571,8 +1571,16 @@ void recomp::mods::ModContext::set_latest_game_mode_id(const std::string& game_m
+@@ -5,6 +5,8 @@
+ 
+ #include "librecomp/files.hpp"
+ #include "librecomp/mods.hpp"
++#include "librecomp/mod_folder_rules.hpp"
++#include "librecomp/mod_enable_rules.hpp"
+ #include "librecomp/overlays.hpp"
+ #include "librecomp/game.hpp"
+ #include "librecomp/patcher.hpp"
+@@ -800,10 +802,28 @@ std::vector<recomp::mods::ModOpenErrorDetails> recomp::mods::ModContext::scan_mo
+     close_mods();
+ 
+     static const std::vector<ModContentTypeId> empty_content_types{};
++
++    // [wcw] Folders without a mod.json open like a manifest-less container (a texture pack folder with rt64.json opens
++    // like an .rtz), aki-roadmap#48.
++    std::vector<folder_rules::Container> folder_containers;
++    for (const auto& [extension, container] : container_types) {
++        folder_rules::Container rule;
++        rule.requires_manifest = container.requires_manifest;
++        for (ModContentTypeId type : container.supported_content_types) {
++            rule.content_types.emplace_back(type.value);
++        }
++        folder_containers.emplace_back(std::move(rule));
++    }
++    std::vector<std::string> content_filenames;
++    for (const ModContentType& type : content_types) {
++        content_filenames.emplace_back(type.content_filename);
++    }
++
+     for (const auto& mod_path : std::filesystem::directory_iterator{mod_folder, std::filesystem::directory_options::skip_permission_denied, ec}) {
+         bool is_mod = false;
+         bool requires_manifest = true;
+         std::reference_wrapper<const std::vector<ModContentTypeId>> supported_content_types = std::cref(empty_content_types);
++        std::vector<ModContentTypeId> folder_content_types;
+         if (mod_path.is_regular_file()) {
+             auto find_container_it = container_types.find(mod_path.path().extension().string());
+             if (find_container_it != container_types.end()) {
+@@ -814,6 +834,19 @@ std::vector<recomp::mods::ModOpenErrorDetails> recomp::mods::ModContext::scan_mo
+         }
+         else if (mod_path.is_directory()) {
+             is_mod = true;
++            std::error_code exists_ec;
++            if (!std::filesystem::exists(mod_path.path() / "mod.json", exists_ec)) {
++                const std::filesystem::path folder = mod_path.path();
++                std::vector<size_t> types = folder_rules::manifestless_folder_types(folder_containers, content_filenames,
++                    [&folder](const std::string& name) { std::error_code file_ec; return std::filesystem::is_regular_file(folder / name, file_ec); });
++                if (!types.empty()) {
++                    for (size_t type : types) {
++                        folder_content_types.emplace_back(ModContentTypeId{ .value = type });
++                    }
++                    requires_manifest = false;
++                    supported_content_types = std::cref(folder_content_types);
++                }
++            }
+         }
+         if (is_mod) {
+             printf("Opening mod " PATHFMT "\n", mod_path.path().stem().c_str());
+@@ -1021,6 +1054,19 @@ bool recomp::mods::ModContext::is_content_runtime_toggleable(ModContentTypeId co
+     return content_types[content_type.value].allow_runtime_toggle;
+ }
+ 
++// [wcw] A mod's dependencies for the auto-enable walk (enable_rules): empty for a mod that isn't opened.
++std::vector<recomp::mods::enable_rules::Dependency> recomp::mods::ModContext::auto_enable_dependencies(const std::string& mod_id) {
++    std::vector<enable_rules::Dependency> dependencies;
++    auto mod_it = opened_mods_by_id.find(mod_id);
++    if (mod_it != opened_mods_by_id.end()) {
++        for (const Dependency &dependency : opened_mods[mod_it->second].manifest.dependencies) {
++            dependencies.push_back({ dependency.mod_id, dependency.optional || is_mod_deprecated(dependency.mod_id, dependency.version) });
++        }
++    }
++
++    return dependencies;
++}
++
+ void recomp::mods::ModContext::enable_mod(const std::string& mod_id, bool enabled, bool trigger_save) {
+     // Check that the mod exists.
+     std::unique_lock lock(opened_mods_mutex);
+@@ -1061,28 +1107,22 @@ void recomp::mods::ModContext::enable_mod(const std::string& mod_id, bool enable
+         }
+ 
+         if (was_enabled) {
+-            std::vector<std::string> mod_stack;
+-            mod_stack.emplace_back(mod_id);
+-            while (!mod_stack.empty()) {
+-                std::string mod_from_stack = std::move(mod_stack.back());
+-                mod_stack.pop_back();
+-
+-                auto mod_from_stack_it = opened_mods_by_id.find(mod_from_stack);
+-                if (mod_from_stack_it != opened_mods_by_id.end()) {
+-                    const ModHandle &mod_from_stack_handle = opened_mods[mod_from_stack_it->second];
+-                    for (const Dependency &dependency : mod_from_stack_handle.manifest.dependencies) {
+-                        if (!dependency.optional && !auto_enabled_mods.contains(dependency.mod_id) && !is_mod_deprecated(dependency.mod_id, dependency.version)) {
+-                            auto_enabled_mods.emplace(dependency.mod_id);
+-                            mod_stack.emplace_back(dependency.mod_id);
+-
+-                            if (mods_loaded) {
+-                                for (ModContentTypeId type_id : mod_from_stack_handle.content_types) {
+-                                    content_enabled_callback* callback = content_types[type_id.value].on_enabled;
+-                                    if (callback) {
+-                                        callback(*this, mod_from_stack_handle);
+-                                    }
+-                                }
+-                            }
++            // [wcw] on_enabled fires for each auto-enabled dependency with its own handle and content types; it fired
++            // with the dependent mod's (aki-roadmap#100).
++            const std::vector<std::string> newly_enabled = enable_rules::newly_auto_enabled(mod_id,
++                [this](const std::string &id) { return auto_enable_dependencies(id); }, auto_enabled_mods);
++            if (mods_loaded) {
++                for (const std::string &dependency_id : newly_enabled) {
++                    auto dependency_it = opened_mods_by_id.find(dependency_id);
++                    if (dependency_it == opened_mods_by_id.end()) {
++                        continue;
++                    }
++
++                    const ModHandle &dependency_handle = opened_mods[dependency_it->second];
++                    for (ModContentTypeId type_id : dependency_handle.content_types) {
++                        content_enabled_callback* callback = content_types[type_id.value].on_enabled;
++                        if (callback) {
++                            callback(*this, dependency_handle);
+                         }
+                     }
+                 }
+@@ -1106,23 +1146,8 @@ void recomp::mods::ModContext::enable_mod(const std::string& mod_id, bool enable
+             // The algorithm needs to be run again with a new set of auto-enabled mods from scratch for all enabled mods.
+             std::unordered_set<std::string> new_auto_enabled_mods;
+             for (const std::string &enabled_mod_id : enabled_mods) {
+-                std::vector<std::string> mod_stack;
+-                mod_stack.emplace_back(enabled_mod_id);
+-                while (!mod_stack.empty()) {
+-                    std::string mod_from_stack = std::move(mod_stack.back());
+-                    mod_stack.pop_back();
+-
+-                    auto mod_from_stack_it = opened_mods_by_id.find(mod_from_stack);
+-                    if (mod_from_stack_it != opened_mods_by_id.end()) {
+-                        const ModHandle &mod_from_stack_handle = opened_mods[mod_from_stack_it->second];
+-                        for (const Dependency &dependency : mod_from_stack_handle.manifest.dependencies) {
+-                            if (!dependency.optional && !new_auto_enabled_mods.contains(dependency.mod_id) && !is_mod_deprecated(dependency.mod_id, dependency.version)) {
+-                                new_auto_enabled_mods.emplace(dependency.mod_id);
+-                                mod_stack.emplace_back(dependency.mod_id);
+-                            }
+-                        }
+-                    }
+-                }
++                enable_rules::newly_auto_enabled(enabled_mod_id,
++                    [this](const std::string &id) { return auto_enable_dependencies(id); }, new_auto_enabled_mods);
+             }
+ 
+             if (mods_loaded) {
+@@ -1571,8 +1596,16 @@ void recomp::mods::ModContext::set_latest_game_mode_id(const std::string& game_m
      mod_configuration_thread_queue.enqueue(ModConfigSetLatestGamemode());
  }
  
@@ -412,7 +762,7 @@ index 0f7de83..3d6df3e 100644
      ram_used = 0;
      num_events = recomp::overlays::num_base_events();
      loaded_code_mods.clear();
-@@ -1680,7 +1688,29 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
+@@ -1680,7 +1713,29 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
              return ret;
          }
  
@@ -442,7 +792,7 @@ index 0f7de83..3d6df3e 100644
      }
  
      // Check that mod dependencies are met.
-@@ -2066,6 +2096,130 @@ std::unique_ptr<recomp::mods::LiveRecompilerCodeHandle> apply_regenlist(Regenera
+@@ -2066,6 +2121,130 @@ std::unique_ptr<recomp::mods::LiveRecompilerCodeHandle> apply_regenlist(Regenera
      return regenerated_code_handle;
  }
  
@@ -1795,6 +2145,412 @@ index 1f3a4cf..fbcea9f 100644
          std::this_thread::yield();
      }
  }
+diff --git a/librecomp/tests/wcw/external_message_pump_tests.cpp b/librecomp/tests/wcw/external_message_pump_tests.cpp
+new file mode 100644
+index 0000000..d4bccf3
+--- /dev/null
++++ b/librecomp/tests/wcw/external_message_pump_tests.cpp
+@@ -0,0 +1,257 @@
++//
++// N64ModernRuntime (ultramodern)
++//
++
++// [wcw] Unit tests for ultramodern/external_message_pump.hpp: the idle thread's wait for external messages while
++// undeliverable completions are queued (aki-roadmap#90). Built and run with librecomp_wcw_tests; a failure fails the
++// build.
++
++#include "ultramodern/external_message_pump.hpp"
++
++#include <atomic>
++#include <chrono>
++#include <deque>
++#include <thread>
++#include <vector>
++
++#include "blockingconcurrentqueue.h"
++
++#include "wcw_test.h"
++
++using namespace ultramodern::external_message_pump;
++using namespace std::chrono_literals;
++
++namespace {
++    struct Msg {
++        int id = 0;
++        bool deliverable = false;
++        bool requeue = true;
++    };
++
++    // A scripted queue: `queued` is what is already waiting; each wait_dequeue_timed call takes the next entry of
++    // `arrivals` (a message posted while the waiter blocks), or times out when there is none.
++    struct FakeQueue {
++        std::deque<Msg> queued;
++        std::deque<Msg> arrivals;
++        int timed_waits = 0;
++        int queued_at_timed_wait = 0; // messages already queued when a timed wait started (must stay 0)
++        std::chrono::microseconds last_timeout{ 0 };
++
++        void wait_dequeue(Msg& m) {
++            if (queued.empty()) {
++                CHECK(!arrivals.empty()); // a real queue would block forever
++                queued.push_back(arrivals.front());
++                arrivals.pop_front();
++            }
++            m = queued.front();
++            queued.pop_front();
++        }
++
++        bool wait_dequeue_timed(Msg& m, std::chrono::microseconds timeout) {
++            timed_waits++;
++            last_timeout = timeout;
++            queued_at_timed_wait += static_cast<int>(queued.size());
++            if (!queued.empty()) { // re-enqueued backlog: the wait returns at once (the old busy cycle)
++                m = queued.front();
++                queued.pop_front();
++                return true;
++            }
++            if (arrivals.empty()) {
++                return false;
++            }
++            m = arrivals.front();
++            arrivals.pop_front();
++            return true;
++        }
++
++        bool try_dequeue(Msg& m) {
++            if (queued.empty()) {
++                return false;
++            }
++            m = queued.front();
++            queued.pop_front();
++            return true;
++        }
++
++        void enqueue(const Msg& m) {
++            queued.push_back(m);
++        }
++    };
++
++    Msg backlog_msg(int id) {
++        return Msg{ id, false, true };
++    }
++
++    Msg new_msg(int id) {
++        return Msg{ id, true, false };
++    }
++
++    struct Run {
++        WaitResult result;
++        std::vector<int> delivered_ids;
++        int wakes = 0;
++    };
++
++    Run run(FakeQueue& q, std::chrono::microseconds backlog_wait = 16ms) {
++        Run r;
++        std::vector<Msg> scratch;
++        r.result = wait_and_deliver(q, scratch, backlog_wait,
++            [&](Msg& m) {
++                if (m.deliverable) {
++                    r.delivered_ids.push_back(m.id);
++                    return Delivery::Delivered;
++                }
++                return m.requeue ? Delivery::Retry : Delivery::Drop;
++            },
++            [&] { r.wakes++; });
++        return r;
++    }
++
++    std::vector<int> ids(const std::deque<Msg>& q) {
++        std::vector<int> out;
++        for (const Msg& m : q) {
++            out.push_back(m.id);
++        }
++        return out;
++    }
++}
++
++// Waiting with only the backlog queued
++
++TEST_CASE("backlog: a message posted while only the backlog is queued is delivered by the same wait (#90 latency)") {
++    // World Tour / VPW64: a standing backlog of fire-and-forget DMA completions, all game threads idle, then the VI
++    // retrace arrives. The old wait delivered nothing, re-enqueued the backlog and slept 1 ms, and the retrace sat in
++    // the queue for that sleep. Now the wait blocks on the queue and the retrace is delivered when it arrives.
++    FakeQueue q;
++    q.queued = { backlog_msg(1), backlog_msg(2) };
++    q.arrivals = { new_msg(10) };
++    const Run r = run(q);
++    CHECK_EQ(r.result.delivered, 1);
++    CHECK(r.delivered_ids == std::vector<int>{ 10 });
++    CHECK_EQ(r.result.backlog_waits, 1);
++    CHECK_EQ(q.timed_waits, 1);
++}
++
++TEST_CASE("backlog: it is held aside during the wait, not re-enqueued (that woke the wait at once, ~550 times a second)") {
++    FakeQueue q;
++    q.queued = { backlog_msg(1), backlog_msg(2), backlog_msg(3) };
++    q.arrivals = { new_msg(10) };
++    run(q);
++    CHECK_EQ(q.queued_at_timed_wait, 0);
++}
++
++TEST_CASE("backlog: it goes back on the queue in order afterwards, for the game threads' drains") {
++    FakeQueue q;
++    q.queued = { backlog_msg(1), backlog_msg(2), backlog_msg(3) };
++    q.arrivals = { new_msg(10) };
++    const Run r = run(q);
++    CHECK_EQ(r.result.requeued, 3);
++    CHECK(ids(q.queued) == (std::vector<int>{ 1, 2, 3 }));
++}
++
++TEST_CASE("backlog: with no new message the wait gives up after backlog_wait and keeps the backlog") {
++    FakeQueue q;
++    q.queued = { backlog_msg(1), backlog_msg(2) };
++    const Run r = run(q, 16ms);
++    CHECK_EQ(r.result.delivered, 0);
++    CHECK_EQ(r.result.requeued, 2);
++    CHECK_EQ(q.timed_waits, 1);
++    CHECK(q.last_timeout == std::chrono::microseconds{ 16ms });
++    CHECK(ids(q.queued) == (std::vector<int>{ 1, 2 }));
++}
++
++TEST_CASE("backlog: a new message that is also undeliverable joins the backlog and the wait goes on") {
++    FakeQueue q;
++    q.queued = { backlog_msg(1) };
++    q.arrivals = { backlog_msg(2), new_msg(10) };
++    const Run r = run(q);
++    CHECK_EQ(r.result.delivered, 1);
++    CHECK_EQ(r.result.backlog_waits, 2);
++    CHECK(ids(q.queued) == (std::vector<int>{ 1, 2 }));
++}
++
++TEST_CASE("backlog: the shutdown check runs after every wake, including wakes inside the backlog wait") {
++    FakeQueue q;
++    q.queued = { backlog_msg(1) };
++    q.arrivals = { backlog_msg(2), new_msg(10) };
++    const Run r = run(q);
++    CHECK_EQ(r.wakes, 3);
++}
++
++// Nothing to hold
++
++TEST_CASE("no backlog: a deliverable message returns at once, without a timed wait") {
++    FakeQueue q;
++    q.queued = { new_msg(10) };
++    const Run r = run(q);
++    CHECK_EQ(r.result.delivered, 1);
++    CHECK_EQ(q.timed_waits, 0);
++    CHECK_EQ(r.wakes, 1);
++}
++
++TEST_CASE("no backlog: everything available is drained in one wake, and an undeliverable one is kept") {
++    FakeQueue q;
++    q.queued = { backlog_msg(1), new_msg(10), new_msg(11) };
++    const Run r = run(q);
++    CHECK(r.delivered_ids == (std::vector<int>{ 10, 11 }));
++    CHECK_EQ(r.result.requeued, 1);
++    CHECK_EQ(q.timed_waits, 0);
++    CHECK(ids(q.queued) == std::vector<int>{ 1 });
++}
++
++TEST_CASE("no backlog: a dropped message counts as dropped and the wait returns") {
++    FakeQueue q;
++    q.queued = { Msg{ 5, false, false } };
++    const Run r = run(q);
++    CHECK_EQ(r.result.delivered, 0);
++    CHECK_EQ(r.result.dropped, 1);
++    CHECK_EQ(q.timed_waits, 0);
++    CHECK(q.queued.empty());
++}
++
++// Grace window
++
++TEST_CASE("grace: a requeue_if_blocked message is retried up to grace_ms after it was posted, then dropped") {
++    CHECK(undeliverable(true, 1000, 0, 1000) == Delivery::Retry);
++    CHECK(undeliverable(true, 500, 0, 1000) == Delivery::Retry);
++    CHECK(undeliverable(true, 1001, 0, 1000) == Delivery::Drop);
++}
++
++TEST_CASE("grace: a message without requeue_if_blocked is dropped when its queue is full (hardware NOBLOCK)") {
++    CHECK(undeliverable(false, 0, 0, 1000) == Delivery::Drop);
++}
++
++// With the runtime's real queue
++
++TEST_CASE("real queue: a message posted from another thread wakes the backlog wait at once, not at its timeout") {
++    moodycamel::BlockingConcurrentQueue<Msg> q;
++    for (int i = 0; i < 50; i++) {
++        q.enqueue(backlog_msg(i));
++    }
++    std::atomic<int64_t> posted_us{ 0 };
++    auto now_us = [] {
++        return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++    };
++    std::thread producer{ [&] {
++        std::this_thread::sleep_for(20ms);
++        posted_us.store(now_us());
++        q.enqueue(new_msg(1000));
++    } };
++    std::vector<Msg> scratch;
++    int64_t delivered_us = 0;
++    // A 2 s safety bound: a wait that only polled or timed out would take that long; waking on the post takes ~us.
++    const WaitResult r = wait_and_deliver(q, scratch, std::chrono::microseconds{ 2s },
++        [&](Msg& m) {
++            if (m.deliverable) {
++                delivered_us = now_us();
++                return Delivery::Delivered;
++            }
++            return Delivery::Retry;
++        },
++        [] {});
++    producer.join();
++    CHECK_EQ(r.delivered, 1);
++    CHECK_EQ(r.requeued, 50);
++    CHECK_EQ(static_cast<int>(q.size_approx()), 50);
++    CHECK(delivered_us - posted_us.load() < 500000);
++}
+diff --git a/librecomp/tests/wcw/mod_enable_rules_tests.cpp b/librecomp/tests/wcw/mod_enable_rules_tests.cpp
+new file mode 100644
+index 0000000..acc2f89
+--- /dev/null
++++ b/librecomp/tests/wcw/mod_enable_rules_tests.cpp
+@@ -0,0 +1,71 @@
++//
++// librecomp
++//
++
++// [wcw] Unit tests for librecomp/mod_enable_rules (dependency auto-enable, aki-roadmap#100) and the manifest-less
++// mod id rule in mod_folder_rules. Built and run as part of every librecomp build (LIBRECOMP_WCW_TESTS); a failure
++// fails the build.
++
++#include "librecomp/mod_enable_rules.hpp"
++#include "librecomp/mod_folder_rules.hpp"
++
++#include <map>
++#include <string>
++#include <unordered_set>
++#include <vector>
++
++#include "wcw_test.h"
++
++using namespace recomp::mods;
++
++namespace {
++    using Graph = std::map<std::string, std::vector<enable_rules::Dependency>>;
++
++    std::vector<std::string> enable(const Graph &graph, const std::string &mod_id, std::unordered_set<std::string> &auto_enabled) {
++        return enable_rules::newly_auto_enabled(mod_id, [&](const std::string &id) {
++            auto it = graph.find(id);
++            return (it != graph.end()) ? it->second : std::vector<enable_rules::Dependency>();
++        }, auto_enabled);
++    }
++}
++
++TEST_CASE("mod enable: enabling a mod auto-enables its dependency, not itself (on_enabled fired with the dependent's handle)") {
++    const Graph graph = { { "hd_textures", { { "base_pack" } } }, { "base_pack", {} } };
++    std::unordered_set<std::string> auto_enabled;
++    const std::vector<std::string> found = enable(graph, "hd_textures", auto_enabled);
++    CHECK_EQ(found.size(), size_t(1));
++    CHECK(!found.empty() && found[0] == "base_pack");
++    CHECK(auto_enabled.contains("base_pack"));
++    CHECK(!auto_enabled.contains("hd_textures"));
++}
++
++TEST_CASE("mod enable: dependencies of dependencies, each once") {
++    const Graph graph = { { "a", { { "b" }, { "c" } } }, { "b", { { "c" }, { "d" } } }, { "c", {} }, { "d", {} } };
++    std::unordered_set<std::string> auto_enabled;
++    const std::vector<std::string> found = enable(graph, "a", auto_enabled);
++    CHECK_EQ(found.size(), size_t(3));
++    CHECK(auto_enabled == std::unordered_set<std::string>({ "b", "c", "d" }));
++    // Enabling another mod that needs them again auto-enables nothing new (no second on_enabled).
++    const Graph more = { { "e", { { "c" } } } };
++    CHECK(enable(more, "e", auto_enabled).empty());
++}
++
++TEST_CASE("mod enable: optional and deprecated dependencies are skipped; a mod that isn't opened is still noted") {
++    const Graph graph = { { "a", { { "opt", true }, { "missing" } } } };
++    std::unordered_set<std::string> auto_enabled;
++    const std::vector<std::string> found = enable(graph, "a", auto_enabled);
++    CHECK_EQ(found.size(), size_t(1));
++    CHECK(!found.empty() && found[0] == "missing");
++    CHECK(!auto_enabled.contains("opt"));
++}
++
++TEST_CASE("mod ids: a folder without a mod.json keeps its whole name (pack.v2 lost its .v2)") {
++    CHECK(folder_rules::manifestless_mod_id("pack.v2", true) == "pack.v2");
++    CHECK(folder_rules::manifestless_mod_id("My Pack 1.0.1", true) == "My Pack 1.0.1");
++    CHECK(folder_rules::manifestless_mod_id("pack", true) == "pack");
++}
++
++TEST_CASE("mod ids: a container file without a mod.json drops only its extension") {
++    CHECK(folder_rules::manifestless_mod_id("pack.v2.rtz", false) == "pack.v2");
++    CHECK(folder_rules::manifestless_mod_id("pack.rtz", false) == "pack");
++}
+diff --git a/librecomp/tests/wcw/mod_folder_rules_tests.cpp b/librecomp/tests/wcw/mod_folder_rules_tests.cpp
+new file mode 100644
+index 0000000..6a1466a
+--- /dev/null
++++ b/librecomp/tests/wcw/mod_folder_rules_tests.cpp
+@@ -0,0 +1,60 @@
++//
++// librecomp
++//
++
++// [wcw] Unit tests for librecomp/mod_folder_rules (texture pack folders without a mod.json, aki-roadmap#48). Built and run
++// as part of every librecomp build (LIBRECOMP_WCW_TESTS); a failure fails the build.
++
++#include "librecomp/mod_folder_rules.hpp"
++
++#include <set>
++#include <string>
++#include <vector>
++
++#include "wcw_test.h"
++
++using namespace recomp::mods::folder_rules;
++
++namespace {
++    // The games' registrations: 0 = binary_syms (.nrm code), 1 = rom_patch, 2 = rt64.json texture packs.
++    const std::vector<std::string> ContentFiles = { "mod_binary.bin", "patch.bps", "rt64.json" };
++    // .nrm needs a mod.json and may hold anything; .rtz holds texture packs and needs none.
++    const std::vector<Container> Containers = { Container{ {}, true }, Container{ { 2 }, false } };
++
++    std::vector<size_t> typesFor(const std::set<std::string> &files, const std::vector<Container> &containers = Containers) {
++        return manifestless_folder_types(containers, ContentFiles, [&](const std::string &name) { return files.count(name) > 0; });
++    }
++}
++
++TEST_CASE("mod folders: a folder with rt64.json and no mod.json opens as a texture pack") {
++    const std::vector<size_t> types = typesFor({ "rt64.json", "0123456789abcdef.png" });
++    CHECK_EQ(types.size(), size_t(1));
++    CHECK(!types.empty() && types[0] == 2);
++}
++
++TEST_CASE("mod folders: a folder without a manifest-less content file is not such a mod (it still needs a mod.json)") {
++    CHECK(typesFor({ "readme.txt", "0123456789abcdef.png" }).empty());
++    CHECK(typesFor({}).empty());
++}
++
++TEST_CASE("mod folders: code content only counts with a mod.json") {
++    // mod_binary.bin belongs to a container that requires a manifest.
++    CHECK(typesFor({ "mod_binary.bin" }).empty());
++    const std::vector<size_t> types = typesFor({ "mod_binary.bin", "rt64.json" });
++    CHECK_EQ(types.size(), size_t(1));
++    CHECK(!types.empty() && types[0] == 2);
++}
++
++TEST_CASE("mod folders: no manifest-less container registered means no change from upstream") {
++    CHECK(typesFor({ "rt64.json" }, { Container{ {}, true } }).empty());
++    // A container that allows rt64.json but needs a mod.json doesn't make a bare folder a mod.
++    CHECK(typesFor({ "rt64.json" }, { Container{ { 2 }, true } }).empty());
++    // A manifest-less container that allows any content has no content file to look for.
++    CHECK(typesFor({ "rt64.json" }, { Container{ {}, false } }).empty());
++}
++
++TEST_CASE("mod folders: a type allowed by two containers appears once, out-of-range ids are ignored") {
++    const std::vector<Container> containers = { Container{ { 2, 9 }, false }, Container{ { 2 }, false } };
++    const std::vector<size_t> types = typesFor({ "rt64.json" }, containers);
++    CHECK_EQ(types.size(), size_t(1));
++}
 diff --git a/librecomp/tests/wcw/save_backup_rules_tests.cpp b/librecomp/tests/wcw/save_backup_rules_tests.cpp
 new file mode 100644
 index 0000000..6d5a504
@@ -2117,6 +2873,121 @@ index 0000000..0db070c
 +#define CHECK_NEAR(a, b, eps) \
 +    do { const double wcwA = double(a); const double wcwB = double(b); if (!(std::fabs(wcwA - wcwB) <= double(eps))) { \
 +        WcwTest::fail(__FILE__, __LINE__, std::string(#a " ~= " #b " (") + std::to_string(wcwA) + " vs " + std::to_string(wcwB) + ")"); } } while (0)
+diff --git a/ultramodern/CMakeLists.txt b/ultramodern/CMakeLists.txt
+index 5593172..c9f0ab6 100644
+--- a/ultramodern/CMakeLists.txt
++++ b/ultramodern/CMakeLists.txt
+@@ -13,6 +13,7 @@ add_library(ultramodern STATIC
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/input.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/mesgqueue.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/misc_ultra.cpp"
++    "${CMAKE_CURRENT_SOURCE_DIR}/src/perf.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/renderer_context.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/rsp.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/scheduling.cpp"
+diff --git a/ultramodern/include/ultramodern/external_message_pump.hpp b/ultramodern/include/ultramodern/external_message_pump.hpp
+new file mode 100644
+index 0000000..e268174
+--- /dev/null
++++ b/ultramodern/include/ultramodern/external_message_pump.hpp
+@@ -0,0 +1,97 @@
++#ifndef __ULTRAMODERN_EXTERNAL_MESSAGE_PUMP_HPP__
++#define __ULTRAMODERN_EXTERNAL_MESSAGE_PUMP_HPP__
++
++// [wcw fix] The idle thread's wait for external messages (aki-roadmap#90), kept free of rdram and the OS so the wcw
++// unit tests can drive it with a scripted queue (librecomp/tests/wcw/external_message_pump_tests.cpp).
++//
++// External messages (VI retrace, SP/DP/PI/SI completions, timers) are posted by host threads into one queue and
++// delivered to the game's message queues by game threads. A requeue_if_blocked message whose target queue is full is
++// retried for a grace window and then dropped. While a game leaves completions it never reads (World Tour and VPW64
++// fire-and-forget DMAs), that queue holds a standing backlog of them.
++//
++// When every game thread is blocked, the idle thread waits here. The backlog can't become deliverable while it waits:
++// only a game thread empties a game queue, and no game thread can run until a NEW message is delivered. The old wait
++// woke at once on the backlog, delivered nothing, re-enqueued it and slept 1 ms, so a retrace or task-done message
++// arriving during that sleep reached the game 1-2 ms late (p50 1.5 ms in World Tour). Now the backlog is held aside
++// and the wait blocks on the queue itself, so a new message wakes it immediately.
++
++#include <chrono>
++#include <cstdint>
++#include <vector>
++
++namespace ultramodern::external_message_pump {
++    enum class Delivery {
++        Delivered, // the message reached its queue
++        Retry,     // the queue is full; keep the message for a later attempt
++        Drop,      // the queue is full and the message may not wait (or its grace window is over)
++    };
++
++    // What happens to a message whose target queue is full. Hardware drops a NOBLOCK post into a full queue; the
++    // runtime keeps requeue_if_blocked messages for grace_ms first, because its DMAs complete instantly and the game
++    // may simply not have drained the queue yet.
++    inline Delivery undeliverable(bool requeue_if_blocked, int64_t now_ms, int64_t enqueue_ms, int64_t grace_ms) {
++        if (requeue_if_blocked && now_ms - enqueue_ms <= grace_ms) {
++            return Delivery::Retry;
++        }
++        return Delivery::Drop;
++    }
++
++    struct WaitResult {
++        int delivered = 0;
++        int dropped = 0;
++        int requeued = 0;      // backlog messages put back on the queue for the game threads' drains
++        int backlog_waits = 0; // waits for a new message because only the backlog was there
++    };
++
++    // Waits for external messages and delivers what it can; returns once something was delivered, or there is no
++    // backlog left, or backlog_wait passed with no new message (a safety bound; the caller loops).
++    //   Queue:   wait_dequeue(Msg&), wait_dequeue_timed(Msg&, std::chrono::microseconds) -> bool,
++    //            try_dequeue(Msg&) -> bool, enqueue(const Msg&)
++    //   attempt: Delivery(Msg&), tries to deliver one message
++    //   on_wake: void(), called after every wake (the caller's shutdown check)
++    // backlog is caller-owned scratch storage (reused to avoid allocating per wait).
++    template <typename Msg, typename Queue, typename Attempt, typename OnWake>
++    WaitResult wait_and_deliver(Queue& queue, std::vector<Msg>& backlog, std::chrono::microseconds backlog_wait,
++        Attempt&& attempt, OnWake&& on_wake) {
++        WaitResult result;
++        backlog.clear();
++        Msg msg;
++        queue.wait_dequeue(msg);
++        on_wake();
++        for (;;) {
++            // Drain everything available: processing one message per wake let an undeliverable message cycle
++            // straight back out of the queue and starve every other producer.
++            do {
++                switch (attempt(msg)) {
++                    case Delivery::Delivered:
++                        result.delivered++;
++                        break;
++                    case Delivery::Retry:
++                        backlog.push_back(msg);
++                        break;
++                    case Delivery::Drop:
++                        result.dropped++;
++                        break;
++                }
++            } while (queue.try_dequeue(msg));
++
++            if (result.delivered > 0 || backlog.empty()) {
++                break;
++            }
++            // Only the backlog was there. Hold it aside and wait for a new message instead of re-enqueueing it
++            // (which would wake this wait again at once) and sleeping (which delays the next real message).
++            result.backlog_waits++;
++            if (!queue.wait_dequeue_timed(msg, backlog_wait)) {
++                break;
++            }
++            on_wake();
++        }
++        result.requeued = static_cast<int>(backlog.size());
++        for (const Msg& m : backlog) {
++            queue.enqueue(m);
++        }
++        return result;
++    }
++}
++
++#endif
 diff --git a/ultramodern/include/ultramodern/input.hpp b/ultramodern/include/ultramodern/input.hpp
 index 1dab1b8..8fb216d 100644
 --- a/ultramodern/include/ultramodern/input.hpp
@@ -2140,6 +3011,48 @@ index 1dab1b8..8fb216d 100644
      }
  }
  
+diff --git a/ultramodern/include/ultramodern/perf.hpp b/ultramodern/include/ultramodern/perf.hpp
+new file mode 100644
+index 0000000..a80bbf5
+--- /dev/null
++++ b/ultramodern/include/ultramodern/perf.hpp
+@@ -0,0 +1,36 @@
++#ifndef __ULTRAMODERN_PERF_HPP__
++#define __ULTRAMODERN_PERF_HPP__
++
++#include <chrono>
++#include <cstdint>
++
++// [wcw perf] CPU frame-phase timings (WCW_PERF_LOG=1, aki-roadmap#82). ultramodern times the game-side phases and hands
++// them to a sink the renderer installs (RecompFrontend sets rt64's, which writes wcw_cpu_phases.csv). With no sink set,
++// each timing point costs one atomic load. Phases reported:
++//   game_frame  time from one osViSwapBuffer to the next (one game frame)
++//   game_busy   the part of that frame the game's threads ran (the frame minus the idle thread's waits)
++//   rsp_audio   an audio RSP task (rsp_task: any other non-graphics task)
++//   dl_submit   handing a display list to the renderer (rt64 parses it into a workload)
++namespace ultramodern::perf {
++    // phase is a static string; start and end are steady_clock times in nanoseconds since its epoch.
++    using phase_sink_t = void (*)(const char* phase, int64_t start_ns, int64_t end_ns);
++
++    void set_phase_sink(phase_sink_t sink);
++    bool enabled();
++    void phase(const char* name, int64_t start_ns, int64_t end_ns);
++
++    inline int64_t now_ns() {
++        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++    }
++
++    // The idle thread's waits for external messages (pause_self): time the game had nothing to run.
++    void add_game_idle(int64_t ns);
++
++    // Called at each osViSwapBuffer: reports game_frame and game_busy for the frame that just ended.
++    void game_frame_boundary();
++
++    // The part of a frame the game ran, given the frame's length and the idle time inside it.
++    int64_t busy_ns(int64_t frame_ns, int64_t idle_ns);
++}
++
++#endif
 diff --git a/ultramodern/include/ultramodern/ultramodern.hpp b/ultramodern/include/ultramodern/ultramodern.hpp
 index 3b28af3..56efc8b 100644
 --- a/ultramodern/include/ultramodern/ultramodern.hpp
@@ -2224,10 +3137,18 @@ index 3198be0..966711a 100644
  // If there's ever any audio popping, check here first. Some games are very sensitive to
  // the remaining sample count and reporting a number that's too high here can lead to issues.
 diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
-index 090cc42..677a00d 100644
+index 090cc42..4ea1af1 100644
 --- a/ultramodern/src/events.cpp
 +++ b/ultramodern/src/events.cpp
-@@ -29,6 +29,7 @@ struct SpTaskAction {
+@@ -14,6 +14,7 @@
+ #include "ultramodern/ultra64.h"
+ #include "ultramodern/ultramodern.hpp"
+ #include "ultramodern/extensions.h"
++#include "ultramodern/perf.hpp"
+ 
+ #include "ultramodern/rsp.hpp"
+ #include "ultramodern/renderer_context.hpp"
+@@ -29,6 +30,7 @@ struct SpTaskAction {
  };
  
  struct ScreenUpdateAction {
@@ -2235,7 +3156,7 @@ index 090cc42..677a00d 100644
      ultramodern::renderer::ViRegs regs;
  };
  
-@@ -72,6 +73,11 @@ static struct {
+@@ -72,6 +74,11 @@ static struct {
          void update_vi() {
              ViState* next_state = get_next_state();
              const OSViMode* next_mode = next_state->mode;
@@ -2247,7 +3168,7 @@ index 090cc42..677a00d 100644
              const OSViCommonRegs* common_regs = &next_mode->comRegs;
              const OSViFieldRegs* field_regs = &next_mode->fldRegs[field];
              PTR(void) framebuffer = osVirtualToPhysical(next_state->framebuffer);
-@@ -91,6 +97,19 @@ static struct {
+@@ -91,6 +98,19 @@ static struct {
  
              // TODO implement osViFade
  
@@ -2267,7 +3188,7 @@ index 090cc42..677a00d 100644
              // Update VI registers.
              regs.VI_ORIGIN_REG = origin;
              regs.VI_WIDTH_REG = common_regs->width;
-@@ -143,6 +162,7 @@ ultramodern::renderer::ViRegs* ultramodern::renderer::get_vi_regs() {
+@@ -143,6 +163,7 @@ ultramodern::renderer::ViRegs* ultramodern::renderer::get_vi_regs() {
  
  extern "C" void osSetEventMesg(RDRAM_ARG OSEvent event_id, PTR(OSMesgQueue) mq_, OSMesg msg) {
      std::lock_guard lock{ events_context.message_mutex };
@@ -2275,7 +3196,7 @@ index 090cc42..677a00d 100644
  
      switch (event_id) {
          case OS_EVENT_SP:
-@@ -165,10 +185,21 @@ extern "C" void osSetEventMesg(RDRAM_ARG OSEvent event_id, PTR(OSMesgQueue) mq_,
+@@ -165,10 +186,21 @@ extern "C" void osSetEventMesg(RDRAM_ARG OSEvent event_id, PTR(OSMesgQueue) mq_,
  
  extern "C" void osViSetEvent(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, u32 retrace_count) {
      std::lock_guard lock{ events_context.message_mutex };
@@ -2297,7 +3218,7 @@ index 090cc42..677a00d 100644
  }
  
  uint64_t total_vis = 0;
-@@ -224,27 +255,99 @@ void vi_thread_func() {
+@@ -224,27 +256,99 @@ void vi_thread_func() {
  
          // Queue a screen update for the graphics thread with the current VI register state.
          // Doing this before the VI update is equivalent to updating the screen after the previous frame's scanout finished.
@@ -2401,7 +3322,7 @@ index 090cc42..677a00d 100644
                  ultramodern::enqueue_external_message(events_context.ai.mq, events_context.ai.msg, false, false);
              }
          }
-@@ -255,15 +358,20 @@ void vi_thread_func() {
+@@ -255,15 +359,20 @@ void vi_thread_func() {
      }
  }
  
@@ -2422,7 +3343,7 @@ index 090cc42..677a00d 100644
      ultramodern::enqueue_external_message(events_context.dp.mq, events_context.dp.msg, false, true);
  }
  
-@@ -283,11 +391,42 @@ void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_r
+@@ -283,11 +392,48 @@ void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_r
              return;
          }
  
@@ -2442,11 +3363,17 @@ index 090cc42..677a00d 100644
 +        }
 +        tasknum++;
 +
++        const bool perf_on = ultramodern::perf::enabled();
++        const int64_t perf_start = perf_on ? ultramodern::perf::now_ns() : 0;
          if (!ultramodern::rsp::run_task(PASS_RDRAM task)) {
              fprintf(stderr, "Failed to execute task type: %" PRIu32 "\n", task->t.type);
              ULTRAMODERN_QUICK_EXIT();
          }
  
++        if (perf_on) { // [wcw perf] WCW_PERF_LOG
++            ultramodern::perf::phase((task->t.type == M_AUDTASK) ? "rsp_audio" : "rsp_task", perf_start, ultramodern::perf::now_ns());
++        }
++
 +        if (taskwatch) {
 +            const uint32_t* now_tcb = (const uint32_t*)(rdram + tcb_off);
 +            const uint32_t* now_frm = (const uint32_t*)(rdram + frame_off);
@@ -2465,7 +3392,7 @@ index 090cc42..677a00d 100644
          // Tell the game that the RSP has completed
          sp_complete();
      }
-@@ -355,15 +494,51 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+@@ -355,23 +501,77 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
  
      while (!exited) {
          // Try to pull an action from the queue
@@ -2524,10 +3451,15 @@ index 090cc42..677a00d 100644
                  ultramodern::measure_input_latency();
  
                  PTR(u64) displaylist = task_action->task.t.data_ptr;
-@@ -371,7 +546,20 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+                 ultramodern::extensions::on_displaylist_submitted(displaylist);
  
                  [[maybe_unused]] auto renderer_start = std::chrono::high_resolution_clock::now();
++                const bool perf_on = ultramodern::perf::enabled();
++                const int64_t perf_start = perf_on ? ultramodern::perf::now_ns() : 0;
                  renderer_context->send_dl(&task_action->task);
++                if (perf_on) { // [wcw perf] WCW_PERF_LOG
++                    ultramodern::perf::phase("dl_submit", perf_start, ultramodern::perf::now_ns());
++                }
 +                sp_complete(); // [wcw fix] see above: RSP inputs are consumed only now.
                  [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
 +                { // [wcw] DIAGNOSTIC (WCW_PRESENT_LUM=1): per-task display-list processing cost on this thread.
@@ -2545,7 +3477,7 @@ index 090cc42..677a00d 100644
  
                  dp_complete();
                  // TODO hook the parsed event up to the actual parsing point when a callback is added to RT64.
-@@ -380,6 +568,18 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+@@ -380,6 +580,18 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                  // printf("Renderer ProcessDList time: %d us\n", static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(renderer_end - renderer_start).count()));
              }
              else if (const auto* screen_update_action = std::get_if<ScreenUpdateAction>(&action)) {
@@ -2564,7 +3496,7 @@ index 090cc42..677a00d 100644
                  events_context.vi.update_screen_regs = screen_update_action->regs;
                  renderer_context->update_screen();
                  display_refresh_rate = renderer_context->get_display_framerate();
-@@ -395,6 +595,7 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+@@ -395,6 +607,7 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
              else if (const auto* dummy_workload_action = std::get_if<DummyWorkloadAction>(&action)) {
                  renderer_context->send_dummy_workload(dummy_workload_action->fb_address);
              }
@@ -2572,7 +3504,7 @@ index 090cc42..677a00d 100644
          }
      }
  
-@@ -454,8 +655,29 @@ void set_dummy_vi(bool odd) {
+@@ -454,8 +667,32 @@ void set_dummy_vi(bool odd) {
      }
  }
  
@@ -2584,6 +3516,9 @@ index 090cc42..677a00d 100644
  extern "C" void osViSwapBuffer(RDRAM_ARG PTR(void) frameBufPtr) {
      std::lock_guard lock{ events_context.message_mutex };
 +    wcw_viswaps.fetch_add(1);
++    if (ultramodern::perf::enabled()) { // [wcw perf] WCW_PERF_LOG: game_frame / game_busy
++        ultramodern::perf::game_frame_boundary();
++    }
 +    // [wcw] DIAGNOSTIC: log swaps — if this never fires, VI scans out nothing (black screen)
 +    // regardless of what the RDP rendered.
 +    { static int n = 0; if (n++ < 30) fprintf(stderr, "[wcw][viswap#%d] fb=0x%08X\n", n, (unsigned)frameBufPtr); }
@@ -2634,11 +3569,14 @@ index a170407..07b6997 100644
      ultramodern::send_si_message();
  
 diff --git a/ultramodern/src/mesgqueue.cpp b/ultramodern/src/mesgqueue.cpp
-index 961de3d..cf62b38 100644
+index 961de3d..74eaf50 100644
 --- a/ultramodern/src/mesgqueue.cpp
 +++ b/ultramodern/src/mesgqueue.cpp
-@@ -1,4 +1,12 @@
+@@ -1,57 +1,289 @@
  #include <thread>
++#include <mutex>
++#include <algorithm>
++#include <chrono>
 +#include <atomic>
 +#include <cstdio>
 +#include <cstdlib>
@@ -2650,11 +3588,18 @@ index 961de3d..cf62b38 100644
  
  #include "blockingconcurrentqueue.h"
  
-@@ -10,48 +18,219 @@ struct QueuedMessage {
+ #include "ultramodern/ultra64.h"
+ #include "ultramodern/ultramodern.hpp"
++#include "ultramodern/external_message_pump.hpp"
+ 
+ struct QueuedMessage {
+     PTR(OSMesgQueue) mq;
      OSMesg mesg;
      bool jam;
      bool requeue_if_blocked;
 +    int64_t enqueue_ms; // [wcw fix] set at enqueue; bounds how long an undeliverable message may requeue
++    int64_t enqueue_us; // [wcw] DIAGNOSTIC: WCW_MSGLAT_LOG delivery latency (enqueue -> delivered)
++    uint32_t tries;     // [wcw] DIAGNOSTIC: delivery attempts that failed before this one
  };
  
  static moodycamel::BlockingConcurrentQueue<QueuedMessage> external_messages {};
@@ -2674,20 +3619,59 @@ index 961de3d..cf62b38 100644
 +// emulates the hardware drop.
 +constexpr int64_t requeue_grace_ms = 1000;
 +
++// [wcw fix] Longest the idle wait holds the undeliverable backlog while waiting for a new message
++// (aki-roadmap#90). A new message ends the wait at once; this only bounds how long the caller goes
++// without re-checking its running queue and the backlog's grace window. One VI.
++constexpr std::chrono::microseconds idle_backlog_wait{16000};
++
 +static int64_t wcw_steady_ms() {
 +    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 +}
 +
++static int64_t wcw_steady_us() {
++    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
  void ultramodern::enqueue_external_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, bool requeue_if_blocked) {
 -    external_messages.enqueue({mq, msg, jam, requeue_if_blocked});
-+    external_messages.enqueue({mq, msg, jam, requeue_if_blocked, wcw_steady_ms()});
++    const int64_t now_us = wcw_steady_us();
++    external_messages.enqueue({mq, msg, jam, requeue_if_blocked, now_us / 1000, now_us, 0});
++}
++
++// [wcw] DIAGNOSTIC (env WCW_MSGLAT_LOG=1): one CSV row per delivered external message in
++// wcw_msg_latency.csv: steady-clock delivery time in ms (the time base of wcw_present_lum.csv),
++// target queue, message, enqueue-to-delivery latency in us, failed attempts before it, and the
++// path that delivered it (i = the idle wait_for_external_message, g = a game thread's
++// osSendMesg/osRecvMesg drain). aki-roadmap#90.
++static void wcw_note_latency(const QueuedMessage& m, char path) {
++    static const bool enabled = getenv("WCW_MSGLAT_LOG") != nullptr;
++    if (!enabled) {
++        return;
++    }
++    static std::mutex file_mutex;
++    static FILE* file = nullptr;
++    static int rows = 0;
++    const int64_t now_us = wcw_steady_us();
++    std::lock_guard lock{file_mutex};
++    if (file == nullptr) {
++        file = fopen("wcw_msg_latency.csv", "w");
++        if (file == nullptr) {
++            return;
++        }
++        fprintf(file, "t_ms,mq,msg,lat_us,tries,path\n");
++    }
++    fprintf(file, "%.3f,0x%X,0x%X,%lld,%u,%c\n", now_us / 1000.0, (uint32_t)m.mq, (uint32_t)m.mesg,
++        (long long)(now_us - m.enqueue_us), m.tries, path);
++    if (++rows % 256 == 0) {
++        fflush(file);
++    }
 +}
 +
 +// [wcw fix] Shutdown (aki-roadmap#3): wake threads blocked in wait_for_external_message so they
 +// reach its park check. The null-queue messages are never delivered: every consumer parks first.
 +void ultramodern::wake_external_message_waiters(int count) {
 +    for (int i = 0; i < count; i++) {
-+        external_messages.enqueue({NULLPTR, NULLPTR, false, false, wcw_steady_ms()});
++        external_messages.enqueue({NULLPTR, NULLPTR, false, false, wcw_steady_ms(), wcw_steady_us(), 0});
 +    }
  }
  
@@ -2697,6 +3681,11 @@ index 961de3d..cf62b38 100644
 +// requeue_if_blocked messages put back on external_messages), per-second delivery counts,
 +// and messages dropped after exhausting the requeue grace window.
 +std::atomic_int wcw_requeues{0}, wcw_extmsg_delivered{0}, wcw_extmsg_dropped{0};
++// [wcw] DIAGNOSTIC: idle waits that found only the undeliverable requeue backlog and waited for a new message (aki-roadmap#90).
++std::atomic_int wcw_idle_backlog_waits{0};
++// [wcw] DIAGNOSTIC: backlog messages the idle wait holds outside the queue while it waits for a new one,
++// so the health line's ext= still counts them.
++std::atomic_int wcw_idle_backlog_held{0};
 +
 +// [wcw] DIAGNOSTIC: small histogram of the (mq, msg) pairs being requeued, to identify WHICH
 +// message is undeliverable when the backlog grows. Lossy/racy by design (diagnostic only).
@@ -2735,6 +3724,7 @@ index 961de3d..cf62b38 100644
 +            // [wcw fix] Undeliverable: retry within the grace window, then drop (hardware
 +            // semantics — NOBLOCK completion posts into a full queue are lost).
 +            if (now_ms - to_send.enqueue_ms <= requeue_grace_ms) {
++                to_send.tries++;
 +                requeued_messages.push_back(to_send);
 +                wcw_note_requeue(to_send.mq, to_send.mesg);
 +            }
@@ -2745,6 +3735,7 @@ index 961de3d..cf62b38 100644
 +        else {
 +            wcw_extmsg_delivered.fetch_add(1);
 +            wcw2k_note_delivery(to_send.mq, to_send.mesg);
++            wcw_note_latency(to_send, 'g');
          }
      }
 +    wcw_requeues.fetch_add((int)requeued_messages.size());
@@ -2753,6 +3744,11 @@ index 961de3d..cf62b38 100644
      }
  }
  
+-void ultramodern::wait_for_external_message(RDRAM_ARG1) {
+-    QueuedMessage to_send;
+-    external_messages.wait_dequeue(to_send);
+-    if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
+-        external_messages.enqueue(to_send);
 +// [wcw] DIAGNOSTIC (env WCW_HEALTH_LOG=1, 1 line/s): game health snapshot. viswaps/s = real
 +// game frame rate; ext=N = external_messages backlog (undeliverable requeued messages make
 +// this grow — every osSendMesg/osRecvMesg on a game thread drains this queue, so a standing
@@ -2771,7 +3767,7 @@ index 961de3d..cf62b38 100644
 +    static const bool enabled = getenv("WCW_HEALTH_LOG") != nullptr;
 +    if (!enabled) {
 +        return;
-+    }
+     }
 +    extern std::atomic_int wcw_viswaps;
 +    static int64_t last_ms = 0;
 +    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -2798,61 +3794,61 @@ index 961de3d..cf62b38 100644
 +                (uint32_t)(key >> 32), (uint32_t)key, cnt);
 +        }
 +    }
-+    fprintf(stderr, "[wcw][health] vis/s=%d ext=%zu rq/s=%d del/s=%d drop/s=%d%s\n",
-+        wcw_viswaps.exchange(0), external_messages.size_approx(),
++    fprintf(stderr, "[wcw][health] vis/s=%d ext=%zu rq/s=%d del/s=%d drop/s=%d idlebk/s=%d%s\n",
++        wcw_viswaps.exchange(0), external_messages.size_approx() + (size_t)std::max(0, wcw_idle_backlog_held.load()),
 +        wcw_requeues.exchange(0), wcw_extmsg_delivered.exchange(0),
-+        wcw_extmsg_dropped.exchange(0), hist);
++        wcw_extmsg_dropped.exchange(0), wcw_idle_backlog_waits.exchange(0), hist);
 +}
 +
- void ultramodern::wait_for_external_message(RDRAM_ARG1) {
-+    // [wcw fix] Drain every available message per wake instead of processing exactly one.
-+    // The single-message version deadlocked: on delivery failure it re-enqueued immediately,
-+    // and moodycamel's consumer bias then dequeued that same producer's item right back —
-+    // an undeliverable requeue_if_blocked message (full 1-deep target queue) spun forever
-+    // and starved every other producer's messages (VI retrace included), freezing the game.
-     QueuedMessage to_send;
++void ultramodern::wait_for_external_message(RDRAM_ARG1) {
++    // [wcw fix] Deliver everything available per wake (one message per wake let an undeliverable
++    // requeue_if_blocked message cycle straight back out of the queue and starve every other
++    // producer, VI retrace included). When only undeliverable messages are there, hold them aside
++    // and block on the queue for a new message: they can't become deliverable until a game thread
++    // runs, and that needs a new message. The previous version re-enqueued them and slept 1 ms, so
++    // with World Tour's / VPW64's standing backlog of orphaned DMA completions every retrace and
++    // task-done message that arrived during the sleep reached the game 1-2 ms late
++    // (aki-roadmap#90). The logic is in external_message_pump.hpp (unit-tested).
++    namespace em = ultramodern::external_message_pump;
 +    thread_local std::vector<QueuedMessage> requeued_messages;
-+    requeued_messages.clear();
-+    bool delivered_any = false;
-     external_messages.wait_dequeue(to_send);
--    if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
--        external_messages.enqueue(to_send);
-+    ultramodern::park_game_thread_if_quitting(); // [wcw fix] see park_game_threads
-+    int64_t now_ms = wcw_steady_ms();
-+    do {
-+        if (do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false)) {
-+            delivered_any = true;
-+            wcw2k_note_delivery(to_send.mq, to_send.mesg);
-+        }
-+        else if (to_send.requeue_if_blocked) {
++    const em::WaitResult result = em::wait_and_deliver(external_messages, requeued_messages, idle_backlog_wait,
++        [&](QueuedMessage& to_send) {
++            if (do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false)) {
++                wcw2k_note_delivery(to_send.mq, to_send.mesg);
++                wcw_note_latency(to_send, 'i');
++                return em::Delivery::Delivered;
++            }
 +            // [wcw fix] Same grace-window drop as dequeue_external_messages above.
-+            if (now_ms - to_send.enqueue_ms <= requeue_grace_ms) {
-+                requeued_messages.push_back(to_send);
++            const em::Delivery outcome = em::undeliverable(to_send.requeue_if_blocked, wcw_steady_ms(), to_send.enqueue_ms, requeue_grace_ms);
++            if (outcome == em::Delivery::Retry) {
++                to_send.tries++;
++                wcw_idle_backlog_held.fetch_add(1);
 +                wcw_note_requeue(to_send.mq, to_send.mesg);
 +            }
-+            else {
++            else if (to_send.requeue_if_blocked) {
 +                wcw_extmsg_dropped.fetch_add(1);
 +            }
-+        }
-+    } while (external_messages.try_dequeue(to_send));
-+    wcw_requeues.fetch_add((int)requeued_messages.size());
-+    for (QueuedMessage& cur_mesg : requeued_messages) {
-+        external_messages.enqueue(cur_mesg);
-+    }
-+    // If nothing was deliverable, don't burn a core cycling the requeued messages.
-+    if (!delivered_any && !requeued_messages.empty()) {
-+        ultramodern::sleep_milliseconds(1);
-     }
++            return outcome;
++        },
++        [] { ultramodern::park_game_thread_if_quitting(); }); // [wcw fix] see park_game_threads
++    wcw_idle_backlog_held.fetch_sub(result.requeued);
++    wcw_requeues.fetch_add(result.requeued);
++    wcw_idle_backlog_waits.fetch_add(result.backlog_waits);
  }
  
  void ultramodern::wait_for_external_message_timed(RDRAM_ARG u32 millis) {
      QueuedMessage to_send;
      if (external_messages.wait_dequeue_timed(to_send, std::chrono::milliseconds{millis})) {
-+        ultramodern::park_game_thread_if_quitting(); // [wcw fix] see park_game_threads
-         if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
+-        if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
 -            external_messages.enqueue(to_send);
++        ultramodern::park_game_thread_if_quitting(); // [wcw fix] see park_game_threads
++        if (do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false)) {
++            wcw_note_latency(to_send, 'i');
++        }
++        else if (to_send.requeue_if_blocked) {
 +            // [wcw fix] Same grace-window drop as dequeue_external_messages above.
 +            if (wcw_steady_ms() - to_send.enqueue_ms <= requeue_grace_ms) {
++                to_send.tries++;
 +                external_messages.enqueue(to_send);
 +            }
 +            else {
@@ -2875,7 +3871,7 @@ index 961de3d..cf62b38 100644
      mq->blocked_on_recv = NULLPTR;
      mq->blocked_on_send = NULLPTR;
      mq->msgCount = count;
-@@ -72,22 +251,68 @@ s32 MQ_IS_FULL(OSMesgQueue* mq) {
+@@ -72,22 +304,68 @@ s32 MQ_IS_FULL(OSMesgQueue* mq) {
      return MQ_GET_COUNT(mq) >= mq->msgCount;
  }
  
@@ -2944,7 +3940,7 @@ index 961de3d..cf62b38 100644
      
      if (jam) {
          // Jams insert at the head of the message queue's buffer.
-@@ -105,7 +330,11 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block) {
+@@ -105,7 +383,11 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block) {
      // If any threads were blocked on receiving from this message queue, pop the first one and schedule it.
      PTR(PTR(OSThread)) blocked_queue = GET_MEMBER(OSMesgQueue, mq_, blocked_on_recv);
      if (!ultramodern::thread_queue_empty(PASS_RDRAM blocked_queue)) {
@@ -2957,7 +3953,7 @@ index 961de3d..cf62b38 100644
      }
      
      return true;
-@@ -122,6 +351,10 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
+@@ -122,6 +404,10 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
          // Otherwise, yield this thread in a loop until the queue is no longer full
          while (MQ_IS_EMPTY(mq)) {
              debug_printf("[Message Queue] Thread %d is blocked on receive\n", TO_PTR(OSThread, ultramodern::this_thread())->id);
@@ -2968,7 +3964,7 @@ index 961de3d..cf62b38 100644
              ultramodern::thread_queue_insert(PASS_RDRAM GET_MEMBER(OSMesgQueue, mq_, blocked_on_recv), ultramodern::this_thread());
              ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
          }
-@@ -137,7 +370,11 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
+@@ -137,7 +423,11 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
      // If any threads were blocked on sending to this message queue, pop the first one and schedule it.
      PTR(PTR(OSThread)) blocked_queue = GET_MEMBER(OSMesgQueue, mq_, blocked_on_send);
      if (!ultramodern::thread_queue_empty(PASS_RDRAM blocked_queue)) {
@@ -2981,7 +3977,7 @@ index 961de3d..cf62b38 100644
      }
  
      return true;
-@@ -146,7 +383,19 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
+@@ -146,7 +436,19 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
  extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags) {
      OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
      bool jam = false;
@@ -3002,7 +3998,7 @@ index 961de3d..cf62b38 100644
      // Don't directly send to the message queue if this isn't a game thread to avoid contention.
      if (!ultramodern::is_game_thread()) {
          ultramodern::enqueue_external_message(mq_, msg, jam, false);
-@@ -156,9 +405,21 @@ extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags)
+@@ -156,9 +458,21 @@ extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags)
      // Handle any messages that have been received from an external thread.
      dequeue_external_messages(PASS_RDRAM1);
  
@@ -3025,7 +4021,7 @@ index 961de3d..cf62b38 100644
      // Check the queue to see if this thread should swap execution to another.
      ultramodern::check_running_queue(PASS_RDRAM1);
  
-@@ -195,11 +456,26 @@ extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32
+@@ -195,11 +509,26 @@ extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32
      // Handle any messages that have been received from an external thread.
      dequeue_external_messages(PASS_RDRAM1);
  
@@ -3053,11 +4049,65 @@ index 961de3d..cf62b38 100644
 +    if (wcw_trace_enabled() && rn <= 80) fprintf(stderr, "[wcw][recv#%d] -> %s\n", rn - 1, received ? "got msg" : "empty");
      return received ? 0 : -1;
  }
+diff --git a/ultramodern/src/perf.cpp b/ultramodern/src/perf.cpp
+new file mode 100644
+index 0000000..7c51b44
+--- /dev/null
++++ b/ultramodern/src/perf.cpp
+@@ -0,0 +1,46 @@
++#include <algorithm>
++#include <atomic>
++
++#include "ultramodern/perf.hpp"
++
++// [wcw perf] See perf.hpp.
++
++static std::atomic<ultramodern::perf::phase_sink_t> phase_sink{ nullptr };
++static std::atomic<int64_t> game_idle_ns{ 0 };
++static std::atomic<int64_t> last_swap_ns{ 0 };
++
++void ultramodern::perf::set_phase_sink(phase_sink_t sink) {
++    phase_sink.store(sink, std::memory_order_release);
++}
++
++bool ultramodern::perf::enabled() {
++    return phase_sink.load(std::memory_order_relaxed) != nullptr;
++}
++
++void ultramodern::perf::phase(const char* name, int64_t start_ns, int64_t end_ns) {
++    phase_sink_t sink = phase_sink.load(std::memory_order_acquire);
++    if (sink != nullptr) {
++        sink(name, start_ns, end_ns);
++    }
++}
++
++void ultramodern::perf::add_game_idle(int64_t ns) {
++    game_idle_ns.fetch_add(ns, std::memory_order_relaxed);
++}
++
++int64_t ultramodern::perf::busy_ns(int64_t frame_ns, int64_t idle_ns) {
++    return std::clamp<int64_t>(frame_ns - idle_ns, 0, std::max<int64_t>(frame_ns, 0));
++}
++
++void ultramodern::perf::game_frame_boundary() {
++    const int64_t now = now_ns();
++    const int64_t idle = game_idle_ns.exchange(0, std::memory_order_relaxed);
++    const int64_t last = last_swap_ns.exchange(now, std::memory_order_relaxed);
++    if (last == 0) {
++        return;
++    }
++
++    const int64_t frame = now - last;
++    phase("game_frame", last, now);
++    phase("game_busy", last, last + busy_ns(frame, idle));
++}
 diff --git a/ultramodern/src/scheduling.cpp b/ultramodern/src/scheduling.cpp
-index a22f747..30aec48 100644
+index a22f747..daf71f3 100644
 --- a/ultramodern/src/scheduling.cpp
 +++ b/ultramodern/src/scheduling.cpp
-@@ -2,6 +2,10 @@
+@@ -1,7 +1,12 @@
+ #include "ultramodern/ultramodern.hpp"
++#include "ultramodern/perf.hpp"
  
  void ultramodern::schedule_running_thread(RDRAM_ARG PTR(OSThread) t_) {
      debug_printf("[Scheduling] Adding thread %d to the running queue\n", TO_PTR(OSThread, t_)->id);
@@ -3068,7 +4118,7 @@ index a22f747..30aec48 100644
      thread_queue_insert(PASS_RDRAM running_queue, t_);
      TO_PTR(OSThread, t_)->state = OSThreadState::QUEUED;
  }
-@@ -9,6 +13,8 @@ void ultramodern::schedule_running_thread(RDRAM_ARG PTR(OSThread) t_) {
+@@ -9,6 +14,8 @@ void ultramodern::schedule_running_thread(RDRAM_ARG PTR(OSThread) t_) {
  void swap_to_thread(RDRAM_ARG OSThread *to) {
      debug_printf("[Scheduling] Thread %d giving execution to thread %d\n", TO_PTR(OSThread, ultramodern::this_thread())->id, to->id);
      // Insert this thread in the running queue.
@@ -3077,7 +4127,7 @@ index a22f747..30aec48 100644
      ultramodern::thread_queue_insert(PASS_RDRAM ultramodern::running_queue, ultramodern::this_thread());
      TO_PTR(OSThread, ultramodern::this_thread())->state = OSThreadState::QUEUED;
      // Unpause the target thread and wait for this one to be unpaused.
-@@ -16,10 +22,22 @@ void swap_to_thread(RDRAM_ARG OSThread *to) {
+@@ -16,10 +23,22 @@ void swap_to_thread(RDRAM_ARG OSThread *to) {
  }
  
  void ultramodern::check_running_queue(RDRAM_ARG1) {
@@ -3101,6 +4151,20 @@ index a22f747..30aec48 100644
          OSThread* self = TO_PTR(OSThread, ultramodern::this_thread());
          if (next_thread->priority > self->priority) {
              ultramodern::thread_queue_pop(PASS_RDRAM running_queue);
+@@ -32,7 +51,13 @@ void ultramodern::check_running_queue(RDRAM_ARG1) {
+ extern "C" void pause_self(RDRAM_ARG1) {
+     while (true) {
+         // Wait until an external message arrives, then allow the next thread to run.
++        // [wcw perf] WCW_PERF_LOG: this wait is the idle thread's, i.e. time the game had nothing to run.
++        const bool perf_on = ultramodern::perf::enabled();
++        const int64_t perf_start = perf_on ? ultramodern::perf::now_ns() : 0;
+         ultramodern::wait_for_external_message(PASS_RDRAM1);
++        if (perf_on) {
++            ultramodern::perf::add_game_idle(ultramodern::perf::now_ns() - perf_start);
++        }
+         ultramodern::check_running_queue(PASS_RDRAM1);
+     }
+ }
 diff --git a/ultramodern/src/threadqueue.cpp b/ultramodern/src/threadqueue.cpp
 index f9c0fa1..c6749e4 100644
 --- a/ultramodern/src/threadqueue.cpp

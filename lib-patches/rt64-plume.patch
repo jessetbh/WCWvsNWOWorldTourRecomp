@@ -1,16 +1,18 @@
 diff --git a/plume_d3d12.cpp b/plume_d3d12.cpp
-index 8c239f4..0e6575e 100644
+index 8c239f4..7a7cd5c 100644
 --- a/plume_d3d12.cpp
 +++ b/plume_d3d12.cpp
-@@ -7,6 +7,7 @@
+@@ -7,6 +7,9 @@
  
  #include "plume_d3d12.h"
  
++#include <chrono>
++#include <thread>
 +#include <atomic>
  #include <unordered_set>
  
  #include <dxgi1_5.h>
-@@ -48,6 +49,60 @@ namespace plume {
+@@ -48,6 +51,76 @@ namespace plume {
      static const uint32_t SamplerDescriptorHeapSize = 1024;
      static const uint32_t TargetDescriptorHeapSize = 16384;
  
@@ -18,6 +20,7 @@ index 8c239f4..0e6575e 100644
 +    // resource freed while the GPU still used it), logs the reason, and with WCW_DRED=1 (Device Removed Extended Data,
 +    // enabled at device creation) the faulting address with the resources around it and the command lists in flight.
 +    static void wcwReportDeviceRemoved(ID3D12Device *device, HRESULT result, const char *where) {
++        wcwDeviceLostFlag() = true;
 +        static std::atomic<bool> reported = false;
 +        if ((device == nullptr) || reported.exchange(true)) {
 +            return;
@@ -57,6 +60,21 @@ index 8c239f4..0e6575e 100644
 +                fprintf(stderr, "[wcw gpu] unfinished command list %ls on queue %ls: %u of %u operations done, next op %d\n",
 +                    node->pCommandListDebugNameW ? node->pCommandListDebugNameW : L"(unnamed)", node->pCommandQueueDebugNameW ? node->pCommandQueueDebugNameW : L"(unnamed)",
 +                    done, node->BreadcrumbCount, (done < node->BreadcrumbCount) ? int(node->pCommandHistory[done]) : -1);
++
++                // The operations around the hang (D3D12_AUTO_BREADCRUMB_OP values: 3 DrawInstanced, 6 Dispatch,
++                // 7 CopyBufferRegion, 8 CopyTextureRegion, 12 ClearRenderTargetView, 14 ResourceBarrier, ...).
++                const UINT first = (done > 24) ? (done - 24) : 0;
++                const UINT last = std::min(done + 8, node->BreadcrumbCount);
++                fprintf(stderr, "[wcw gpu]   ops %u..%u:", first, last - 1);
++                for (UINT i = first; i < last; i++) {
++                    fprintf(stderr, (i == done) ? " [%d]" : " %d", int(node->pCommandHistory[i]));
++                }
++
++                fprintf(stderr, "\n");
++                for (UINT c = 0; c < node->BreadcrumbContextsCount; c++) {
++                    const D3D12_DRED_BREADCRUMB_CONTEXT &context = node->pBreadcrumbContexts[c];
++                    fprintf(stderr, "[wcw gpu]   marker at op %u: %ls\n", context.BreadcrumbIndex, context.pContextString ? context.pContextString : L"");
++                }
 +            }
 +        }
 +
@@ -71,7 +89,20 @@ index 8c239f4..0e6575e 100644
      // Common functions.
  
      static std::wstring Utf8ToUtf16(const std::string_view& value) {
-@@ -1358,6 +1413,7 @@ namespace plume {
+@@ -769,6 +842,12 @@ namespace plume {
+     }
+ 
+     static void setObjectName(ID3D12Object *object, const std::string &name) {
++        // [wcw] After device loss, object creation fails and leaves the object null (the texture upload thread crashed
++        // naming one).
++        if (object == nullptr) {
++            return;
++        }
++
+         const std::wstring wideCharName = Utf8ToUtf16(name);
+         object->SetName(wideCharName.c_str());
+     }
+@@ -1358,6 +1437,7 @@ namespace plume {
  
          d3d = static_cast<IDXGISwapChain3 *>(swapChain1);
          d3d->SetMaximumFrameLatency(desc.maxFrameLatency);
@@ -79,7 +110,7 @@ index 8c239f4..0e6575e 100644
          waitableObject = d3d->GetFrameLatencyWaitableObject();
  
          textures.resize(desc.textureCount);
-@@ -1394,6 +1450,10 @@ namespace plume {
+@@ -1394,6 +1474,10 @@ namespace plume {
          UINT syncInterval = (vsyncEnabled && !desc.enablePresentWait) ? 1 : 0;
          UINT flags = (!vsyncEnabled && tearingAllowed) ? DXGI_PRESENT_ALLOW_TEARING : 0;
          HRESULT res = d3d->Present(syncInterval, flags);
@@ -90,7 +121,32 @@ index 8c239f4..0e6575e 100644
          return SUCCEEDED(res);
      }
  
-@@ -1424,6 +1484,7 @@ namespace plume {
+@@ -1413,17 +1497,30 @@ namespace plume {
+             return false;
+         }
+ 
++        // [wcw] A lost device can't resize: a failed ResizeBuffers left the buffers released, and the next resize
++        // released them again (a null read after device loss).
++        if (wcwDeviceLostFlag().load()) {
++            return false;
++        }
++
+         for (uint32_t i = 0; i < desc.textureCount; i++) {
+-            textures[i].d3d->Release();
+-            textures[i].d3d = nullptr;
++            if (textures[i].d3d != nullptr) {
++                textures[i].d3d->Release();
++                textures[i].d3d = nullptr;
++            }
+         }
+ 
+         HRESULT res = d3d->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, swapChainFlags);
+         if (FAILED(res)) {
+             fprintf(stderr, "ResizeBuffers failed with error code 0x%lX.\n", res);
++            if (wcwDeviceLost(res)) {
++                wcwReportDeviceRemoved(commandQueue->device->d3d, res, "SwapChain::resize");
++            }
++
              return false;
          }
  
@@ -98,7 +154,7 @@ index 8c239f4..0e6575e 100644
          setTextures();
          return true;
      }
-@@ -1492,6 +1553,38 @@ namespace plume {
+@@ -1492,6 +1589,38 @@ namespace plume {
          return (d3d == nullptr) || (width == 0) || (height == 0);
      }
  
@@ -137,7 +193,7 @@ index 8c239f4..0e6575e 100644
      uint32_t D3D12SwapChain::getRefreshRate() const {
          return 0;
      }
-@@ -2312,7 +2405,11 @@ namespace plume {
+@@ -2312,7 +2441,11 @@ namespace plume {
  
          const D3D12_TEXTURE_COPY_LOCATION copyDstLocation = toD3D12(dstLocation);
          const D3D12_TEXTURE_COPY_LOCATION copySrcLocation = toD3D12(srcLocation);
@@ -150,21 +206,80 @@ index 8c239f4..0e6575e 100644
          d3d->CopyTextureRegion(&copyDstLocation, dstX, dstY, dstZ, &copySrcLocation, (srcBox != nullptr) ? &copyBox : nullptr);
          resetSamplePositions();
      }
-@@ -2781,7 +2878,12 @@ namespace plume {
+@@ -2627,8 +2760,16 @@ namespace plume {
+         }
+     }
+ 
++    void D3D12CommandList::setName(const std::string &name) {
++        setObjectName(d3d, name);
++    }
++
+     // D3D12CommandQueue
+ 
++    void D3D12CommandQueue::setName(const std::string &name) {
++        setObjectName(d3d, name);
++    }
++
+     D3D12CommandQueue::D3D12CommandQueue(D3D12Device *device, RenderCommandListType type) {
+         assert(device != nullptr);
+ 
+@@ -2762,6 +2903,11 @@ namespace plume {
+         HRESULT res = device->allocator->CreateResource(&allocationDesc, &resourceDesc, resourceStates, nullptr, &allocation, IID_PPV_ARGS(&d3d));
+         if (FAILED(res)) {
+             fprintf(stderr, "CreateResource failed with error code 0x%lX.\n", res);
++            // [wcw] Set the device-lost flag as early as possible, so the renderer threads stop before using the null resource.
++            if (FAILED(device->d3d->GetDeviceRemovedReason())) {
++                wcwReportDeviceRemoved(device->d3d, res, "Buffer::create");
++            }
++
+             return;
+         }
+     }
+@@ -2781,11 +2927,30 @@ namespace plume {
          }
  
          void *outputData = nullptr;
 -        d3d->Map(subresource, (readRange != nullptr) ? &range : nullptr, &outputData);
-+        const HRESULT res = d3d->Map(subresource, (readRange != nullptr) ? &range : nullptr, &outputData);
-+        if (FAILED(res)) {
-+            // [wcw] A removed device fails every Map; callers then write through null (the settings-change crash).
++        // [wcw] A removed device fails every Map (and resource creation, leaving d3d null); callers then wrote through
++        // null in several threads at once (the settings-change crash). Hand out scratch memory instead: the writes go
++        // nowhere, and the application sees wcwDeviceLostFlag and quits cleanly.
++        const HRESULT res = (d3d != nullptr) ? d3d->Map(subresource, (readRange != nullptr) ? &range : nullptr, &outputData) : DXGI_ERROR_DEVICE_REMOVED;
++        if (FAILED(res) || (outputData == nullptr)) {
 +            wcwReportDeviceRemoved(device->d3d, res, "Buffer::map");
++            wcwDeviceLostFlag() = true;
++            if (wcwLostScratch.size() < desc.size) {
++                wcwLostScratch.resize(size_t(desc.size));
++            }
++
++            wcwLostMapped = true;
++            return wcwLostScratch.data();
 +        }
 +
          return outputData;
      }
  
-@@ -3648,9 +3750,21 @@ namespace plume {
+     void D3D12Buffer::unmap(uint32_t subresource, const RenderRange *writtenRange) {
++        if (wcwLostMapped || (d3d == nullptr)) {
++            wcwLostMapped = false;
++            return;
++        }
++
+         D3D12_RANGE range;
+         if (writtenRange != nullptr) {
+             range.Begin = writtenRange->begin;
+@@ -2878,6 +3043,11 @@ namespace plume {
+         HRESULT res = device->allocator->CreateResource(&allocationDesc, &resourceDesc, resourceStates, (desc.optimizedClearValue != nullptr) ? &optimizedClearValue : nullptr, &allocation, IID_PPV_ARGS(&d3d));
+         if (FAILED(res)) {
+             fprintf(stderr, "CreateResource failed with error code 0x%lX.\n", res);
++            // [wcw] Set the device-lost flag as early as possible, so the renderer threads stop before using the null resource.
++            if (FAILED(device->d3d->GetDeviceRemovedReason())) {
++                wcwReportDeviceRemoved(device->d3d, res, "Texture::create");
++            }
++
+             return;
+         }
+     }
+@@ -3648,9 +3818,21 @@ namespace plume {
          HRESULT res;
          UINT adapterIndex = 0;
          IDXGIAdapter1 *adapterOption = nullptr;
@@ -186,7 +301,7 @@ index 8c239f4..0e6575e 100644
  
              // Ignore remote or software adapters.
              if (adapterDesc.Flags & (DXGI_ADAPTER_FLAG_REMOTE | DXGI_ADAPTER_FLAG_SOFTWARE)) {
-@@ -3660,6 +3774,7 @@ namespace plume {
+@@ -3660,6 +3842,7 @@ namespace plume {
  
              ID3D12Device8 *deviceOption = nullptr;
              res = D3D12CreateDevice(adapterOption, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&deviceOption));
@@ -194,7 +309,39 @@ index 8c239f4..0e6575e 100644
              if (FAILED(res)) {
                  adapterOption->Release();
                  continue;
-@@ -4176,6 +4291,7 @@ namespace plume {
+@@ -3882,6 +4065,21 @@ namespace plume {
+         if (FAILED(res)) {
+             fprintf(stderr, "GetTimestampFrequency failed with error code 0x%lX. Timestamps will be inaccurate.\n", res);
+         }
++
++        // [wcw] WCW_GPU_REMOVE_AFTER=<seconds>: remove the device on purpose after that long (ID3D12Device5::RemoveDevice),
++        // to test what the application does on device loss without waiting for a real GPU hang.
++        if (const char *removeText = getenv("WCW_GPU_REMOVE_AFTER")) {
++            const int removeSeconds = atoi(removeText);
++            ID3D12Device5 *device5 = nullptr;
++            if ((removeSeconds > 0) && SUCCEEDED(d3d->QueryInterface(IID_PPV_ARGS(&device5)))) {
++                std::thread([device5, removeSeconds]() {
++                    std::this_thread::sleep_for(std::chrono::seconds(removeSeconds));
++                    fprintf(stderr, "[wcw gpu] WCW_GPU_REMOVE_AFTER=%d: removing the device\n", removeSeconds);
++                    device5->RemoveDevice();
++                    device5->Release();
++                }).detach();
++            }
++        }
+     }
+ 
+     D3D12Device::~D3D12Device() {
+@@ -4024,7 +4222,8 @@ namespace plume {
+             instanceDesc.InstanceMask = instance.instanceMask;
+             instanceDesc.InstanceContributionToHitGroupIndex = instance.instanceContributionToHitGroupIndex;
+             instanceDesc.Flags = instance.cullDisable ? D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE : D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
+-            instanceDesc.AccelerationStructure = interfaceBottomLevelAS->d3d->GetGPUVirtualAddress() + instance.bottomLevelAS.offset;
++            // [wcw] A bottom level AS created after device loss has no resource (the render thread crashed here).
++            instanceDesc.AccelerationStructure = (interfaceBottomLevelAS->d3d != nullptr) ? (interfaceBottomLevelAS->d3d->GetGPUVirtualAddress() + instance.bottomLevelAS.offset) : 0;
+             memcpy(instanceDesc.Transform, instance.transform.m, sizeof(instanceDesc.Transform));
+         }
+ 
+@@ -4176,6 +4375,7 @@ namespace plume {
      // D3D12Interface
  
      D3D12Interface::D3D12Interface() {
@@ -202,7 +349,7 @@ index 8c239f4..0e6575e 100644
          // Create DXGI Factory.
          UINT dxgiFactoryFlags = 0;
  
-@@ -4192,7 +4308,9 @@ namespace plume {
+@@ -4192,7 +4392,9 @@ namespace plume {
          }
  #   endif
  
@@ -213,7 +360,7 @@ index 8c239f4..0e6575e 100644
          if (FAILED(res)) {
              fprintf(stderr, "CreateDXGIFactory2 failed with error code 0x%lX.\n", res);
              return;
-@@ -4223,6 +4341,7 @@ namespace plume {
+@@ -4223,6 +4425,7 @@ namespace plume {
  
              adapterOption->Release();
          }
@@ -222,7 +369,7 @@ index 8c239f4..0e6575e 100644
  
      D3D12Interface::~D3D12Interface() {
 diff --git a/plume_d3d12.h b/plume_d3d12.h
-index 4827452..5628e36 100644
+index 4827452..9bfce62 100644
 --- a/plume_d3d12.h
 +++ b/plume_d3d12.h
 @@ -111,6 +111,7 @@ namespace plume {
@@ -242,6 +389,32 @@ index 4827452..5628e36 100644
          void getWindowSize(uint32_t &dstWidth, uint32_t &dstHeight) const;
          void setTextures();
      };
+@@ -187,6 +190,7 @@ namespace plume {
+ 
+         D3D12CommandList(D3D12CommandQueue *queue);
+         ~D3D12CommandList() override;
++        void setName(const std::string &name) override;
+         void begin() override;
+         void end() override;
+         void barriers(RenderBarrierStages stages, const RenderBufferBarrier *bufferBarriers, uint32_t bufferBarriersCount, const RenderTextureBarrier *textureBarriers, uint32_t textureBarriersCount) override;
+@@ -262,6 +266,7 @@ namespace plume {
+ 
+         D3D12CommandQueue(D3D12Device *device, RenderCommandListType type);
+         ~D3D12CommandQueue() override;
++        void setName(const std::string &name) override;
+         std::unique_ptr<RenderCommandList> createCommandList() override;
+         std::unique_ptr<RenderSwapChain> createSwapChain(const RenderSwapChainDesc &desc) override;
+         void executeCommandLists(const RenderCommandList **commandLists, uint32_t commandListCount, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount, RenderCommandSemaphore **signalSemaphores, uint32_t signalSemaphoreCount, RenderCommandFence *signalFence) override;
+@@ -275,6 +280,9 @@ namespace plume {
+         D3D12MA::Allocation *allocation = nullptr;
+         D3D12Pool *pool = nullptr;
+         RenderBufferDesc desc;
++        // [wcw] Stand-in for map() after the device is lost (see wcwDeviceLostFlag).
++        std::vector<uint8_t> wcwLostScratch;
++        bool wcwLostMapped = false;
+ 
+         D3D12Buffer() = default;
+         D3D12Buffer(D3D12Device *device, D3D12Pool *pool, const RenderBufferDesc &desc);
 diff --git a/plume_metal.cpp b/plume_metal.cpp
 index a5f30a3..08da721 100644
 --- a/plume_metal.cpp
@@ -270,10 +443,31 @@ index 8de188d..76e4e71 100644
      };
  
 diff --git a/plume_render_interface.h b/plume_render_interface.h
-index 2048557..ff368af 100644
+index 2048557..89b0dfe 100644
 --- a/plume_render_interface.h
 +++ b/plume_render_interface.h
-@@ -103,6 +103,9 @@ namespace plume {
+@@ -7,11 +7,20 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <climits>
+ 
+ #include "plume_render_interface_types.h"
+ 
+ namespace plume {
++    // [wcw] Set once the GPU device is lost (removed, hung or reset). From then on the D3D12 backend hands out scratch
++    // memory instead of failing buffer maps, so the renderer threads keep running until the application quits; the
++    // application polls this to quit cleanly instead of crashing in several threads at once.
++    inline std::atomic<bool> &wcwDeviceLostFlag() {
++        static std::atomic<bool> flag(false);
++        return flag;
++    }
++
+     // Interfaces.
+ 
+     struct RenderBufferFormattedView {
+@@ -103,6 +112,9 @@ namespace plume {
  
          // Only valid if displayTiming is enabled in capabilities.
          virtual uint32_t getRefreshRate() const = 0;
@@ -283,6 +477,24 @@ index 2048557..ff368af 100644
      };
  
      struct RenderFramebuffer {
+@@ -113,6 +125,8 @@ namespace plume {
+ 
+     struct RenderCommandList {
+         virtual ~RenderCommandList() { }
++        // [wcw] Debug name (D3D12: shows in DRED device-loss reports). Optional for backends.
++        virtual void setName(const std::string &name) { }
+         virtual void begin() = 0;
+         virtual void end() = 0;
+         virtual void barriers(RenderBarrierStages stages, const RenderBufferBarrier *bufferBarriers, uint32_t bufferBarriersCount, const RenderTextureBarrier *textureBarriers, uint32_t textureBarriersCount) = 0;
+@@ -199,6 +213,8 @@ namespace plume {
+ 
+     struct RenderCommandQueue {
+         virtual ~RenderCommandQueue() { }
++        // [wcw] Debug name (D3D12: shows in DRED device-loss reports). Optional for backends.
++        virtual void setName(const std::string &name) { }
+         virtual std::unique_ptr<RenderCommandList> createCommandList() = 0;
+         virtual std::unique_ptr<RenderSwapChain> createSwapChain(const RenderSwapChainDesc &desc) = 0;
+         virtual void executeCommandLists(const RenderCommandList **commandLists, uint32_t commandListCount, RenderCommandSemaphore **waitSemaphores = nullptr, uint32_t waitSemaphoreCount = 0, RenderCommandSemaphore **signalSemaphores = nullptr, uint32_t signalSemaphoreCount = 0, RenderCommandFence *signalFence = nullptr) = 0;
 diff --git a/plume_render_interface_types.h b/plume_render_interface_types.h
 index 9dcfedf..2f1332e 100644
 --- a/plume_render_interface_types.h

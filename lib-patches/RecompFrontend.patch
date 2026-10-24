@@ -1435,7 +1435,7 @@ index 296ce0e..e825de5 100644
      }
  } // namespace config
 diff --git a/recompui/src/config/ui_config_tab_graphics.cpp b/recompui/src/config/ui_config_tab_graphics.cpp
-index 4fdf81f..c552d45 100644
+index 4fdf81f..0b67119 100644
 --- a/recompui/src/config/ui_config_tab_graphics.cpp
 +++ b/recompui/src/config/ui_config_tab_graphics.cpp
 @@ -1,7 +1,22 @@
@@ -2309,8 +2309,8 @@ index 4fdf81f..c552d45 100644
 +                "<recomp-color primary>Performance</recomp-color> traces at reduced resolution with the fewest rays and skips ambient occlusion. "
 +                "<recomp-color primary>Balanced</recomp-color> traces at reduced resolution and adds soft ambient occlusion where surfaces meet "
 +                "(under arms, between the legs, where wrestlers touch the mat). "
-+                "<recomp-color primary>Quality</recomp-color> traces every pixel for sharper shadows and deeper ambient occlusion. "
-+                "<recomp-color primary>Ultra</recomp-color> keeps Quality's look with twice the rays, for the cleanest result; "
++                "<recomp-color primary>Quality</recomp-color> traces every pixel up to 1440p (at 4K, two thirds of the lines) for sharper shadows and deeper ambient occlusion. "
++                "<recomp-color primary>Ultra</recomp-color> keeps Quality's look with twice the rays and traces every pixel at any resolution, for the cleanest result; "
 +                "it costs the most and suits fast GPUs.",
 +                ray_tracing_quality_options,
 +                enhanced.rt_quality
@@ -2515,19 +2515,33 @@ index 4a4033b..6c4c6ff 100644
  
      class Radio : public Container {
 diff --git a/recompui/src/renderer/rt64_render_context.cpp b/recompui/src/renderer/rt64_render_context.cpp
-index a7954c7..d899e2a 100644
+index a7954c7..dba60fa 100644
 --- a/recompui/src/renderer/rt64_render_context.cpp
 +++ b/recompui/src/renderer/rt64_render_context.cpp
-@@ -4,6 +4,8 @@
+@@ -2,13 +2,22 @@
+ #include <cstring>
+ #include <variant>
  #include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <thread>
++
++#include "SDL.h"
  
  #include "hle/rt64_application.h"
 +#include "common/rt64_wcw_logic.h"
++#include "common/rt64_wcw_perf.h"
 +#include "render/rt64_hdr_output.h"
  #include "rt64_render_hooks.h"
  #include "overloaded.h"
  
-@@ -143,7 +145,8 @@ void set_application_user_config(RT64::Application* application, const ultramode
+ #include "ultramodern/ultramodern.hpp"
+ #include "ultramodern/config.hpp"
++#include "ultramodern/perf.hpp"
+ 
+ #include "renderer.h"
+ #include "recompui/recompui.h"
+@@ -143,7 +152,8 @@ void set_application_user_config(RT64::Application* application, const ultramode
          default:
          case ultramodern::renderer::Resolution::Auto:
              application->userConfig.resolution = RT64::UserConfiguration::Resolution::WindowIntegerScale;
@@ -2537,7 +2551,19 @@ index a7954c7..d899e2a 100644
              break;
          case ultramodern::renderer::Resolution::Original:
              application->userConfig.resolution = RT64::UserConfiguration::Resolution::Manual;
-@@ -270,6 +273,9 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
+@@ -221,6 +231,11 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
+     static unsigned char dummy_rom_header[0x40];
+     recompui::set_render_hooks();
+ 
++    // [wcw perf] WCW_PERF_LOG=1: ultramodern's game-side CPU phases go to rt64's wcw_cpu_phases.csv.
++    if (RT64::WcwPerf::enabled()) {
++        ultramodern::perf::set_phase_sink(&RT64::WcwPerf::cpuPhaseNs);
++    }
++
+     // Set up the RT64 application core fields.
+     RT64::Application::Core appCore{};
+ #if defined(_WIN32)
+@@ -270,6 +285,9 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
      RT64::ApplicationConfiguration appConfig;
      appConfig.useConfigurationFile = false;
  
@@ -2547,7 +2573,7 @@ index a7954c7..d899e2a 100644
      // Create the RT64 application.
      app = std::make_unique<RT64::Application>(appCore, appConfig);
  
-@@ -299,6 +305,8 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
+@@ -299,6 +317,8 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
              app->userConfig.graphicsAPI = RT64::UserConfiguration::GraphicsAPI::Automatic;
              break;
      }
@@ -2556,7 +2582,7 @@ index a7954c7..d899e2a 100644
  
      // Set up the RT64 application.
      uint32_t thread_id = 0;
-@@ -331,6 +339,7 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
+@@ -331,6 +351,7 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
      }
  
      recompui::config::graphics::update_msaa_supported(sample_positions_supported);
@@ -2564,7 +2590,54 @@ index a7954c7..d899e2a 100644
  
      high_precision_fb_enabled = app->shaderLibrary->usesHDR;
  }
-@@ -405,12 +414,9 @@ float renderer::RT64Context::get_resolution_scale() const {
+@@ -356,6 +377,46 @@ void renderer::RT64Context::send_dummy_workload(uint32_t fb_address) {
+ }
+ 
+ void renderer::RT64Context::update_screen() {
++    // [wcw] The GPU device was lost (a GPU hang or removal; the D3D12 backend logged why). Rendering can't continue:
++    // RT64's threads stop touching the GPU, and this tells the player and quits through the normal shutdown (saves
++    // flush), instead of crashing in several renderer threads at once. The quit doesn't wait on the message forever
++    // (RT64::WcwLogic::DeviceLossQuit): nobody may be there to close it.
++    static std::atomic<bool> device_lost_handled = false;
++    if (plume::wcwDeviceLostFlag().load() && !device_lost_handled.exchange(true)) {
++        fprintf(stderr, "[wcw] graphics device lost: quitting\n");
++        fflush(stderr);
++        std::thread([]() {
++            static std::atomic<bool> message_closed = false;
++            RT64::WcwLogic::DeviceLossQuit device_loss_quit;
++            auto seconds_now = []() {
++                return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
++            };
++
++            while (true) {
++                switch (device_loss_quit.update(true, seconds_now(), message_closed.load())) {
++                case RT64::WcwLogic::DeviceLossQuit::Action::ShowMessage:
++                    std::thread([]() {
++                        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Graphics device lost",
++                            "The graphics card stopped responding (the GPU was reset), so the game has to close.\n\n"
++                            "Your saves are kept. If this keeps happening, try lowering the Ray Tracing quality or the framerate.",
++                            nullptr);
++                        message_closed = true;
++                    }).detach();
++                    break;
++                case RT64::WcwLogic::DeviceLossQuit::Action::Quit:
++                    fprintf(stderr, "[wcw] graphics device lost: %s, shutting down\n", message_closed.load() ? "message closed" : "no answer to the message");
++                    fflush(stderr);
++                    ultramodern::quit();
++                    return;
++                default:
++                    break;
++                }
++
++                std::this_thread::sleep_for(std::chrono::milliseconds(50));
++            }
++        }).detach();
++    }
++
+     check_refresh_rate_changes();
+     app->updateScreen();
+ }
+@@ -405,12 +466,9 @@ float renderer::RT64Context::get_resolution_scale() const {
      constexpr int ReferenceHeight = 240;
      switch (app->userConfig.resolution) {
          case RT64::UserConfiguration::Resolution::WindowIntegerScale:
