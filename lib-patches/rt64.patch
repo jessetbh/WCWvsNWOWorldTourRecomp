@@ -10,7 +10,7 @@ index 21df8c2..5635c09 100644
 +	url = https://github.com/jessetbh/plume.git
 +	branch = wcw
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 2fb01e5..2aae9de 100644
+index 2fb01e5..f31acab 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -21,8 +21,9 @@ function(preprocess INFILE OUTFILE OPTIONS)
@@ -102,7 +102,7 @@ index 2fb01e5..2aae9de 100644
      "${PROJECT_SOURCE_DIR}/src/render/rt64_vi_renderer.cpp"
  
      "${PROJECT_SOURCE_DIR}/src/preset/rt64_preset.cpp"
-@@ -442,6 +463,37 @@ target_link_libraries(rt64 nfd)
+@@ -442,6 +463,38 @@ target_link_libraries(rt64 nfd)
  target_link_libraries(rt64 libzstd_static)
  target_link_libraries(rt64 plume)
  
@@ -116,6 +116,7 @@ index 2fb01e5..2aae9de 100644
 +        "${PROJECT_SOURCE_DIR}/tests/wcw/rt64_wcw_sharp_texel_tests.cpp"
 +        "${PROJECT_SOURCE_DIR}/tests/wcw/rt64_wcw_perf_tests.cpp"
 +        "${PROJECT_SOURCE_DIR}/tests/wcw/rt64_wcw_texdump_tests.cpp"
++        "${PROJECT_SOURCE_DIR}/tests/wcw/rt64_wcw_packfs_tests.cpp"
 +        "${PROJECT_SOURCE_DIR}/src/common/rt64_wcw_logic.cpp"
 +        "${PROJECT_SOURCE_DIR}/src/common/rt64_wcw_perf.cpp"
 +        "${PROJECT_SOURCE_DIR}/src/common/rt64_wcw_texdump.cpp"
@@ -140,7 +141,7 @@ index 2fb01e5..2aae9de 100644
  # Add tools.
  add_subdirectory(src/tools/texture_hasher)
  add_subdirectory(src/tools/texture_packer)
-@@ -527,6 +579,12 @@ build_pixel_shader(  rt64 "src/shaders/PostBlendDitherNoisePS.hlsl" "src/shaders
+@@ -527,6 +580,12 @@ build_pixel_shader(  rt64 "src/shaders/PostBlendDitherNoisePS.hlsl" "src/shaders
  build_compute_shader(rt64 "src/shaders/RSPModifyCS.hlsl")
  build_compute_shader(rt64 "src/shaders/RSPProcessCS.hlsl")
  build_compute_shader(rt64 "src/shaders/RSPWorldCS.hlsl")
@@ -153,7 +154,7 @@ index 2fb01e5..2aae9de 100644
  build_compute_shader(rt64 "src/shaders/RSPSmoothNormalCS.hlsl")
  build_compute_shader(rt64 "src/shaders/RSPVertexTestZCS.hlsl")
  build_compute_shader(rt64 "src/shaders/RSPVertexTestZCS.hlsl" "src/shaders/RSPVertexTestZCSMS.hlsl" "-D MULTISAMPLING")
-@@ -545,6 +603,8 @@ build_pixel_shader(  rt64 "src/shaders/TextureResolvePS.hlsl" "src/shaders/Textu
+@@ -545,6 +604,8 @@ build_pixel_shader(  rt64 "src/shaders/TextureResolvePS.hlsl" "src/shaders/Textu
  build_pixel_shader(  rt64 "src/shaders/TextureResolvePS.hlsl" "src/shaders/TextureResolveSamples8XPS.hlsl" "-D SAMPLES_8X")
  build_pixel_shader(  rt64 "src/shaders/VideoInterfacePS.hlsl" "src/shaders/VideoInterfacePSRegular.hlsl")
  build_pixel_shader(  rt64 "src/shaders/VideoInterfacePS.hlsl" "src/shaders/VideoInterfacePSPixel.hlsl" "-D PIXEL_ANTIALIASING")
@@ -182,6 +183,182 @@ index 1194a96..432e1ab 100644
          presentation.removeBlackBorders = true;
          rect.fixRectLR = true;
          f3dex.forceBranch = false;
+diff --git a/src/common/rt64_filesystem_directory.h b/src/common/rt64_filesystem_directory.h
+index e0d35f7..f706c28 100644
+--- a/src/common/rt64_filesystem_directory.h
++++ b/src/common/rt64_filesystem_directory.h
+@@ -5,15 +5,58 @@
+ #pragma once
+ 
+ #include "rt64_filesystem.h"
++#include "rt64_wcw_logic.h"
+ 
++#include <cstdio>
+ #include <filesystem>
++#include <fstream>
+ 
+ namespace RT64 {
++    // [wcw] aki-roadmap#115: the ports aren't long-path aware, so a pack path past MAX_PATH failed. On Windows the root
++    // becomes its extended-length (\\?\) form, which every path built from it inherits; elsewhere it stays as given.
++    inline std::filesystem::path wcwLongPathRoot(const std::filesystem::path &directoryPath) {
++#ifdef _WIN32
++        std::error_code ec;
++        const std::filesystem::path absolutePath = std::filesystem::absolute(directoryPath, ec);
++        if (ec) {
++            return directoryPath;
++        }
++
++        return std::filesystem::path(WcwLogic::extendedLengthPath(absolutePath.wstring()));
++#else
++        return directoryPath;
++#endif
++    }
++
++    // [wcw] #115: a file inside the pack root. Pack paths use '/' and may hold "." or "..", which Win32 doesn't resolve
++    // inside a \\?\ root, so the joined path is normalized there (WcwLogic::extendedLengthJoin).
++    inline std::filesystem::path wcwPackPath(const std::filesystem::path &directoryPath, const std::string &path) {
++#ifdef _WIN32
++        return std::filesystem::path(WcwLogic::extendedLengthJoin(directoryPath.wstring(), std::filesystem::u8path(path).wstring()));
++#else
++        return directoryPath / std::filesystem::u8path(path);
++#endif
++    }
++
++    // [wcw] #115: the directory walk uses the error_code overloads. A failed step ends the walk (logged once per walk)
++    // instead of throwing filesystem_error out of a render thread, which ended the game with 0xC0000409 and no backtrace.
++    inline void wcwLogWalkError(const std::filesystem::path &directoryPath, const std::error_code &ec) {
++        fprintf(stderr, "[wcw] texture pack walk stopped in %s: %s\n", directoryPath.u8string().c_str(), ec.message().c_str());
++    }
++
+     struct FileSystemDirectoryIterator : FileSystemIteratorImplementation {
+         std::filesystem::recursive_directory_iterator dirIterator;
+         std::filesystem::path directoryPath;
+         std::string pathStr;
+         bool pathStrValid = false;
++        bool walkErrorLogged = false;
++
++        void logWalkError(const std::error_code &ec) {
++            if (!walkErrorLogged) {
++                walkErrorLogged = true;
++                wcwLogWalkError(directoryPath, ec);
++            }
++        }
+ 
+         FileSystemDirectoryIterator() {
+             // Default constructor.
+@@ -21,12 +64,36 @@ namespace RT64 {
+ 
+         FileSystemDirectoryIterator(const std::filesystem::path &directoryPath) {
+             this->directoryPath = directoryPath;
+-            dirIterator = std::filesystem::recursive_directory_iterator(directoryPath);
++            std::error_code ec;
++            dirIterator = std::filesystem::recursive_directory_iterator(directoryPath, ec);
++            if (ec) {
++                logWalkError(ec);
++                dirIterator = std::filesystem::recursive_directory_iterator();
++            }
++        }
++
++        // Advances one entry; on an error the walk ends.
++        void step() {
++            std::error_code ec;
++            dirIterator.increment(ec);
++            if (ec) {
++                logWalkError(ec);
++                dirIterator = std::filesystem::recursive_directory_iterator();
++            }
++        }
++
++        bool atFile() const {
++            std::error_code ec;
++            return dirIterator->is_regular_file(ec) && !ec;
+         }
+ 
+         const std::string &value() override {
+             if (!pathStrValid) {
+-                pathStr = std::filesystem::relative(dirIterator->path(), directoryPath).u8string();
++                std::error_code ec;
++                pathStr = dirIterator->path().lexically_relative(directoryPath).u8string();
++                if (pathStr.empty()) {
++                    pathStr = std::filesystem::relative(dirIterator->path(), directoryPath, ec).u8string();
++                }
+                 pathStrValid = true;
+             }
+ 
+@@ -38,8 +105,8 @@ namespace RT64 {
+ 
+             static const std::filesystem::recursive_directory_iterator endIterator;
+             do {
+-                dirIterator++;
+-            } while ((dirIterator != endIterator) && !dirIterator->is_regular_file());
++                step();
++            } while ((dirIterator != endIterator) && !atFile());
+         }
+ 
+         bool compare(const FileSystemIteratorImplementation *other) const override {
+@@ -53,7 +120,7 @@ namespace RT64 {
+         std::shared_ptr<FileSystemDirectoryIterator> endIterator;
+ 
+         FileSystemDirectory(const std::filesystem::path &directoryPath) {
+-            this->directoryPath = directoryPath;
++            this->directoryPath = wcwLongPathRoot(directoryPath);
+             endIterator = { std::make_shared<FileSystemDirectoryIterator>() };
+         }
+         
+@@ -62,8 +129,8 @@ namespace RT64 {
+ 
+             // Search for the first iterator that isn't a directory.
+             static const std::filesystem::recursive_directory_iterator endIterator;
+-            while ((beginIterator->dirIterator != endIterator) && !beginIterator->dirIterator->is_regular_file()) {
+-                beginIterator->dirIterator++;
++            while ((beginIterator->dirIterator != endIterator) && !beginIterator->atFile()) {
++                beginIterator->step();
+             }
+ 
+             return { beginIterator };
+@@ -75,7 +142,7 @@ namespace RT64 {
+ 
+         std::string makeCanonical(const std::string &path) const override {
+             std::error_code ec;
+-            std::filesystem::path canonicalPath = std::filesystem::canonical(directoryPath / std::filesystem::u8path(path), ec);
++            std::filesystem::path canonicalPath = std::filesystem::canonical(wcwPackPath(directoryPath, path), ec);
+             if (ec) {
+                 return std::string();
+             }
+@@ -89,7 +156,7 @@ namespace RT64 {
+         }
+         
+         bool load(const std::string &path, uint8_t *fileData, size_t fileDataMaxByteCount) const override {
+-            std::ifstream fileStream(directoryPath / std::filesystem::u8path(path), std::ios::binary);
++            std::ifstream fileStream(wcwPackPath(directoryPath, path), std::ios::binary);
+             if (fileStream.is_open()) {
+                 fileStream.read((char *)(fileData), fileDataMaxByteCount);
+                 return !fileStream.bad();
+@@ -101,7 +168,7 @@ namespace RT64 {
+ 
+         size_t getSize(const std::string &path) const override {
+             std::error_code ec;
+-            size_t fileSize = std::filesystem::file_size(directoryPath / std::filesystem::u8path(path), ec);
++            size_t fileSize = std::filesystem::file_size(wcwPackPath(directoryPath, path), ec);
+             if (!ec) {
+                 return fileSize;
+             }
+@@ -115,11 +182,13 @@ namespace RT64 {
+                 return false;
+             }
+ 
+-            return std::filesystem::exists(directoryPath / std::filesystem::u8path(path));
++            std::error_code ec;
++            return std::filesystem::exists(wcwPackPath(directoryPath, path), ec);
+         }
+ 
+         static std::unique_ptr<FileSystem> create(const std::filesystem::path &directoryPath) {
+-            if (std::filesystem::exists(directoryPath)) {
++            std::error_code ec;
++            if (std::filesystem::exists(wcwLongPathRoot(directoryPath), ec)) {
+                 return std::make_unique<FileSystemDirectory>(directoryPath);
+             }
+             else {
 diff --git a/src/common/rt64_math.cpp b/src/common/rt64_math.cpp
 index c20fb51..09f0db5 100644
 --- a/src/common/rt64_math.cpp
@@ -386,10 +563,10 @@ index 9f331c9..bd05a36 100644
      void to_json(json &j, const ReplacementDatabase &db) {
 diff --git a/src/common/rt64_wcw_logic.cpp b/src/common/rt64_wcw_logic.cpp
 new file mode 100644
-index 0000000..f827267
+index 0000000..d932235
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.cpp
-@@ -0,0 +1,764 @@
+@@ -0,0 +1,843 @@
 +//
 +// RT64
 +//
@@ -1131,6 +1308,85 @@ index 0000000..f827267
 +        return packFileExists ? TexDumpWrite::SidecarsOnly : TexDumpWrite::All;
 +    }
 +
++    std::wstring extendedLengthPath(const std::wstring &absolutePath) {
++        if ((absolutePath.rfind(L"\\\\?\\", 0) == 0) || (absolutePath.rfind(L"\\\\.\\", 0) == 0)) {
++            return absolutePath;
++        }
++
++        std::wstring path = absolutePath;
++        std::replace(path.begin(), path.end(), L'/', L'\\');
++        std::wstring prefix;
++        size_t rest = 0;
++        const bool drive = (path.size() >= 3) && (path[1] == L':') && (path[2] == L'\\') &&
++            (((path[0] >= L'A') && (path[0] <= L'Z')) || ((path[0] >= L'a') && (path[0] <= L'z')));
++        if (drive) {
++            prefix = L"\\\\?\\" + path.substr(0, 2);
++            rest = 3;
++        }
++        else if ((path.size() > 2) && (path[0] == L'\\') && (path[1] == L'\\')) {
++            // UNC: \\server\share\... -> \\?\UNC\server\share\...; the server and share stay as the root.
++            const size_t server = path.find(L'\\', 2);
++            const size_t share = (server == std::wstring::npos) ? std::wstring::npos : path.find(L'\\', server + 1);
++            if ((server == std::wstring::npos) || (server == 2)) {
++                return absolutePath;
++            }
++
++            const size_t rootEnd = (share == std::wstring::npos) ? path.size() : share;
++            prefix = L"\\\\?\\UNC\\" + path.substr(2, rootEnd - 2);
++            rest = (share == std::wstring::npos) ? path.size() : share + 1;
++        }
++        else {
++            return absolutePath;
++        }
++
++        std::vector<std::wstring> parts;
++        size_t start = rest;
++        while (start <= path.size()) {
++            size_t end = path.find(L'\\', start);
++            if (end == std::wstring::npos) {
++                end = path.size();
++            }
++
++            const std::wstring part = path.substr(start, end - start);
++            if (part == L"..") {
++                if (!parts.empty()) {
++                    parts.pop_back();
++                }
++            }
++            else if (!part.empty() && (part != L".")) {
++                parts.push_back(part);
++            }
++
++            start = end + 1;
++        }
++
++        std::wstring result = prefix + L"\\";
++        for (size_t i = 0; i < parts.size(); i++) {
++            result += (i > 0) ? L"\\" : L"";
++            result += parts[i];
++        }
++
++        return result;
++    }
++
++    std::wstring extendedLengthJoin(const std::wstring &root, const std::wstring &relative) {
++        const auto joined = [&relative](const std::wstring &base) {
++            const bool separated = base.empty() || (base.back() == L'\\') || (base.back() == L'/');
++            return base + (separated ? L"" : L"\\") + relative;
++        };
++
++        // Back to the plain form, so extendedLengthPath normalizes the whole joined path and adds the prefix again.
++        if (root.rfind(L"\\\\?\\UNC\\", 0) == 0) {
++            return extendedLengthPath(joined(L"\\\\" + root.substr(8)));
++        }
++        else if (root.rfind(L"\\\\?\\", 0) == 0) {
++            return extendedLengthPath(joined(root.substr(4)));
++        }
++        else {
++            return joined(root);
++        }
++    }
++
 +    DeviceLostWork deviceLostWork(bool deviceLost) {
 +        return deviceLost ? DeviceLostWork::SkipGpuWork : DeviceLostWork::Render;
 +    }
@@ -1156,10 +1412,10 @@ index 0000000..f827267
 +};
 diff --git a/src/common/rt64_wcw_logic.h b/src/common/rt64_wcw_logic.h
 new file mode 100644
-index 0000000..64baec3
+index 0000000..2ea3f15
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.h
-@@ -0,0 +1,719 @@
+@@ -0,0 +1,732 @@
 +//
 +// RT64
 +//
@@ -1784,6 +2040,19 @@ index 0000000..64baec3
 +            return (commands > limit) || transformsFull;
 +        }
 +    };
++
++    // The Windows extended-length form of an absolute path (aki-roadmap#115): "\\?\C:\..." or "\\?\UNC\server\share\...".
++    // The ports aren't long-path aware, so a pack file whose full path reached MAX_PATH (260) didn't open (the texture
++    // silently stayed stock), and a folder nested past it threw from the directory walk and ended the game (0xC0000409).
++    // Win32 doesn't normalize a \\?\ path, so this also turns '/' into '\', drops "." and empty components and resolves
++    // "..". Empty, relative or drive-relative ("C:foo") input, and a path already in \\?\ or \\.\ form, come back unchanged.
++    std::wstring extendedLengthPath(const std::wstring &absolutePath);
++
++    // A file inside a pack root (aki-roadmap#115 review): root joined with a pack-relative path. Pack paths come with
++    // '/' (rt64.json entries, Rice names, the forward-slash forms the database builds) and may hold "." or "..", and
++    // Win32 resolves neither inside a \\?\ path, so with an extended-length root the joined path goes through
++    // extendedLengthPath again: '/' becomes '\' and "."/".." are resolved. Any other root is joined as given.
++    std::wstring extendedLengthJoin(const std::wstring &root, const std::wstring &relative);
 +
 +    // Graphics device loss
 +
@@ -26488,10 +26757,10 @@ index 42cd7b6..728c967 100644
  target_link_libraries(texture_packer PRIVATE libzstd_static)
 diff --git a/tests/wcw/rt64_wcw_logic_tests.cpp b/tests/wcw/rt64_wcw_logic_tests.cpp
 new file mode 100644
-index 0000000..dbb2bb1
+index 0000000..8b61929
 --- /dev/null
 +++ b/tests/wcw/rt64_wcw_logic_tests.cpp
-@@ -0,0 +1,1804 @@
+@@ -0,0 +1,1860 @@
 +//
 +// RT64
 +//
@@ -28109,6 +28378,62 @@ index 0000000..dbb2bb1
 +    CHECK(WorldTransformLimit <= uint64_t(UINT16_MAX));
 +}
 +
++TEST_CASE("long pack paths: a drive path gets the \\\\?\\ form, so files past MAX_PATH open (#115)") {
++    CHECK(extendedLengthPath(L"C:\\Users\\me\\depot\\NoMercyRecomp-fullconv\\conversions\\_packages\\Pack") ==
++          L"\\\\?\\C:\\Users\\me\\depot\\NoMercyRecomp-fullconv\\conversions\\_packages\\Pack");
++    CHECK(extendedLengthPath(L"C:\\") == L"\\\\?\\C:\\");
++    CHECK(extendedLengthPath(L"d:\\packs\\") == L"\\\\?\\d:\\packs");
++    // A pack root longer than MAX_PATH keeps every character (the old limit cut in at 260).
++    std::wstring deep = L"C:\\games";
++    for (int i = 0; i < 8; i++) {
++        deep += L"\\" + std::wstring(40, L'a' + i);
++    }
++
++    CHECK(deep.size() > 300);
++    CHECK(extendedLengthPath(deep) == L"\\\\?\\" + deep);
++}
++
++TEST_CASE("long pack paths: \\\\?\\ isn't normalized by Windows, so slashes, '.', '..' and doubled separators are resolved here") {
++    CHECK(extendedLengthPath(L"C:/Users/me/packs/x") == L"\\\\?\\C:\\Users\\me\\packs\\x");
++    CHECK(extendedLengthPath(L"C:\\a\\.\\b\\\\c") == L"\\\\?\\C:\\a\\b\\c");
++    CHECK(extendedLengthPath(L"C:\\a\\b\\..\\c") == L"\\\\?\\C:\\a\\c");
++    // ".." stops at the drive root.
++    CHECK(extendedLengthPath(L"C:\\..\\..\\a") == L"\\\\?\\C:\\a");
++}
++
++TEST_CASE("long pack paths: UNC shares get \\\\?\\UNC\\; other forms come back unchanged") {
++    CHECK(extendedLengthPath(L"\\\\nas\\games\\packs\\Pack") == L"\\\\?\\UNC\\nas\\games\\packs\\Pack");
++    CHECK(extendedLengthPath(L"\\\\nas\\games") == L"\\\\?\\UNC\\nas\\games\\");
++    CHECK(extendedLengthPath(L"\\\\?\\C:\\already") == L"\\\\?\\C:\\already");
++    CHECK(extendedLengthPath(L"\\\\.\\pipe\\x") == L"\\\\.\\pipe\\x");
++    CHECK(extendedLengthPath(L"") == L"");
++    CHECK(extendedLengthPath(L"relative\\pack") == L"relative\\pack");
++    CHECK(extendedLengthPath(L"C:drive-relative") == L"C:drive-relative");
++    CHECK(extendedLengthPath(L"\\rooted\\no-drive") == L"\\rooted\\no-drive");
++}
++
++TEST_CASE("long pack paths: a pack file in a subfolder, named with '/', joins to a \\\\?\\ path Win32 can open (#115 review)") {
++    // Pack paths use '/', and Win32 doesn't turn it into '\' inside a \\?\ path: a texture in any subfolder of a pack
++    // silently didn't load once the root was \\?\ (exists() false, canonical() ERROR_INVALID_NAME), short paths too.
++    CHECK(extendedLengthJoin(L"\\\\?\\C:\\mods\\Pack", L"textures/sub/x.png") == L"\\\\?\\C:\\mods\\Pack\\textures\\sub\\x.png");
++    CHECK(extendedLengthJoin(L"\\\\?\\C:\\mods\\Pack\\", L"x.png") == L"\\\\?\\C:\\mods\\Pack\\x.png");
++    CHECK(extendedLengthJoin(L"\\\\?\\C:\\", L"a/b.png") == L"\\\\?\\C:\\a\\b.png");
++    CHECK(extendedLengthJoin(L"\\\\?\\UNC\\nas\\games\\Pack", L"sub/x.png") == L"\\\\?\\UNC\\nas\\games\\Pack\\sub\\x.png");
++}
++
++TEST_CASE("long pack paths: '.' and '..' in a pack path resolve against a \\\\?\\ root") {
++    CHECK(extendedLengthJoin(L"\\\\?\\C:\\mods\\Pack", L"textures/other/../sub/x.png") == L"\\\\?\\C:\\mods\\Pack\\textures\\sub\\x.png");
++    CHECK(extendedLengthJoin(L"\\\\?\\C:\\mods\\Pack", L"./textures/./x.png") == L"\\\\?\\C:\\mods\\Pack\\textures\\x.png");
++    CHECK(extendedLengthJoin(L"\\\\?\\C:\\mods\\Pack", L"textures//x.png") == L"\\\\?\\C:\\mods\\Pack\\textures\\x.png");
++    CHECK(extendedLengthJoin(L"\\\\?\\C:\\mods\\Pack", L"") == L"\\\\?\\C:\\mods\\Pack");
++}
++
++TEST_CASE("long pack paths: a root that isn't \\\\?\\ is joined as given") {
++    CHECK(extendedLengthJoin(L"packs\\Pack", L"sub/x.png") == L"packs\\Pack\\sub/x.png");
++    CHECK(extendedLengthJoin(L"C:\\mods\\Pack\\", L"x.png") == L"C:\\mods\\Pack\\x.png");
++    CHECK(extendedLengthJoin(L"", L"x.png") == L"x.png");
++}
++
 +// Graphics device loss
 +
 +TEST_CASE("device loss: renderer threads render until the device is lost, then skip all GPU work") {
@@ -28295,6 +28620,114 @@ index 0000000..dbb2bb1
 +
 +int main() {
 +    return WcwTest::runAll("rt64 wcw tests");
++}
+diff --git a/tests/wcw/rt64_wcw_packfs_tests.cpp b/tests/wcw/rt64_wcw_packfs_tests.cpp
+new file mode 100644
+index 0000000..d5e5e0c
+--- /dev/null
++++ b/tests/wcw/rt64_wcw_packfs_tests.cpp
+@@ -0,0 +1,102 @@
++//
++// RT64
++//
++
++// [wcw] Tests for texture pack folders (common/rt64_filesystem_directory.h) against real files in the temp folder:
++// a pack's files are found, sized, loaded and canonicalized by the '/' paths rt64.json, Rice names and the database
++// use, from subfolders, with "." and "..", and past MAX_PATH (aki-roadmap#115 and its review).
++
++#include "common/rt64_filesystem_directory.h"
++
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <random>
++#include <string>
++
++#include "wcw_test.h"
++
++using namespace RT64;
++
++namespace {
++    // A pack folder in the temp folder, removed again at the end of the test.
++    struct TempPack {
++        std::filesystem::path root;
++
++        explicit TempPack(const std::string &name) {
++            root = std::filesystem::temp_directory_path() / ("rt64_wcw_packfs_" + name + "_" + std::to_string(std::random_device{}()));
++            std::error_code ec;
++            std::filesystem::remove_all(root, ec);
++            std::filesystem::create_directories(root, ec);
++        }
++
++        ~TempPack() {
++            std::error_code ec;
++            std::filesystem::remove_all(wcwLongPathRoot(root), ec);
++        }
++
++        // Writes a file under the pack; relative uses '\' or '/' (written through the \\?\ form, so any length works).
++        void write(const std::string &relative, const std::string &content) const {
++            const std::filesystem::path path = wcwPackPath(wcwLongPathRoot(root), relative);
++            std::error_code ec;
++            std::filesystem::create_directories(path.parent_path(), ec);
++            std::ofstream file(path, std::ios::binary);
++            file << content;
++        }
++    };
++
++    bool loads(const FileSystem &fileSystem, const std::string &path, const std::string &expected) {
++        std::string data(expected.size(), '\0');
++        return fileSystem.load(path, reinterpret_cast<uint8_t *>(data.data()), data.size()) && (data == expected);
++    }
++}
++
++TEST_CASE("pack folders: a texture in a subfolder, named with '/', is found, sized, loaded and canonicalized (#115 review)") {
++    // With the \\?\ root, '/' in a pack path wasn't converted by Win32: every subfolder texture silently stayed stock.
++    TempPack pack("sub");
++    pack.write("textures/sub/x.png", "hello");
++    std::unique_ptr<FileSystem> fileSystem = FileSystemDirectory::create(pack.root);
++    CHECK(fileSystem != nullptr);
++    CHECK(fileSystem->exists("textures/sub/x.png"));
++    CHECK_EQ(fileSystem->getSize("textures/sub/x.png"), size_t(5));
++    CHECK(loads(*fileSystem, "textures/sub/x.png", "hello"));
++    CHECK(FileSystem::toForwardSlashes(fileSystem->makeCanonical("textures/sub/x.png")) == "textures/sub/x.png");
++    CHECK(!fileSystem->exists("textures/sub/missing.png"));
++}
++
++TEST_CASE("pack folders: '.' and '..' in a pack path resolve against the pack root") {
++    TempPack pack("dots");
++    pack.write("textures/sub/x.png", "hello");
++    // POSIX resolves ".." against the folders that exist, so "other" must be there (Win32 resolves it lexically).
++    pack.write("textures/other/y.png", "other");
++    std::unique_ptr<FileSystem> fileSystem = FileSystemDirectory::create(pack.root);
++    CHECK(fileSystem != nullptr);
++    CHECK(fileSystem->exists("textures/other/../sub/x.png"));
++    CHECK(fileSystem->exists("./textures/sub/./x.png"));
++    CHECK(loads(*fileSystem, "textures/other/../sub/x.png", "hello"));
++    CHECK(FileSystem::toForwardSlashes(fileSystem->makeCanonical("textures/other/../sub/x.png")) == "textures/sub/x.png");
++}
++
++TEST_CASE("pack folders: a texture past MAX_PATH is found and loaded, and the walk lists it") {
++    TempPack pack("long");
++    std::string relative = "textures";
++    while ((pack.root.u8string().size() + relative.size()) < 300) {
++        relative += "/a_rather_long_folder_name";
++    }
++
++    relative += "/x.png";
++    pack.write(relative, "hello");
++    std::unique_ptr<FileSystem> fileSystem = FileSystemDirectory::create(pack.root);
++    CHECK(fileSystem != nullptr);
++    CHECK(fileSystem->exists(relative));
++    CHECK(loads(*fileSystem, relative, "hello"));
++    size_t files = 0;
++    std::string listed;
++    for (const std::string &path : *fileSystem) {
++        files++;
++        listed = FileSystem::toForwardSlashes(path);
++    }
++
++    CHECK_EQ(files, size_t(1));
++    CHECK(listed == relative);
 +}
 diff --git a/tests/wcw/rt64_wcw_perf_tests.cpp b/tests/wcw/rt64_wcw_perf_tests.cpp
 new file mode 100644
