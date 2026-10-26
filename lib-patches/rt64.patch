@@ -563,10 +563,10 @@ index 9f331c9..bd05a36 100644
      void to_json(json &j, const ReplacementDatabase &db) {
 diff --git a/src/common/rt64_wcw_logic.cpp b/src/common/rt64_wcw_logic.cpp
 new file mode 100644
-index 0000000..d932235
+index 0000000..2c7ead6
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.cpp
-@@ -0,0 +1,843 @@
+@@ -0,0 +1,860 @@
 +//
 +// RT64
 +//
@@ -621,6 +621,23 @@ index 0000000..d932235
 +
 +    bool reusableTrace(bool traced, uint64_t tracedSignature, uint64_t signature, bool tracedDarkened, bool darkens) {
 +        return traced && (tracedSignature == signature) && (tracedDarkened == darkens);
++    }
++
++    bool buildForPass(bool traceEveryFrame, bool generated, bool haveTrace, uint32_t reusesSinceTrace, bool traceTexturesChange) {
++        return traceEveryFrame || traceTexturesChange || traceRender(generated, haveTrace, reusesSinceTrace);
++    }
++
++    bool traceTexturesChange(const TraceTextures &textures, uint32_t targetWidth, uint32_t targetHeight, float targetScale, uint32_t mode) {
++        if (!textures.active || !textures.haveTextures || (textures.outputWidth != targetWidth) || (textures.outputHeight != targetHeight) ||
++            (textures.traceScale != targetScale))
++        {
++            return true;
++        }
++
++        // The trace size the textures were made at (recordTrace: the output size times the trace scale, at least 1).
++        const uint32_t traceWidth = std::max(uint32_t(std::ceil(textures.outputWidth * textures.traceScale)), 1u);
++        const uint32_t traceHeight = std::max(uint32_t(std::ceil(textures.outputHeight * textures.traceScale)), 1u);
++        return !textures.haveHistory || (textures.historyWidth != traceWidth) || (textures.historyHeight != traceHeight) || (textures.historyMode != mode);
 +    }
 +
 +    uint64_t passSignature(const uint32_t *triangleCounts, size_t count) {
@@ -1412,10 +1429,10 @@ index 0000000..d932235
 +};
 diff --git a/src/common/rt64_wcw_logic.h b/src/common/rt64_wcw_logic.h
 new file mode 100644
-index 0000000..2ea3f15
+index 0000000..3b644a5
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.h
-@@ -0,0 +1,732 @@
+@@ -0,0 +1,762 @@
 +//
 +// RT64
 +//
@@ -1517,6 +1534,36 @@ index 0000000..2ea3f15
 +    // every pass on every target as if it traced). A reused arena pass that didn't count as the target's darkening
 +    // pass let a second pass darken the misses again: generated frames ~5% darker, 3% of game frames off.
 +    bool reusableTrace(bool traced, uint64_t tracedSignature, uint64_t signature, bool tracedDarkened, bool darkens);
++
++    // Whether a pass builds its acceleration structures (BLAS + TLAS) on this render (aki-roadmap#36). A pass that
++    // composites its slot's latest trace (traceRender false) reads neither, yet every generated frame built them:
++    // ~0.1 ms each, over half the workloads at 120 fps. It still builds when it traces every frame
++    // (traceEveryFrame: WCW_RT_TRACE_GENERATED), or when its trace textures are made again on this render
++    // (traceTexturesChange: target size or trace scale changed), which drops the trace it would composite.
++    bool buildForPass(bool traceEveryFrame, bool generated, bool haveTrace, uint32_t reusesSinceTrace, bool traceTexturesChange);
++
++    // What a pass's latest trace was made with: the ray tracer's trace textures and the slot's history.
++    struct TraceTextures {
++        // Ray tracing also ran on the previous render (re-enabled after being off, every history is stale).
++        bool active = false;
++        bool haveTextures = false;
++        // The color target size and trace scale the textures were made for.
++        uint32_t outputWidth = 0;
++        uint32_t outputHeight = 0;
++        float traceScale = 0.0f;
++        bool haveHistory = false;
++        uint32_t historyWidth = 0;
++        uint32_t historyHeight = 0;
++        // The mode (WCW_RT_MODE_*) that wrote the history: shadows and AO, or a debug view's color.
++        uint32_t historyMode = UINT32_MAX;
++    };
++
++    // Whether recordTrace makes the trace textures or the slot's history again, or drops the history, for a pass
++    // into a target of targetWidth x targetHeight at targetScale in mode: the latest trace can't be composited then
++    // (buildForPass's traceTexturesChange). A changed mode (the Lighting editor's debug views) and a changed trace
++    // scale (an RT quality change between recordBuild and recordTrace) count, as do the target size and the
++    // trace size the history was made at.
++    bool traceTexturesChange(const TraceTextures &textures, uint32_t targetWidth, uint32_t targetHeight, float targetScale, uint32_t mode);
 +
 +    // Ray tracing quality presets
 +
@@ -21440,7 +21487,7 @@ index 0000000..9f63d18
 +    };
 +};
 diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
-index 9fae0d4..96666b7 100644
+index 9fae0d4..2ddffa5 100644
 --- a/src/render/rt64_framebuffer_renderer.cpp
 +++ b/src/render/rt64_framebuffer_renderer.cpp
 @@ -3,11 +3,16 @@
@@ -21893,7 +21940,7 @@ index 9fae0d4..96666b7 100644
 +                wcwRaytracer->beginScene(wcwView, wcwProj, wcwViewport,
 +                    worldPosRes, outputBuffers.worldPosBuffer.allocatedSize, outputBuffers.worldNormBuffer.buffer.get(), outputBuffers.worldNormBuffer.allocatedSize,
 +                    indexRes, uint64_t(indexCount) * IndexStride,
-+                    drawBuffers.rdpTilesBuffer.get(), drawBuffers.gpuTilesBuffer.get(), tcRes);
++                    drawBuffers.rdpTilesBuffer.get(), drawBuffers.gpuTilesBuffer.get(), tcRes, p.fbStorage->colorTarget);
 +            }
 +
              for (uint32_t d = 0; (d < proj.gameCallCount) && (globalCallIndex < p.maxGameCall); d++) {
@@ -23691,10 +23738,10 @@ index 0000000..29fb84f
 +};
 diff --git a/src/render/rt64_wcw_raytracer.cpp b/src/render/rt64_wcw_raytracer.cpp
 new file mode 100644
-index 0000000..06e5482
+index 0000000..efb1670
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.cpp
-@@ -0,0 +1,1396 @@
+@@ -0,0 +1,1478 @@
 +//
 +// RT64
 +//
@@ -24281,8 +24328,9 @@ index 0000000..06e5482
 +    void WcwRaytracer::beginScene(const hlslpp::float4x4 &view, const hlslpp::float4x4 &proj, const RenderViewport &viewport,
 +        const RenderBuffer *worldPosBuffer, uint64_t worldPosSize, const RenderBuffer *worldNormBuffer, uint64_t worldNormSize,
 +        const RenderBuffer *faceIndicesBuffer, uint64_t faceIndicesSize,
-+        const RenderBuffer *rdpTilesBuffer, const RenderBuffer *gpuTilesBuffer, const RenderBuffer *texCoordBuffer)
++        const RenderBuffer *rdpTilesBuffer, const RenderBuffer *gpuTilesBuffer, const RenderBuffer *texCoordBuffer, RenderTarget *colorTarget)
 +    {
++        sceneTarget = colorTarget;
 +        boundsViewProj = hlslpp::mul(view, proj);
 +        boundsMin[0] = boundsMin[1] = FLT_MAX;
 +        boundsMax[0] = boundsMax[1] = -FLT_MAX;
@@ -24416,19 +24464,78 @@ index 0000000..06e5482
 +        }
 +    }
 +
++    float WcwRaytracer::targetTraceScale(const RenderTarget *target) const {
++        // The level's trace resolution (WcwLogic::rtPreset). WCW_RT_MAX_LINES overrides the line cap, WCW_RT_SCALE
++        // the whole scale.
++        WcwLogic::RtPreset qualityPreset = WcwLogic::rtPreset(userQuality());
++        qualityPreset.maxLines = envFloat(getenv("WCW_RT_MAX_LINES"), qualityPreset.maxLines);
++        return std::clamp(envFloat(getenv("WCW_RT_SCALE"), WcwLogic::rtTraceScale(qualityPreset, target->height, target->downsampleMultiplier)), 0.1f, 1.0f);
++    }
++
++    bool WcwRaytracer::traceTexturesChange(const RenderTarget *target, const Slot &slot) const {
++        // The tests recordTrace makes before it composites (WcwLogic::traceTexturesChange).
++        WcwLogic::TraceTextures textures;
++        textures.active = wasActive;
++        textures.haveTextures = (currentTexture != nullptr);
++        textures.outputWidth = outputWidth;
++        textures.outputHeight = outputHeight;
++        textures.traceScale = traceScale;
++        textures.haveHistory = (slot.history != nullptr);
++        textures.historyWidth = slot.historyWidth;
++        textures.historyHeight = slot.historyHeight;
++        textures.historyMode = slot.historyMode;
++        return WcwLogic::traceTexturesChange(textures, target->width, target->height, targetTraceScale(target), mode);
++    }
++
 +    void WcwRaytracer::recordBuild(RenderWorker *worker) {
 +        structuresBuilt = false;
 +        if (!sceneActive || meshes.empty()) {
 +            return;
 +        }
 +
-+        WcwGpuScope wcwBuildScope(worker->commandList.get(), WcwPerf::GpuPass::RtBuild);
-+
 +        currentSlot = chooseSlot();
 +        Slot &slot = slots[currentSlot];
 +        if (!slot.valid) {
 +            slot.historyValid = false;
 +        }
++
++        // [wcw rt] Whether this pass traces is decided here (recordTrace did it after the build), so a pass that
++        // composites its slot's latest trace doesn't build structures it won't read (WcwLogic::buildForPass,
++        // aki-roadmap#36). WCW_RT_TRACE_GENERATED=1 traces every displayed frame (the old cost).
++        static const bool traceGenerated = getenv("WCW_RT_TRACE_GENERATED") != nullptr;
++        passTriangleCounts.clear();
++        for (const RenderBottomLevelASMesh &mesh : meshes) {
++            passTriangleCounts.push_back(mesh.indexCount / 3);
++        }
++
++        passSignatureValue = WcwLogic::passSignature(passTriangleCounts.data(), passTriangleCounts.size());
++        // Outside darkness: which pass darkens the misses is decided for every pass, traced or not, so each
++        // target gets exactly one (WcwLogic::MissDarkening).
++        passDarkens = (sceneTarget != nullptr) && missDarkening.darkenThisPass(sceneTarget, lastPresentId, meshes.size());
++        passHaveTrace = WcwLogic::reusableTrace(slot.tracedPresent != UINT64_MAX, slot.tracedSignature, passSignatureValue, slot.tracedDarkened, passDarkens);
++        const bool texturesChange = (sceneTarget == nullptr) || traceTexturesChange(sceneTarget, slot);
++        passReuses = !WcwLogic::buildForPass(traceGenerated, generatedRender, passHaveTrace, slot.reusesSinceTrace, texturesChange);
++        if (passReuses) {
++            // Still a fresh shadow caster for the other passes' TLAS (its BLAS holds the real frame's geometry), and
++            // in use: chooseSlot evicts the slot built longest ago.
++            slot.builtFrame = frameCounter;
++            slot.builtWorkload = workloadCounter;
++            structuresBuilt = true;
++            buildsSkipped++;
++            if (timingPool != nullptr) {
++                // The composite still stamps this workload's queries. Nothing was built or traced: no build counts.
++                worker->commandList->resetQueryPool(timingPool.get(), 0, StampCount);
++                timingWritten = 0;
++                timingMeshes = 0;
++                timingTriangles = 0;
++                timingAlphaMeshes = 0;
++                timingPixels = 0;
++            }
++
++            return;
++        }
++
++        WcwGpuScope wcwBuildScope(worker->commandList.get(), WcwPerf::GpuPass::RtBuild);
 +
 +        // Bottom level: every gathered draw call is one geometry over the shared world position buffer.
 +        device->setBottomLevelASBuildInfo(blasInfo, meshes.data(), uint32_t(meshes.size()), true, false);
@@ -24555,7 +24662,7 @@ index 0000000..06e5482
 +        // WCW_RT_SCALE the whole scale.
 +        WcwLogic::RtPreset qualityPreset = WcwLogic::rtPreset(quality);
 +        qualityPreset.maxLines = envFloat(getenv("WCW_RT_MAX_LINES"), qualityPreset.maxLines);
-+        const float frameScale = std::clamp(envFloat(getenv("WCW_RT_SCALE"), WcwLogic::rtTraceScale(qualityPreset, colorTarget->height, colorTarget->downsampleMultiplier)), 0.1f, 1.0f);
++        const float frameScale = targetTraceScale(colorTarget);
 +        const uint32_t presetSamples = qualityPreset.samplesPerLight;
 +
 +        // Re-enabled after being off: the histories are stale.
@@ -24641,20 +24748,29 @@ index 0000000..06e5482
 +            compositePipeline = device->createGraphicsPipeline(pipelineDesc);
 +        }
 +
-+        // Frame interpolation: a generated frame composites this pass's latest trace instead of tracing again
-+        // (WcwLogic::traceRender). WCW_RT_TRACE_GENERATED=1 traces every displayed frame (the old cost).
++        // Frame interpolation: a generated frame composites this pass's latest trace instead of tracing again. The
++        // decision (and the pass's signature and darkening choice) was made in recordBuild, which skipped the build
++        // for it (WcwLogic::buildForPass).
 +        static const bool traceGenerated = getenv("WCW_RT_TRACE_GENERATED") != nullptr;
-+        passTriangleCounts.clear();
-+        for (const RenderBottomLevelASMesh &mesh : meshes) {
-+            passTriangleCounts.push_back(mesh.indexCount / 3);
++        const uint64_t signature = passSignatureValue;
++        const bool darkenMisses = passDarkens;
++        if (colorTarget != sceneTarget) {
++            static bool logged = false;
++            if (!logged) {
++                logged = true;
++                fprintf(stderr, "[wcw rt] the traced pass's target differs from the gathered scene's (%p, %p)\n", (void *)colorTarget, (void *)sceneTarget);
++            }
 +        }
 +
-+        const uint64_t signature = WcwLogic::passSignature(passTriangleCounts.data(), passTriangleCounts.size());
-+        // Outside darkness: which pass darkens the misses is decided for every pass, traced or not, so each
-+        // target gets exactly one (WcwLogic::MissDarkening).
-+        const bool darkenMisses = missDarkening.darkenThisPass(colorTarget, lastPresentId, meshes.size());
-+        const bool haveTrace = WcwLogic::reusableTrace(slot.tracedPresent != UINT64_MAX, slot.tracedSignature, signature, slot.tracedDarkened, darkenMisses);
-+        if (!traceGenerated && !WcwLogic::traceRender(generatedRender, haveTrace, slot.reusesSinceTrace)) {
++        if (passReuses) {
++            // recordBuild decided to reuse, but the trace may have been dropped since (textures or history made
++            // again, or the history's mode changed: tracedPresent reset), or the pass draws into another target
++            // than the gathered scene's. The history isn't this pass's then: composite nothing this frame.
++            if (texturesChanged || (slot.tracedPresent == UINT64_MAX) || (colorTarget != sceneTarget)) {
++                traceRectEmpty = true;
++                return;
++            }
++
 +            memcpy(traceRect, slot.tracedRect, sizeof(traceRect));
 +            traceRectEmpty = (traceRect[2] <= traceRect[0]) || (traceRect[3] <= traceRect[1]);
 +            compositeSet->setTexture(0, slot.history.get(), RenderTextureLayout::SHADER_READ);
@@ -25052,6 +25168,9 @@ index 0000000..06e5482
 +        static double maxTotal = 0.0;
 +        static uint64_t triangleSum = 0, meshSum = 0, alphaSum = 0, pixelSum = 0, fullScreenSum = 0;
 +        static uint32_t count = 0;
++        // Workloads that built (reusing passes skip the build, aki-roadmap#36): the build, its span to the composite
++        // and the scene sizes are averaged over these.
++        static uint32_t builtCount = 0;
 +        timingPool->queryResults();
 +        const uint64_t *t = timingPool->getResults();
 +        auto span = [&](uint32_t a, uint32_t b) {
@@ -25064,39 +25183,49 @@ index 0000000..06e5482
 +        const double resolve = span(StampTraceEnd, StampResolveEnd);
 +        const double composite = span(StampCompositeBegin, StampCompositeEnd);
 +        const double total = span(StampBuildBegin, StampCompositeEnd);
-+        sums[0] += build;
++        const bool built = (timingWritten & (1u << StampBuildBegin)) != 0;
++        if (built) {
++            sums[0] += build;
++            sums[4] += total;
++            maxTotal = std::max(maxTotal, total);
++            triangleSum += timingTriangles;
++            meshSum += timingMeshes;
++            alphaSum += timingAlphaMeshes;
++            builtCount++;
++        }
++
 +        sums[1] += trace;
 +        sums[2] += resolve;
 +        sums[3] += composite;
-+        sums[4] += total;
-+        maxTotal = std::max(maxTotal, total);
-+        triangleSum += timingTriangles;
-+        meshSum += timingMeshes;
-+        alphaSum += timingAlphaMeshes;
 +        pixelSum += timingPixels;
 +        fullScreenSum += timingFullScreen ? 1 : 0;
 +        timingWritten = 0;
 +        if (++count == 300) {
-+            fprintf(stderr, "[wcw rt gpu] per traced workload avg: build=%.3f trace=%.3f resolve=%.3f composite=%.3f ms, build->composite span=%.3f (max %.3f) ms; %llu meshes (%llu alpha-tested), %llu tris, %llu trace px of %u lines, %llu full-screen, %u traces reused, %u generated frames reused a trace, traced %u/%u/%u/%u (none/other pass/darkening/stale) (300 workloads)\n",
-+                sums[0] / count, sums[1] / count, sums[2] / count, sums[3] / count, sums[4] / count, maxTotal,
-+                (unsigned long long)(meshSum / count), (unsigned long long)(alphaSum / count), (unsigned long long)(triangleSum / count), (unsigned long long)(pixelSum / count), timingTraceHeight, (unsigned long long)fullScreenSum, reusedTraces, generatedReuses,
++            const uint32_t builtDiv = std::max(builtCount, 1u);
++            fprintf(stderr, "[wcw rt gpu] per built workload (%u of 300 built, %u builds skipped): build=%.3f ms, build->composite span=%.3f (max %.3f) ms; %llu meshes (%llu alpha-tested), %llu tris | per workload avg: trace=%.3f resolve=%.3f composite=%.3f ms, %llu trace px of %u lines, %llu full-screen, %u traces reused, %u generated frames reused a trace, traced %u/%u/%u/%u (none/other pass/darkening/stale) (300 workloads)\n",
++                builtCount, buildsSkipped, sums[0] / builtDiv, sums[4] / builtDiv, maxTotal,
++                (unsigned long long)(meshSum / builtDiv), (unsigned long long)(alphaSum / builtDiv), (unsigned long long)(triangleSum / builtDiv),
++                sums[1] / count, sums[2] / count, sums[3] / count,
++                (unsigned long long)(pixelSum / count), timingTraceHeight, (unsigned long long)fullScreenSum, reusedTraces, generatedReuses,
 +                generatedTraces[0], generatedTraces[1], generatedTraces[2], generatedTraces[3]);
 +            memset(generatedTraces, 0, sizeof(generatedTraces));
 +            reusedTraces = 0;
 +            generatedReuses = 0;
++            buildsSkipped = 0;
 +            memset(sums, 0, sizeof(sums));
 +            maxTotal = 0.0;
 +            triangleSum = meshSum = alphaSum = pixelSum = fullScreenSum = 0;
 +            count = 0;
++            builtCount = 0;
 +        }
 +    }
 +};
 diff --git a/src/render/rt64_wcw_raytracer.h b/src/render/rt64_wcw_raytracer.h
 new file mode 100644
-index 0000000..b638f0d
+index 0000000..6c19f30
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.h
-@@ -0,0 +1,321 @@
+@@ -0,0 +1,336 @@
 +//
 +// RT64
 +//
@@ -25270,6 +25399,20 @@ index 0000000..b638f0d
 +        // The workload being recorded renders a frame generated by interpolation (not the game frame's real one).
 +        bool generatedRender = false;
 +        std::vector<uint32_t> passTriangleCounts;
++        // This pass's trace decision, made in recordBuild so a pass that composites its slot's latest trace doesn't
++        // build the structures (WcwLogic::buildForPass, aki-roadmap#36); recordTrace uses it.
++        RenderTarget *sceneTarget = nullptr;
++        uint64_t passSignatureValue = 0;
++        bool passDarkens = false;
++        bool passHaveTrace = false;
++        bool passReuses = false;
++        // Builds skipped for reusing passes, for WCW_GPU_LOG.
++        uint32_t buildsSkipped = 0;
++        // The trace scale for a target: the quality level's (WcwLogic::rtTraceScale) or WCW_RT_SCALE.
++        float targetTraceScale(const RenderTarget *target) const;
++        // Whether recordTrace makes the trace textures or the slot's history again for this target, dropping the
++        // slot's trace.
++        bool traceTexturesChange(const RenderTarget *target, const Slot &slot) const;
 +        std::unique_ptr<RenderDescriptorSet> resolveSet;
 +        std::unique_ptr<RenderPipelineLayout> resolveLayout;
 +        std::unique_ptr<RenderPipeline> resolvePipeline;
@@ -25396,10 +25539,11 @@ index 0000000..b638f0d
 +        static bool splitScreen();
 +        // The Lighting editor's split toggle (-1: WCW_RT_SPLIT decides).
 +        static void setSplitScreenOverride(int split);
++        // colorTarget: the target the traced pass draws into (recordBuild decides there whether the pass traces).
 +        void beginScene(const hlslpp::float4x4 &view, const hlslpp::float4x4 &proj, const RenderViewport &viewport,
 +            const RenderBuffer *worldPosBuffer, uint64_t worldPosSize, const RenderBuffer *worldNormBuffer, uint64_t worldNormSize,
 +            const RenderBuffer *faceIndicesBuffer, uint64_t faceIndicesSize,
-+            const RenderBuffer *rdpTilesBuffer, const RenderBuffer *gpuTilesBuffer, const RenderBuffer *texCoordBuffer);
++            const RenderBuffer *rdpTilesBuffer, const RenderBuffer *gpuTilesBuffer, const RenderBuffer *texCoordBuffer, RenderTarget *colorTarget);
 +        // culled: the draw has N64 face culling on, so primary rays skip its back faces.
 +        // character: a wrestler draw, shadowed with the weaker character strength.
 +        // lit: the draw uses N64 lighting (G_LIGHTING), so its vertices carry normals the AO can interpolate.
@@ -26757,10 +26901,10 @@ index 42cd7b6..728c967 100644
  target_link_libraries(texture_packer PRIVATE libzstd_static)
 diff --git a/tests/wcw/rt64_wcw_logic_tests.cpp b/tests/wcw/rt64_wcw_logic_tests.cpp
 new file mode 100644
-index 0000000..8b61929
+index 0000000..fbbb0ef
 --- /dev/null
 +++ b/tests/wcw/rt64_wcw_logic_tests.cpp
-@@ -0,0 +1,1860 @@
+@@ -0,0 +1,1936 @@
 +//
 +// RT64
 +//
@@ -27172,6 +27316,82 @@ index 0000000..8b61929
 +    CHECK(!traceRender(true, true, 2));
 +    CHECK(traceRender(true, true, MaxGeneratedReuse));
 +    CHECK(traceRender(true, true, MaxGeneratedReuse + 5));
++}
++
++TEST_CASE("acceleration structures: a generated frame that reuses its pass's trace doesn't build them (#36)") {
++    // The reusing generated frame: no build (every generated frame built BLAS + TLAS for nothing).
++    CHECK(!buildForPass(false, true, true, 0, false));
++    CHECK(!buildForPass(false, true, true, MaxGeneratedReuse - 1, false));
++    // Every frame that traces builds: the real frame, a pass with no trace yet, and the reuse limit.
++    CHECK(buildForPass(false, false, true, 0, false));
++    CHECK(buildForPass(false, true, false, 0, false));
++    CHECK(buildForPass(false, true, true, MaxGeneratedReuse, false));
++    // The build follows the trace decision exactly when nothing else forces one.
++    for (int generated = 0; generated < 2; generated++) {
++        for (int haveTrace = 0; haveTrace < 2; haveTrace++) {
++            for (uint32_t reuses = 0; reuses <= MaxGeneratedReuse + 1; reuses++) {
++                CHECK(buildForPass(false, generated != 0, haveTrace != 0, reuses, false) == traceRender(generated != 0, haveTrace != 0, reuses));
++            }
++        }
++    }
++}
++
++TEST_CASE("acceleration structures: a pass still builds when its trace can't be reused this render (#36)") {
++    // WCW_RT_TRACE_GENERATED traces every displayed frame, so every frame builds.
++    CHECK(buildForPass(true, true, true, 0, false));
++    // The trace textures are made again (target size or trace scale changed): the history is dropped and the pass
++    // traces, so it needs the structures even on a reusing generated frame.
++    CHECK(buildForPass(false, true, true, 0, true));
++}
++
++// WCW_RT_MODE_SHADOW and WCW_RT_MODE_AO (src/shared/rt64_wcw_rt.h, not included here): resolved shadows, and AO.
++static constexpr uint32_t ShadowMode = 2;
++static constexpr uint32_t AoMode = 7;
++
++// The trace textures as recordTrace left them after tracing a 1920x1080 target at half scale in shadow mode.
++static TraceTextures tracedAt1080p() {
++    TraceTextures t;
++    t.active = true;
++    t.haveTextures = true;
++    t.outputWidth = 1920;
++    t.outputHeight = 1080;
++    t.traceScale = 0.5f;
++    t.haveHistory = true;
++    t.historyWidth = 960;
++    t.historyHeight = 540;
++    t.historyMode = ShadowMode;
++    return t;
++}
++
++TEST_CASE("acceleration structures: the latest trace stays usable while nothing it was made with changed (#36)") {
++    CHECK(!traceTexturesChange(tracedAt1080p(), 1920, 1080, 0.5f, ShadowMode));
++}
++
++TEST_CASE("acceleration structures: anything that drops the latest trace makes the pass build and trace (#36 review)") {
++    const TraceTextures t = tracedAt1080p();
++    // Another target size or trace scale (an RT quality change between recordBuild and recordTrace).
++    CHECK(traceTexturesChange(t, 2560, 1080, 0.5f, ShadowMode));
++    CHECK(traceTexturesChange(t, 1920, 1440, 0.5f, ShadowMode));
++    CHECK(traceTexturesChange(t, 1920, 1080, 0.75f, ShadowMode));
++    // Another mode: the Lighting editor's debug views write a color, not resolved shadows. A reusing frame
++    // composited the other mode's history for a frame.
++    CHECK(traceTexturesChange(t, 1920, 1080, 0.5f, AoMode));
++    // No textures or history yet, a history made at another trace size, or ray tracing just turned back on.
++    TraceTextures noTextures = t;
++    noTextures.haveTextures = false;
++    CHECK(traceTexturesChange(noTextures, 1920, 1080, 0.5f, ShadowMode));
++    TraceTextures noHistory = t;
++    noHistory.haveHistory = false;
++    CHECK(traceTexturesChange(noHistory, 1920, 1080, 0.5f, ShadowMode));
++    TraceTextures smallHistory = t;
++    smallHistory.historyHeight = 480;
++    CHECK(traceTexturesChange(smallHistory, 1920, 1080, 0.5f, ShadowMode));
++    TraceTextures narrowHistory = t;
++    narrowHistory.historyWidth = 720;
++    CHECK(traceTexturesChange(narrowHistory, 1920, 1080, 0.5f, ShadowMode));
++    TraceTextures reenabled = t;
++    reenabled.active = false;
++    CHECK(traceTexturesChange(reenabled, 1920, 1080, 0.5f, ShadowMode));
 +}
 +
 +TEST_CASE("generated frames: two passes sharing a slot don't reuse each other's trace (generated frames ~5% darker)") {
