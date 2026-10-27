@@ -563,10 +563,10 @@ index 9f331c9..bd05a36 100644
      void to_json(json &j, const ReplacementDatabase &db) {
 diff --git a/src/common/rt64_wcw_logic.cpp b/src/common/rt64_wcw_logic.cpp
 new file mode 100644
-index 0000000..2c7ead6
+index 0000000..191ba7b
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.cpp
-@@ -0,0 +1,860 @@
+@@ -0,0 +1,861 @@
 +//
 +// RT64
 +//
@@ -975,7 +975,8 @@ index 0000000..2c7ead6
 +            return capOverride;
 +        }
 +
-+        return std::max(2u, (targetRate + viOriginalRate / 2) / viOriginalRate);
++        const uint32_t gameRate = std::max(viOriginalRate, MinInterpolatedGameRate);
++        return std::max(2u, (targetRate + gameRate / 2) / gameRate);
 +    }
 +
 +    void InterpolationTicks::reset() {
@@ -1429,10 +1430,10 @@ index 0000000..2c7ead6
 +};
 diff --git a/src/common/rt64_wcw_logic.h b/src/common/rt64_wcw_logic.h
 new file mode 100644
-index 0000000..3b644a5
+index 0000000..7d19d60
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.h
-@@ -0,0 +1,762 @@
+@@ -0,0 +1,771 @@
 +//
 +// RT64
 +//
@@ -1774,8 +1775,17 @@ index 0000000..3b644a5
 +
 +    // Frame interpolation
 +
++    // The slowest game rate frame interpolation spreads a game frame over (the AKI games run at 30 or 20 fps).
++    // The measured rate dips below it on slow frames (ray tracing), and each displayed frame beyond the second needs
++    // a generated-frame target in each of the three rotating target sets, kept for the rest of the run: No Mercy at
++    // 60 fps with RT grew them to 3 or 4 targets of 58.5 MB each depending on timing, so GPU memory differed by up to
++    // 0.5 GB between identical runs (aki-roadmap#97). A slower game frame shows at most this many frames' worth;
++    // the earliest generated frames of a catch-up are skipped instead (InterpolationTicks::beginGameFrame).
++    constexpr uint32_t MinInterpolatedGameRate = 20;
++
 +    // Displayed frames per game frame: display rate / game rate, rounded, at least 2 (2 for a 30 fps game at 60,
-+    // 4 at 120). capOverride (WCW_HFR_CAP) replaces it when non-zero.
++    // 4 at 120), the game rate taken as at least MinInterpolatedGameRate (at most 3 at 60, 6 at 120).
++    // capOverride (WCW_HFR_CAP) replaces it when non-zero.
 +    uint32_t framesPerGameFrame(uint32_t targetRate, uint32_t viOriginalRate, uint32_t capOverride);
 +
 +    struct FrameWeights {
@@ -26901,10 +26911,10 @@ index 42cd7b6..728c967 100644
  target_link_libraries(texture_packer PRIVATE libzstd_static)
 diff --git a/tests/wcw/rt64_wcw_logic_tests.cpp b/tests/wcw/rt64_wcw_logic_tests.cpp
 new file mode 100644
-index 0000000..fbbb0ef
+index 0000000..6fbe2ce
 --- /dev/null
 +++ b/tests/wcw/rt64_wcw_logic_tests.cpp
-@@ -0,0 +1,1936 @@
+@@ -0,0 +1,1974 @@
 +//
 +// RT64
 +//
@@ -28105,6 +28115,44 @@ index 0000000..fbbb0ef
 +    CHECK_EQ(framesPerGameFrame(144, 30, 0), 5u);
 +    CHECK_EQ(framesPerGameFrame(30, 30, 0), 2u);
 +    CHECK_EQ(framesPerGameFrame(120, 30, 3), 3u);
++}
++
++TEST_CASE("interpolation: a game frame slower than 20 fps doesn't add generated-frame targets (#97)") {
++    // 20 fps (the slowest normal AKI rate) keeps its frames.
++    CHECK_EQ(framesPerGameFrame(60, 20, 0), 3u);
++    CHECK_EQ(framesPerGameFrame(120, 20, 0), 6u);
++    // Slower measured rates (slow ray-traced frames) are capped like 20 fps: they used to need 4-5 frames at 60 fps,
++    // growing every generated-frame target set by one or two 58.5 MB targets for the rest of the run.
++    CHECK_EQ(framesPerGameFrame(60, 15, 0), 3u);
++    CHECK_EQ(framesPerGameFrame(60, 12, 0), 3u);
++    CHECK_EQ(framesPerGameFrame(120, 10, 0), 6u);
++    // Just under 20 fps (the old code gave 4 at 60), and display rates that aren't a multiple of 20.
++    CHECK_EQ(framesPerGameFrame(60, 17, 0), 3u);
++    CHECK_EQ(framesPerGameFrame(144, 15, 0), 7u);
++    CHECK_EQ(framesPerGameFrame(165, 15, 0), 8u);
++    // The debug override still wins.
++    CHECK_EQ(framesPerGameFrame(60, 15, 5), 5u);
++}
++
++TEST_CASE("interpolation: a capped slow game frame skips its earliest generated frames and ends on the real one (#97)") {
++    // 60 fps with the game at 15 fps: 4 frames are due per game frame, 3 are shown; the weights stay in order and the
++    // last is the real frame, and the ticks stay within their bound.
++    InterpolationTicks ticks;
++    for (int gameFrame = 0; gameFrame < 50; gameFrame++) {
++        const uint32_t frames = ticks.beginGameFrame(60, 15, 0);
++        CHECK_EQ(frames, 3u);
++        float lastCur = -1.0f;
++        FrameWeights w;
++        for (uint32_t i = 0; i < frames; i++) {
++            w = ticks.advance(60, 15);
++            CHECK(w.cur > lastCur);
++            lastCur = w.cur;
++        }
++
++        CHECK_NEAR(w.cur, 1.0f, 1e-6);
++        CHECK(ticks.logical >= ticks.display);
++        CHECK((ticks.logical - ticks.display) <= int64_t(60 + 15));
++    }
 +}
 +
 +static void checkIntegerMultipleWeights(uint32_t targetRate, uint32_t viRate) {
