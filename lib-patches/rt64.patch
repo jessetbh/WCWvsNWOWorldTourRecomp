@@ -10,7 +10,7 @@ index 21df8c2..5635c09 100644
 +	url = https://github.com/jessetbh/plume.git
 +	branch = wcw
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 2fb01e5..f31acab 100644
+index 2fb01e5..8dac7ad 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -21,8 +21,9 @@ function(preprocess INFILE OUTFILE OPTIONS)
@@ -79,18 +79,19 @@ index 2fb01e5..f31acab 100644
      add_custom_command(OUTPUT ${OUTNAME}.metal
              COMMAND spirv_cross_msl ${OUTNAME}.spv ${OUTNAME}.metal
              DEPENDS ${OUTNAME}.spv spirv_cross_msl)
-@@ -319,6 +331,10 @@ set (SOURCES
+@@ -319,6 +331,11 @@ set (SOURCES
      "${PROJECT_SOURCE_DIR}/src/common/rt64_timer.cpp"
      "${PROJECT_SOURCE_DIR}/src/common/rt64_user_configuration.cpp"
      "${PROJECT_SOURCE_DIR}/src/common/rt64_user_paths.cpp"
 +    "${PROJECT_SOURCE_DIR}/src/common/rt64_wcw_logic.cpp"
++    "${PROJECT_SOURCE_DIR}/src/common/rt64_wcw_dd.cpp"
 +    "${PROJECT_SOURCE_DIR}/src/common/rt64_wcw_perf.cpp"
 +    "${PROJECT_SOURCE_DIR}/src/common/rt64_wcw_texdump.cpp"
 +    "${PROJECT_SOURCE_DIR}/src/common/rt64_wcw_venues.cpp"
  
      "${PROJECT_SOURCE_DIR}/src/gbi/rt64_gbi.cpp"
      "${PROJECT_SOURCE_DIR}/src/gbi/rt64_gbi_f3d.cpp"
-@@ -386,6 +402,11 @@ set (SOURCES
+@@ -386,6 +403,11 @@ set (SOURCES
      "${PROJECT_SOURCE_DIR}/src/render/rt64_transform_processor.cpp"
      "${PROJECT_SOURCE_DIR}/src/render/rt64_upscaler.cpp"
      "${PROJECT_SOURCE_DIR}/src/render/rt64_vertex_processor.cpp"
@@ -102,7 +103,7 @@ index 2fb01e5..f31acab 100644
      "${PROJECT_SOURCE_DIR}/src/render/rt64_vi_renderer.cpp"
  
      "${PROJECT_SOURCE_DIR}/src/preset/rt64_preset.cpp"
-@@ -442,6 +463,38 @@ target_link_libraries(rt64 nfd)
+@@ -442,6 +464,39 @@ target_link_libraries(rt64 nfd)
  target_link_libraries(rt64 libzstd_static)
  target_link_libraries(rt64 plume)
  
@@ -117,6 +118,7 @@ index 2fb01e5..f31acab 100644
 +        "${PROJECT_SOURCE_DIR}/tests/wcw/rt64_wcw_perf_tests.cpp"
 +        "${PROJECT_SOURCE_DIR}/tests/wcw/rt64_wcw_texdump_tests.cpp"
 +        "${PROJECT_SOURCE_DIR}/tests/wcw/rt64_wcw_packfs_tests.cpp"
++        "${PROJECT_SOURCE_DIR}/tests/wcw/rt64_wcw_dd_tests.cpp"
 +        "${PROJECT_SOURCE_DIR}/src/common/rt64_wcw_logic.cpp"
 +        "${PROJECT_SOURCE_DIR}/src/common/rt64_wcw_perf.cpp"
 +        "${PROJECT_SOURCE_DIR}/src/common/rt64_wcw_texdump.cpp"
@@ -141,7 +143,15 @@ index 2fb01e5..f31acab 100644
  # Add tools.
  add_subdirectory(src/tools/texture_hasher)
  add_subdirectory(src/tools/texture_packer)
-@@ -527,6 +580,12 @@ build_pixel_shader(  rt64 "src/shaders/PostBlendDitherNoisePS.hlsl" "src/shaders
+@@ -468,6 +523,7 @@ if (WIN32)
+         D3D12
+         DXGI
+         Shcore.lib
++        Ws2_32
+         ${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/x64/dxcompiler.lib)
+ 
+     target_include_directories(rt64 PRIVATE ${zstd_SOURCE_DIR}/lib)
+@@ -527,6 +583,12 @@ build_pixel_shader(  rt64 "src/shaders/PostBlendDitherNoisePS.hlsl" "src/shaders
  build_compute_shader(rt64 "src/shaders/RSPModifyCS.hlsl")
  build_compute_shader(rt64 "src/shaders/RSPProcessCS.hlsl")
  build_compute_shader(rt64 "src/shaders/RSPWorldCS.hlsl")
@@ -154,7 +164,7 @@ index 2fb01e5..f31acab 100644
  build_compute_shader(rt64 "src/shaders/RSPSmoothNormalCS.hlsl")
  build_compute_shader(rt64 "src/shaders/RSPVertexTestZCS.hlsl")
  build_compute_shader(rt64 "src/shaders/RSPVertexTestZCS.hlsl" "src/shaders/RSPVertexTestZCSMS.hlsl" "-D MULTISAMPLING")
-@@ -545,6 +604,8 @@ build_pixel_shader(  rt64 "src/shaders/TextureResolvePS.hlsl" "src/shaders/Textu
+@@ -545,6 +607,8 @@ build_pixel_shader(  rt64 "src/shaders/TextureResolvePS.hlsl" "src/shaders/Textu
  build_pixel_shader(  rt64 "src/shaders/TextureResolvePS.hlsl" "src/shaders/TextureResolveSamples8XPS.hlsl" "-D SAMPLES_8X")
  build_pixel_shader(  rt64 "src/shaders/VideoInterfacePS.hlsl" "src/shaders/VideoInterfacePSRegular.hlsl")
  build_pixel_shader(  rt64 "src/shaders/VideoInterfacePS.hlsl" "src/shaders/VideoInterfacePSPixel.hlsl" "-D PIXEL_ANTIALIASING")
@@ -561,12 +571,431 @@ index 9f331c9..bd05a36 100644
      }
  
      void to_json(json &j, const ReplacementDatabase &db) {
+diff --git a/src/common/rt64_wcw_dd.cpp b/src/common/rt64_wcw_dd.cpp
+new file mode 100644
+index 0000000..8121f61
+--- /dev/null
++++ b/src/common/rt64_wcw_dd.cpp
+@@ -0,0 +1,371 @@
++//
++// RT64
++//
++
++#include "rt64_wcw_dd.h"
++
++#include <atomic>
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++#if defined(_WIN32)
++#   include <winsock2.h>
++#   include <ws2tcpip.h>
++#   include <windows.h>
++#   include <psapi.h>
++#   include <dxgi1_4.h>
++#else
++#   include <arpa/inet.h>
++#   include <netinet/in.h>
++#   include <sys/socket.h>
++#   include <unistd.h>
++#endif
++
++#include "common/rt64_plume.h"
++
++namespace RT64::WcwDd {
++    namespace {
++        double nowMs() {
++            return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count();
++        }
++
++        struct Sink {
++            std::mutex mutex;
++            WcwLogic::DdFrameWindow window;
++            WcwLogic::DdSession session;
++            std::string game;
++            std::string aggregationKey;
++            bool echo = false;
++            uint16_t port = 8125;
++
++            std::mutex socketMutex;
++#       if defined(_WIN32)
++            SOCKET socket = INVALID_SOCKET;
++            std::vector<IDXGIAdapter3 *> adapters;
++#       else
++            int socket = -1;
++#       endif
++
++            std::once_flag startOnce;
++            std::thread thread;
++            std::mutex stopMutex;
++            std::condition_variable stopCondition;
++            bool stop = false;
++            bool deviceLostSent = false;
++        };
++
++        // Never destroyed: the renderer threads may still note presents while the process exits. atexit stops the
++        // sender thread and sends the last window.
++        Sink &sink() {
++            static Sink *s = new Sink();
++            return *s;
++        }
++
++        std::string exeName() {
++#       if defined(_WIN32)
++            char path[MAX_PATH] = {};
++            const DWORD n = GetModuleFileNameA(nullptr, path, MAX_PATH);
++            return std::string(path, n);
++#       else
++            char path[4096] = {};
++            const ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
++            return (n > 0) ? std::string(path, size_t(n)) : std::string("unknown");
++#       endif
++        }
++
++        unsigned long processId() {
++#       if defined(_WIN32)
++            return GetCurrentProcessId();
++#       else
++            return (unsigned long)getpid();
++#       endif
++        }
++
++        void openSocket(Sink &s) {
++#       if defined(_WIN32)
++            WSADATA wsa;
++            if (WSAStartup(MAKEWORD(2, 2), &wsa) == 0) {
++                s.socket = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++            }
++#       else
++            s.socket = ::socket(AF_INET, SOCK_DGRAM, 0);
++#       endif
++        }
++
++        // Not connect()ed: on Windows a connected UDP socket fails later sends after an ICMP port unreachable (no
++        // Agent listening), as ddmetrics.ps1 notes.
++        void sendLines(Sink &s, const std::vector<std::string> &lines) {
++            const std::vector<std::string> packets = WcwLogic::ddPackets(lines);
++            std::scoped_lock lock(s.socketMutex);
++            sockaddr_in to = {};
++            to.sin_family = AF_INET;
++            to.sin_port = htons(s.port);
++            to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++            for (const std::string &p : packets) {
++                if (s.echo) {
++                    fprintf(stderr, "[wcw dd] %s\n", p.c_str());
++                }
++
++#           if defined(_WIN32)
++                if (s.socket != INVALID_SOCKET) {
++                    sendto(s.socket, p.data(), int(p.size()), 0, reinterpret_cast<const sockaddr *>(&to), sizeof(to));
++                }
++#           else
++                if (s.socket >= 0) {
++                    sendto(s.socket, p.data(), p.size(), 0, reinterpret_cast<const sockaddr *>(&to), sizeof(to));
++                }
++#           endif
++            }
++        }
++
++        void openAdapters(Sink &s) {
++#       if defined(_WIN32)
++            IDXGIFactory1 *factory = nullptr;
++            if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void **>(&factory)))) {
++                return;
++            }
++
++            IDXGIAdapter1 *adapter = nullptr;
++            for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; i++) {
++                DXGI_ADAPTER_DESC1 desc = {};
++                IDXGIAdapter3 *adapter3 = nullptr;
++                if (SUCCEEDED(adapter->GetDesc1(&desc)) && ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0) &&
++                    SUCCEEDED(adapter->QueryInterface(__uuidof(IDXGIAdapter3), reinterpret_cast<void **>(&adapter3))))
++                {
++                    s.adapters.push_back(adapter3);
++                }
++
++                adapter->Release();
++            }
++
++            factory->Release();
++#       endif
++        }
++
++        WcwLogic::DdProcessSample sampleProcess(Sink &s) {
++            WcwLogic::DdProcessSample p;
++#       if defined(_WIN32)
++            PROCESS_MEMORY_COUNTERS_EX mem = {};
++            mem.cb = sizeof(mem);
++            DWORD handles = 0;
++            if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&mem), sizeof(mem)) &&
++                GetProcessHandleCount(GetCurrentProcess(), &handles))
++            {
++                p.has = true;
++                p.privateMb = double(mem.PrivateUsage) / (1024.0 * 1024.0);
++                p.workingSetMb = double(mem.WorkingSetSize) / (1024.0 * 1024.0);
++                p.handles = uint32_t(handles);
++            }
++
++            // This process's local (dedicated) memory on every adapter (WcwLogic::ddPickVram).
++            std::vector<WcwLogic::DdVramAdapter> vram;
++            for (IDXGIAdapter3 *adapter : s.adapters) {
++                DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
++                if (SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
++                    vram.push_back({ info.CurrentUsage, info.Budget });
++                }
++            }
++
++            if (!vram.empty()) {
++                const WcwLogic::DdVramAdapter v = WcwLogic::ddPickVram(vram);
++                p.hasVram = true;
++                p.vramMb = double(v.usage) / (1024.0 * 1024.0);
++                p.vramBudgetMb = double(v.budget) / (1024.0 * 1024.0);
++            }
++#       else
++            (void)s;
++#       endif
++            return p;
++        }
++
++        std::string eventLine(Sink &s, const std::string &title, const std::string &text, const char *alertType) {
++            // The caller holds s.mutex.
++            return WcwLogic::ddEventLine("aki-game " + s.game + ": " + title, text, s.session.tags(), (alertType != nullptr) ? alertType : "info", s.aggregationKey);
++        }
++
++        // withProcess: false for the last window at exit, when the renderer is already torn down.
++        void flushWindow(Sink &s, bool withProcess) {
++            WcwLogic::DdFrameStats stats;
++            std::vector<std::string> tags;
++            {
++                std::scoped_lock lock(s.mutex);
++                stats = s.window.take(nowMs(), s.session.context().fpsTarget);
++                tags = s.session.tags();
++            }
++
++            const WcwLogic::DdProcessSample process = withProcess ? sampleProcess(s) : WcwLogic::DdProcessSample();
++            std::vector<std::string> lines;
++            for (const auto &m : WcwLogic::ddWindowMetrics(stats, process)) {
++                lines.push_back(WcwLogic::ddGaugeLine(m.first, m.second, tags));
++            }
++
++            sendLines(s, lines);
++        }
++
++        void threadLoop() {
++            Sink &s = sink();
++            openAdapters(s);
++            double windowStart = nowMs();
++            std::unique_lock<std::mutex> stopLock(s.stopMutex);
++            while (!s.stop) {
++                // Wakes every second for the device-lost check; the window goes out every DdWindowSeconds, also when
++                // nothing presents (a hang reads as 0 presents/s instead of a gap).
++                s.stopCondition.wait_for(stopLock, std::chrono::seconds(1));
++                if (s.stop) {
++                    break;
++                }
++
++                stopLock.unlock();
++                if (plume::wcwDeviceLostFlag().load() && !s.deviceLostSent) {
++                    s.deviceLostSent = true;
++                    event("device lost", "The GPU device was lost (hang, removal or reset); the game is quitting.", "error");
++                }
++
++                if (WcwLogic::ddWindowDue(nowMs(), windowStart)) {
++                    windowStart = nowMs();
++                    flushWindow(s, true);
++                }
++
++                stopLock.lock();
++            }
++        }
++
++        void stopAtExit() {
++            Sink &s = sink();
++            {
++                std::scoped_lock lock(s.stopMutex);
++                s.stop = true;
++            }
++
++            s.stopCondition.notify_all();
++            if (s.thread.joinable()) {
++                s.thread.join();
++            }
++
++            flushWindow(s, false);
++            event("session end", "The game exited.", "info");
++        }
++
++        void start() {
++            Sink &s = sink();
++            std::call_once(s.startOnce, [&s]() {
++                const char *game = getenv("WCW_DD_GAME");
++                s.game = ((game != nullptr) && (game[0] != '\0')) ? std::string(game) : WcwLogic::ddGameFromExe(exeName());
++
++                s.echo = WcwLogic::envSwitchOn(getenv("WCW_DD_ECHO"));
++                const char *port = getenv("WCW_DD_PORT");
++                const int p = (port != nullptr) ? atoi(port) : 0;
++                s.port = ((p > 0) && (p < 65536)) ? uint16_t(p) : uint16_t(8125);
++                s.aggregationKey = WcwLogic::ddTag("k", "aki-game-" + s.game + "-" + std::to_string(processId())).substr(2);
++                {
++                    std::scoped_lock lock(s.mutex);
++                    s.session.setIdentity(s.game, WcwLogic::ddParseTags(getenv("WCW_DD_TAGS")));
++                    s.window.start(nowMs());
++                }
++
++                openSocket(s);
++                fprintf(stderr, "[wcw dd] WCW_DD_METRICS: sending aki.game.* to 127.0.0.1:%u every %.0f s (game %s)\n", unsigned(s.port),
++                    WcwLogic::DdWindowSeconds, s.game.c_str());
++                s.thread = std::thread(threadLoop);
++                atexit(stopAtExit);
++            });
++        }
++    };
++
++    bool enabled() {
++        static const bool on = WcwLogic::envSwitchOn(getenv("WCW_DD_METRICS"));
++        return on;
++    }
++
++    void notePresent(Clock::time_point t, bool generated, bool repeated) {
++        if (!enabled()) {
++            return;
++        }
++
++        start();
++        Sink &s = sink();
++        std::scoped_lock lock(s.mutex);
++        s.window.addPresent(std::chrono::duration<double, std::milli>(t.time_since_epoch()).count(), generated, repeated);
++    }
++
++    void noteGpuRow(const WcwPerf::GpuRow &row) {
++        if (!enabled()) {
++            return;
++        }
++
++        start();
++        Sink &s = sink();
++        std::scoped_lock lock(s.mutex);
++        if (row.present) {
++            s.window.addGpuPresent(row.gpuMs);
++        }
++        else {
++            s.window.addGpuRender(row.presentId, row.gpuMs, row.passMs[size_t(WcwPerf::GpuPass::RtBuild)], row.passMs[size_t(WcwPerf::GpuPass::RtTrace)]);
++        }
++    }
++
++    void noteContext(const WcwLogic::DdContext &context) {
++        if (!enabled()) {
++            return;
++        }
++
++        start();
++        Sink &s = sink();
++        std::string line;
++        {
++            std::scoped_lock lock(s.mutex);
++            const WcwLogic::DdSession::Decision d = s.session.noteContext(context, nowMs());
++            if (d.event == WcwLogic::DdSession::Event::SessionStart) {
++                line = eventLine(s, "session start", "WCW_DD_METRICS play session, pid " + std::to_string(processId()) + ".", "info");
++            }
++            else if (d.event == WcwLogic::DdSession::Event::SettingsChanged) {
++                line = eventLine(s, "settings changed", d.changes, "info");
++            }
++        }
++
++        if (!line.empty()) {
++            sendLines(s, { line });
++        }
++    }
++
++    void noteVenue(const std::string &venue) {
++        if (!enabled()) {
++            return;
++        }
++
++        start();
++        Sink &s = sink();
++        std::string line;
++        {
++            std::scoped_lock lock(s.mutex);
++            const WcwLogic::DdSession::Decision d = s.session.noteVenue(venue);
++            if (d.event == WcwLogic::DdSession::Event::VenueChanged) {
++                line = eventLine(s, "venue " + (venue.empty() ? std::string("(none)") : venue), d.changes, "info");
++            }
++        }
++
++        if (!line.empty()) {
++            sendLines(s, { line });
++        }
++    }
++
++    void event(const std::string &title, const std::string &text, const char *alertType) {
++        if (!enabled()) {
++            return;
++        }
++
++        start();
++        Sink &s = sink();
++        std::string line;
++        {
++            std::scoped_lock lock(s.mutex);
++            line = eventLine(s, title, text, alertType);
++        }
++
++        sendLines(s, { line });
++    }
++};
+diff --git a/src/common/rt64_wcw_dd.h b/src/common/rt64_wcw_dd.h
+new file mode 100644
+index 0000000..cc8af20
+--- /dev/null
++++ b/src/common/rt64_wcw_dd.h
+@@ -0,0 +1,36 @@
++//
++// RT64
++//
++
++#pragma once
++
++#include <chrono>
++#include <string>
++
++#include "common/rt64_wcw_logic.h"
++#include "common/rt64_wcw_perf.h"
++
++// [wcw dd] In-game performance metrics to the local Datadog Agent (aki-roadmap#125). Off by default; WCW_DD_METRICS=1
++// turns it on. Every WcwLogic::DdWindowSeconds a background thread sends the window's aki.game.* gauges (frame pacing,
++// GPU ms, process memory, handles, VRAM) as DogStatsD over UDP to 127.0.0.1 (WCW_DD_PORT, default 8125), tagged with
++// the settings (WcwLogic::DdContext). Events: session start and end, settings changed, venue changed, device lost.
++// Nothing leaves the PC except through the owner's own Agent; with no Agent the packets are dropped.
++//   WCW_DD_TAGS=key:value,...  extra tags (conversion id, owner); keep them low cardinality.
++//   WCW_DD_GAME=<key>          the game tag, when the executable's name doesn't give it (WcwLogic::ddGameFromExe).
++//   WCW_DD_ECHO=1              also print every packet to stderr.
++// The aggregation and the line format are WcwLogic (unit tested); this is the sink. Every call is a no-op when off.
++namespace RT64::WcwDd {
++    bool enabled();
++    using Clock = std::chrono::steady_clock;
++    // Present thread: a Present call. generated: an in-between frame; repeated: the real frame shown again.
++    void notePresent(Clock::time_point t, bool generated, bool repeated);
++    // A WCW perf GPU timing row (render or present); the GPU timer runs while this is enabled (WcwPerf::timingEnabled).
++    void noteGpuRow(const WcwPerf::GpuRow &row);
++    // Present thread: the current settings, every present (WcwLogic::DdSession decides the events). The game,
++    // extraTags and venue fields are ignored.
++    void noteContext(const WcwLogic::DdContext &context);
++    // The ray tracer's detected venue changed (empty: none).
++    void noteVenue(const std::string &venue);
++    // Sends an event at once, tagged with the current context. alertType: info, success, warning or error.
++    void event(const std::string &title, const std::string &text, const char *alertType);
++};
 diff --git a/src/common/rt64_wcw_logic.cpp b/src/common/rt64_wcw_logic.cpp
 new file mode 100644
-index 0000000..5207cae
+index 0000000..3b1a3db
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.cpp
-@@ -0,0 +1,900 @@
+@@ -0,0 +1,1575 @@
 +//
 +// RT64
 +//
@@ -575,6 +1004,8 @@ index 0000000..5207cae
 +
 +#include <algorithm>
 +#include <cmath>
++#include <cstdio>
++#include <cstring>
 +#include <vector>
 +
 +namespace RT64::WcwLogic {
@@ -1466,13 +1897,686 @@ index 0000000..5207cae
 +
 +        return Action::None;
 +    }
++
++    uint32_t regrowSettleMs(uint64_t regrownPixels, int32_t overrideMs, bool deferringRelease) {
++        if (regrownPixels < RegrowSettleMinPixels) {
++            return 0;
++        }
++
++        if (overrideMs >= 0) {
++            return uint32_t(overrideMs);
++        }
++
++        return deferringRelease ? 0 : RegrowSettleDefaultMs;
++    }
++
++    bool releaseReady(const ReleaseStamp &stamp, uint64_t presentsFinished, uint64_t workloadsDone, uint64_t nowMs) {
++        return (presentsFinished >= stamp.presentsStarted) && (workloadsDone >= (stamp.workloadsDone + DeferredReleaseWorkloads)) &&
++            (nowMs >= stamp.ms) && ((nowMs - stamp.ms) >= DeferredReleaseMinMs);
++    }
++
++    // HDR readback for the luminance log and BMP dumps (aki-roadmap#128)
++
++    float halfToFloat(uint16_t half) {
++        const uint32_t sign = uint32_t(half & 0x8000) << 16;
++        const uint32_t exponent = (half >> 10) & 0x1F;
++        const uint32_t mantissa = half & 0x3FF;
++        uint32_t bits = sign;
++        if (exponent == 0x1F) {
++            bits |= 0x7F800000 | (mantissa << 13);
++        }
++        else if (exponent != 0) {
++            bits |= ((exponent + 112) << 23) | (mantissa << 13);
++        }
++        else if (mantissa != 0) {
++            const float value = float(mantissa) / 16777216.0f;
++            return (sign != 0) ? -value : value;
++        }
++
++        float value;
++        memcpy(&value, &bits, sizeof(value));
++        return value;
++    }
++
++    uint8_t linearToSrgb8(float linearValue) {
++        // NaN clamps to 0 (std::clamp would keep it).
++        const float c = (linearValue > 0.0f) ? std::min(linearValue, 1.0f) : 0.0f;
++        const float s = (c <= 0.0031308f) ? (c * 12.92f) : (1.055f * powf(c, 1.0f / 2.4f) - 0.055f);
++        return uint8_t(std::lround(s * 255.0f));
++    }
++
++    void HdrReadbackConverter::convertRow(const uint16_t *src, uint8_t *dst, uint32_t width, float invScale, double &nitsSum, float &nitsMax) {
++        if (halfTable.empty()) {
++            halfTable.resize(65536);
++            for (uint32_t i = 0; i < 65536; i++) {
++                halfTable[i] = halfToFloat(uint16_t(i));
++            }
++        }
++
++        // Compared by bits: a NaN scale must not rebuild the table every row.
++        if (srgbTable.empty() || (memcmp(&srgbTableScale, &invScale, sizeof(float)) != 0)) {
++            srgbTable.resize(65536);
++            for (uint32_t i = 0; i < 65536; i++) {
++                srgbTable[i] = linearToSrgb8(halfTable[i] * invScale);
++            }
++
++            srgbTableScale = invScale;
++            srgbBuilds++;
++        }
++
++        for (uint32_t x = 0; x < width; x++) {
++            const uint16_t *pixel = src + uint64_t(x) * 4;
++            const float nits = 80.0f * (0.2126f * halfTable[pixel[0]] + 0.7152f * halfTable[pixel[1]] + 0.0722f * halfTable[pixel[2]]);
++            nitsSum += nits;
++            nitsMax = std::max(nitsMax, nits);
++            dst[x * 4 + 0] = srgbTable[pixel[2]];
++            dst[x * 4 + 1] = srgbTable[pixel[1]];
++            dst[x * 4 + 2] = srgbTable[pixel[0]];
++            dst[x * 4 + 3] = 255;
++        }
++    }
++
++    // In-game Datadog metrics (aki-roadmap#125)
++
++    bool envSwitchOn(const char *value) {
++        return (value != nullptr) && (value[0] != '\0') && (strcmp(value, "0") != 0);
++    }
++
++    void DdFrameWindow::start(double nowMs) {
++        windowStartMs = nowMs;
++        presents = generated = repeated = 0;
++        intervals.clear();
++        gpuRender.clear();
++        rtBuild.clear();
++        rtTrace.clear();
++        gpuPresent.clear();
++        frameGpu.clear();
++        frameRt.clear();
++    }
++
++    void DdFrameWindow::addPresent(double tMs, bool generatedFrame, bool repeatedFrame) {
++        if ((lastPresentMs >= 0.0) && (tMs >= lastPresentMs)) {
++            intervals.push_back(tMs - lastPresentMs);
++        }
++
++        lastPresentMs = tMs;
++        presents++;
++        generated += generatedFrame ? 1 : 0;
++        repeated += repeatedFrame ? 1 : 0;
++    }
++
++    void DdFrameWindow::addGpuRender(uint64_t presentId, double gpuMs, double rtBuildMs, double rtTraceMs) {
++        if (frameOpen && (presentId != framePresentId)) {
++            frameGpu.push_back(frameGpuSum);
++            frameRt.push_back(frameRtSum);
++            frameGpuSum = frameRtSum = 0.0;
++        }
++
++        frameOpen = true;
++        framePresentId = presentId;
++        frameGpuSum += gpuMs;
++        frameRtSum += rtBuildMs + rtTraceMs;
++        gpuRender.push_back(gpuMs);
++        rtBuild.push_back(rtBuildMs);
++        rtTrace.push_back(rtTraceMs);
++    }
++
++    void DdFrameWindow::addGpuPresent(double gpuMs) {
++        gpuPresent.push_back(gpuMs);
++    }
++
++    DdFrameStats DdFrameWindow::take(double nowMs, uint32_t fpsTarget) {
++        DdFrameStats s;
++        s.seconds = (windowStartMs >= 0.0) ? std::max(0.0, (nowMs - windowStartMs) / 1000.0) : 0.0;
++        s.presents = presents;
++        s.generated = generated;
++        s.repeated = repeated;
++        if (s.seconds > 0.0) {
++            s.presentsPerS = presents / s.seconds;
++            s.interpolatedPerS = generated / s.seconds;
++            s.realFps = (presents - generated) / s.seconds;
++            s.repeatedPerMin = repeated * 60.0 / s.seconds;
++        }
++
++        if (!intervals.empty()) {
++            std::vector<double> sorted = intervals;
++            std::sort(sorted.begin(), sorted.end());
++            s.hasIntervals = true;
++            s.p50Ms = ddPercentile(sorted, 0.50);
++            s.p95Ms = ddPercentile(sorted, 0.95);
++            s.p99Ms = ddPercentile(sorted, 0.99);
++            s.maxMs = sorted.back();
++            const size_t slowest = std::max<size_t>(1, sorted.size() / 100);
++            double sum = 0.0;
++            for (size_t i = sorted.size() - slowest; i < sorted.size(); i++) {
++                sum += sorted[i];
++            }
++
++            const double mean = sum / double(slowest);
++            s.low1PctFps = (mean > 0.0) ? (1000.0 / mean) : 0.0;
++            const double targetMs = (fpsTarget > 0) ? (1000.0 / fpsTarget) : 0.0;
++            const double threshold = DdHitchFactor * std::max(targetMs, s.p50Ms);
++            for (double v : sorted) {
++                s.hitches += (v > threshold) ? 1 : 0;
++            }
++
++            s.hitchesPerMin = (s.seconds > 0.0) ? (s.hitches * 60.0 / s.seconds) : 0.0;
++        }
++
++        s.gpuRenderRows = uint32_t(gpuRender.size());
++        if (!gpuRender.empty()) {
++            s.gpuRenderMs = ddPercentile(gpuRender, 0.50);
++            s.gpuRenderP95Ms = ddPercentile(gpuRender, 0.95);
++            s.rtBuildMs = ddPercentile(rtBuild, 0.50);
++            s.rtTraceMs = ddPercentile(rtTrace, 0.50);
++        }
++
++        s.gameFrames = uint32_t(frameGpu.size());
++        if (!frameGpu.empty()) {
++            s.gpuGameFrameMs = ddPercentile(frameGpu, 0.50);
++            s.gpuGameFrameP95Ms = ddPercentile(frameGpu, 0.95);
++            s.rtGameFrameMs = ddPercentile(frameRt, 0.50);
++        }
++
++        s.gpuPresentRows = uint32_t(gpuPresent.size());
++        if (!gpuPresent.empty()) {
++            s.gpuPresentMs = ddPercentile(gpuPresent, 0.50);
++        }
++
++        start(nowMs);
++        return s;
++    }
++
++    double ddPercentile(std::vector<double> values, double p) {
++        if (values.empty()) {
++            return 0.0;
++        }
++
++        std::sort(values.begin(), values.end());
++        const double rank = std::ceil(std::clamp(p, 0.0, 1.0) * double(values.size()));
++        const size_t index = (rank < 1.0) ? 0 : std::min(values.size() - 1, size_t(rank) - 1);
++        return values[index];
++    }
++
++    uint32_t ddFpsTarget(uint32_t targetRate, uint32_t viOriginalRate) {
++        return (targetRate > 0) ? targetRate : viOriginalRate;
++    }
++
++    std::vector<std::pair<std::string, double>> ddWindowMetrics(const DdFrameStats &s, const DdProcessSample &process) {
++        std::vector<std::pair<std::string, double>> m;
++        auto put = [&m](const char *name, double value) { m.emplace_back(std::string("aki.game.") + name, value); };
++        put("active", 1.0);
++        if (s.seconds > 0.0) {
++            put("presents_per_s", s.presentsPerS);
++            put("real_fps", s.realFps);
++            put("interpolated_per_s", s.interpolatedPerS);
++            put("pacing.repeated_per_min", s.repeatedPerMin);
++        }
++
++        if (s.hasIntervals) {
++            put("pacing.p50_ms", s.p50Ms);
++            put("pacing.p95_ms", s.p95Ms);
++            put("pacing.p99_ms", s.p99Ms);
++            put("pacing.max_ms", s.maxMs);
++            put("pacing.low_1pct_fps", s.low1PctFps);
++            put("pacing.hitches_per_min", s.hitchesPerMin);
++        }
++
++        if (s.gpuRenderRows > 0) {
++            put("perf.gpu_render_ms", s.gpuRenderMs);
++            put("perf.gpu_render_p95_ms", s.gpuRenderP95Ms);
++            // Only with ray tracing running: 0 ms with it off would read as free RT on a dashboard.
++            if ((s.rtBuildMs > 0.0) || (s.rtTraceMs > 0.0) || (s.rtGameFrameMs > 0.0)) {
++                put("perf.rt_build_ms", s.rtBuildMs);
++                put("perf.rt_trace_ms", s.rtTraceMs);
++            }
++        }
++
++        if (s.gameFrames > 0) {
++            put("perf.gpu_game_frame_ms", s.gpuGameFrameMs);
++            put("perf.gpu_game_frame_p95_ms", s.gpuGameFrameP95Ms);
++            if (s.rtGameFrameMs > 0.0) {
++                put("perf.rt_game_frame_ms", s.rtGameFrameMs);
++            }
++        }
++
++        if (s.gpuPresentRows > 0) {
++            put("perf.gpu_present_ms", s.gpuPresentMs);
++        }
++
++        if (process.has) {
++            put("memory.private_mb", process.privateMb);
++            put("memory.working_set_mb", process.workingSetMb);
++            put("process.handles", double(process.handles));
++        }
++
++        if (process.hasVram) {
++            put("memory.vram_mb", process.vramMb);
++            put("memory.vram_budget_mb", process.vramBudgetMb);
++        }
++
++        return m;
++    }
++
++    bool ddWindowDue(double nowMs, double windowStartMs) {
++        return (nowMs - windowStartMs) >= (DdWindowSeconds * 1000.0);
++    }
++
++    DdVramAdapter ddPickVram(const std::vector<DdVramAdapter> &adapters) {
++        DdVramAdapter out;
++        bool picked = false;
++        uint64_t mostUsage = 0;
++        for (const DdVramAdapter &a : adapters) {
++            out.usage += a.usage;
++            if (!picked || (a.usage > mostUsage)) {
++                picked = true;
++                mostUsage = a.usage;
++                out.budget = a.budget;
++            }
++        }
++
++        return out;
++    }
++
++    bool DdContext::operator==(const DdContext &o) const {
++        return (game == o.game) && (fpsTarget == o.fpsTarget) && (framerate == o.framerate) && (rt == o.rt) && (rtQuality == o.rtQuality) &&
++            (resolution == o.resolution) && (aspect == o.aspect) && (msaa == o.msaa) && (downsample == o.downsample) && (hdr == o.hdr) &&
++            (crt == o.crt) && (beam == o.beam) && (venue == o.venue) && (extraTags == o.extraTags);
++    }
++
++    const char *rtQualityName(uint32_t quality) {
++        switch (RtQuality(quality)) {
++        case RtQuality::Performance:
++            return "performance";
++        case RtQuality::Balanced:
++            return "balanced";
++        case RtQuality::Quality:
++            return "quality";
++        case RtQuality::Ultra:
++            return "ultra";
++        default:
++            return "unknown";
++        }
++    }
++
++    std::string ddCrtPresetName(const std::string &preset) {
++        const size_t slash = preset.find_last_of("/\\");
++        std::string name = (slash == std::string::npos) ? preset : preset.substr(slash + 1);
++        const size_t dot = name.rfind('.');
++        if ((dot != std::string::npos) && (dot > 0)) {
++            std::string ext = name.substr(dot);
++            for (char &ch : ext) {
++                ch = ((ch >= 'A') && (ch <= 'Z')) ? char(ch - 'A' + 'a') : ch;
++            }
++
++            if (ext == ".slangp") {
++                name.resize(dot);
++            }
++        }
++
++        return name;
++    }
++
++    std::vector<std::string> ddContextTags(const DdContext &c) {
++        static const char *builtInKeys[] = { "game", "fps_target", "framerate", "rt", "rt_quality", "resolution", "aspect", "msaa", "downsample",
++            "hdr", "crt", "beam", "rt_venue" };
++        std::vector<std::string> tags;
++        auto add = [&tags](const char *key, const std::string &value) {
++            std::string t = ddTag(key, value);
++            if (!t.empty() && (std::find(tags.begin(), tags.end(), t) == tags.end())) {
++                tags.push_back(std::move(t));
++            }
++        };
++
++        add("game", c.game);
++        add("fps_target", (c.fpsTarget > 0) ? std::to_string(c.fpsTarget) : std::string());
++        add("framerate", c.framerate);
++        add("rt", c.rt ? "on" : "off");
++        if (c.rt) {
++            add("rt_quality", rtQualityName(c.rtQuality));
++        }
++
++        add("resolution", c.resolution);
++        add("aspect", c.aspect);
++        add("msaa", c.msaa);
++        add("downsample", std::to_string(c.downsample));
++        add("hdr", c.hdr ? "on" : "off");
++        add("crt", c.crt.empty() ? std::string("off") : ddCrtPresetName(c.crt));
++        add("beam", c.beam ? "on" : "off");
++        add("rt_venue", c.venue);
++        for (const std::string &t : c.extraTags) {
++            const std::string key = t.substr(0, t.find(':'));
++            bool builtIn = false;
++            for (const char *k : builtInKeys) {
++                builtIn = builtIn || (key == k);
++            }
++
++            if (!builtIn && (std::find(tags.begin(), tags.end(), t) == tags.end())) {
++                tags.push_back(t);
++            }
++        }
++
++        return tags;
++    }
++
++    std::string ddTagChanges(const std::vector<std::string> &before, const std::vector<std::string> &after) {
++        auto keyOf = [](const std::string &t) { return t.substr(0, t.find(':')); };
++        auto find = [&keyOf](const std::vector<std::string> &tags, const std::string &key) -> std::string {
++            for (const std::string &t : tags) {
++                if (keyOf(t) == key) {
++                    return t;
++                }
++            }
++
++            return key + ":(none)";
++        };
++
++        std::vector<std::string> keys;
++        for (const std::vector<std::string> *list : { &after, &before }) {
++            for (const std::string &t : *list) {
++                const std::string k = keyOf(t);
++                if (std::find(keys.begin(), keys.end(), k) == keys.end()) {
++                    keys.push_back(k);
++                }
++            }
++        }
++
++        std::string out;
++        for (const std::string &k : keys) {
++            const std::string b = find(before, k);
++            const std::string a = find(after, k);
++            if (a != b) {
++                out += (out.empty() ? "" : ", ") + b + " -> " + a;
++            }
++        }
++
++        return out;
++    }
++
++    void DdSession::setIdentity(const std::string &gameKey, const std::vector<std::string> &extra) {
++        game = gameKey;
++        extraTags = extra;
++    }
++
++    DdSession::Decision DdSession::noteContext(const DdContext &context, double nowMs) {
++        Decision d;
++        DdContext c = context;
++        c.game = game;
++        c.extraTags = extraTags;
++        c.venue = c.rt ? venue : std::string();
++        if (haveContext && (c == current)) {
++            return d;
++        }
++
++        const std::vector<std::string> before = currentTags;
++        current = c;
++        currentTags = ddContextTags(c);
++        if (!haveContext) {
++            haveContext = true;
++            startMs = nowMs;
++            d.event = Event::SessionStart;
++        }
++        else if ((nowMs - startMs) >= (DdSettleSeconds * 1000.0)) {
++            d.event = Event::SettingsChanged;
++            d.changes = ddTagChanges(before, currentTags);
++        }
++
++        return d;
++    }
++
++    DdSession::Decision DdSession::noteVenue(const std::string &newVenue) {
++        Decision d;
++        if (newVenue == venue) {
++            return d;
++        }
++
++        venue = newVenue;
++        if (haveContext && current.rt) {
++            const std::vector<std::string> before = currentTags;
++            current.venue = venue;
++            currentTags = ddContextTags(current);
++            d.event = Event::VenueChanged;
++            d.changes = ddTagChanges(before, currentTags);
++        }
++
++        return d;
++    }
++
++    std::vector<std::string> DdSession::tags() const {
++        if (haveContext) {
++            return currentTags;
++        }
++
++        const std::string t = ddTag("game", game);
++        return t.empty() ? std::vector<std::string>() : std::vector<std::string>{ t };
++    }
++
++    static std::string ddLower(std::string s) {
++        for (char &c : s) {
++            c = ((c >= 'A') && (c <= 'Z')) ? char(c - 'A' + 'a') : c;
++        }
++
++        return s;
++    }
++
++    static bool ddEndsWith(const std::string &s, const std::string &suffix) {
++        return (s.size() >= suffix.size()) && (s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0);
++    }
++
++    std::string ddGameFromExe(const std::string &exeName) {
++        const size_t slash = exeName.find_last_of("/\\");
++        std::string name = ddLower((slash == std::string::npos) ? exeName : exeName.substr(slash + 1));
++        if (ddEndsWith(name, ".exe")) {
++            name.resize(name.size() - 4);
++        }
++
++        if (ddEndsWith(name, "recompiled")) {
++            name.resize(name.size() - 10);
++        }
++
++        return (name == "wcw") ? std::string("wt") : name;
++    }
++
++    std::vector<std::string> ddParseTags(const char *list) {
++        std::vector<std::string> tags;
++        if (list == nullptr) {
++            return tags;
++        }
++
++        std::string all(list);
++        size_t pos = 0;
++        while (pos <= all.size()) {
++            size_t end = all.find(',', pos);
++            if (end == std::string::npos) {
++                end = all.size();
++            }
++
++            const std::string entry = all.substr(pos, end - pos);
++            const size_t colon = entry.find(':');
++            if (colon != std::string::npos) {
++                std::string t = ddTag(entry.substr(0, colon), entry.substr(colon + 1));
++                if (!t.empty() && (std::find(tags.begin(), tags.end(), t) == tags.end())) {
++                    tags.push_back(std::move(t));
++                }
++            }
++
++            pos = end + 1;
++        }
++
++        return tags;
++    }
++
++    // Lowercases, replaces characters outside allowed with '_' and collapses runs of '_'.
++    static std::string ddSanitize(const std::string &s, const char *allowedPunct) {
++        std::string out;
++        for (char c : ddLower(s)) {
++            const bool ok = ((c >= 'a') && (c <= 'z')) || ((c >= '0') && (c <= '9')) || (c == '_') || ((c != '\0') && (strchr(allowedPunct, c) != nullptr));
++            const char r = ok ? c : '_';
++            if ((r == '_') && !out.empty() && (out.back() == '_')) {
++                continue;
++            }
++
++            out.push_back(r);
++        }
++
++        return out;
++    }
++
++    static std::string ddTrim(const std::string &s, const char *chars) {
++        const size_t a = s.find_first_not_of(chars);
++        if (a == std::string::npos) {
++            return std::string();
++        }
++
++        return s.substr(a, s.find_last_not_of(chars) - a + 1);
++    }
++
++    static bool ddStartsWithLetter(const std::string &s) {
++        return !s.empty() && (s[0] >= 'a') && (s[0] <= 'z');
++    }
++
++    std::string ddMetricName(const std::string &name) {
++        std::string n = ddSanitize(name, ".");
++        return ddStartsWithLetter(n) ? n : ("aki_" + n);
++    }
++
++    std::string ddTag(const std::string &key, const std::string &value) {
++        std::string v = ddTrim(value, " \t\r\n");
++        if (v.empty()) {
++            return std::string();
++        }
++
++        std::string k = ddTrim(ddSanitize(key, "-./"), "_");
++        if (!ddStartsWithLetter(k)) {
++            k = "t_" + k;
++        }
++
++        v = ddTrim(ddSanitize(v, "-:./"), "_");
++        if (v.empty()) {
++            return std::string();
++        }
++
++        std::string t = k + ":" + v;
++        if (t.size() > 200) {
++            t.resize(200);
++        }
++
++        return t;
++    }
++
++    std::string ddFormatValue(double value) {
++        char buf[64];
++        snprintf(buf, sizeof(buf), "%.6f", value);
++        std::string s(buf);
++        if (s.find('.') != std::string::npos) {
++            while (s.back() == '0') {
++                s.pop_back();
++            }
++
++            if (s.back() == '.') {
++                s.pop_back();
++            }
++        }
++
++        return (s == "-0") ? std::string("0") : s;
++    }
++
++    std::string ddGaugeLine(const std::string &name, double value, const std::vector<std::string> &tags) {
++        if (!std::isfinite(value)) {
++            return std::string();
++        }
++
++        std::string line = ddMetricName(name) + ":" + ddFormatValue(value) + "|g";
++        std::string joined;
++        for (const std::string &t : tags) {
++            if (!t.empty()) {
++                joined += (joined.empty() ? "" : ",") + t;
++            }
++        }
++
++        if (!joined.empty()) {
++            line += "|#" + joined;
++        }
++
++        return line;
++    }
++
++    std::string ddEventLine(const std::string &title, const std::string &text, const std::vector<std::string> &tags,
++        const std::string &alertType, const std::string &aggregationKey)
++    {
++        std::string ti, tx;
++        for (char c : title) {
++            if (c != '\r') {
++                ti.push_back((c == '\n') ? ' ' : c);
++            }
++        }
++
++        for (char c : text) {
++            if (c == '\n') {
++                tx += "\\n";
++            }
++            else if (c != '\r') {
++                tx.push_back(c);
++            }
++        }
++
++        std::string line = "_e{" + std::to_string(ti.size()) + "," + std::to_string(tx.size()) + "}:" + ti + "|" + tx;
++        if (!aggregationKey.empty()) {
++            line += "|k:" + aggregationKey;
++        }
++
++        line += "|s:aki-game";
++        if (!alertType.empty()) {
++            line += "|t:" + alertType;
++        }
++
++        std::string joined;
++        for (const std::string &t : tags) {
++            if (!t.empty()) {
++                joined += (joined.empty() ? "" : ",") + t;
++            }
++        }
++
++        if (!joined.empty()) {
++            line += "|#" + joined;
++        }
++
++        return line;
++    }
++
++    std::vector<std::string> ddPackets(const std::vector<std::string> &lines, size_t maxBytes) {
++        std::vector<std::string> packets;
++        std::string cur;
++        for (const std::string &l : lines) {
++            if (l.empty()) {
++                continue;
++            }
++
++            if (cur.empty()) {
++                cur = l;
++            }
++            else if (cur.size() + 1 + l.size() <= maxBytes) {
++                cur += "\n" + l;
++            }
++            else {
++                packets.push_back(cur);
++                cur = l;
++            }
++        }
++
++        if (!cur.empty()) {
++            packets.push_back(cur);
++        }
++
++        return packets;
++    }
 +};
 diff --git a/src/common/rt64_wcw_logic.h b/src/common/rt64_wcw_logic.h
 new file mode 100644
-index 0000000..8cfc3e0
+index 0000000..3631534
 --- /dev/null
 +++ b/src/common/rt64_wcw_logic.h
-@@ -0,0 +1,794 @@
+@@ -0,0 +1,1149 @@
 +//
 +// RT64
 +//
@@ -1484,8 +2588,12 @@ index 0000000..8cfc3e0
 +#include <mutex>
 +#include <string>
 +#include <unordered_map>
++#include <utility>
 +#include <vector>
 +#include <array>
++#include <algorithm>
++#include <deque>
++#include <memory>
 +
 +// [wcw] Decision logic for frame interpolation, present pacing, the CRT beam simulator and ray-traced shadows, kept
 +// free of renderer state so it can be unit tested (tests/wcw). The renderer calls these functions; a change to any
@@ -2266,18 +3374,371 @@ index 0000000..8cfc3e0
 +    // generated frames removed the dip. Other unmapped objects keep the interpolated view, so they stay in place
 +    // relative to the interpolated scene around them.
 +    bool pinUnmappedToRealView(bool inMatch, bool generated, bool realCrosses, bool generatedCrosses);
++
++    // Render target regrow settle (aki-roadmap#4)
++
++    // Render targets newly allocated by one workload (pixels, summed over color and depth) at or above which the
++    // workload waits before recording into them, and how long.
++    constexpr uint64_t RegrowSettleMinPixels = 4ULL * 1024ULL * 1024ULL;
++    constexpr uint32_t RegrowSettleDefaultMs = 100;
++
++    // How long (ms) a workload waits after regrowing its render targets, before it records into them. Supersampling
++    // 2x at 1600x900 / 150% DPI regrows No Mercy's targets from 3840x1920 to 7670x2880 a few seconds in; the first
++    // workload into the new targets hung the GPU every time (NVIDIA Xid 13 GPC SAVE_RESTORE_ADDR_OOB, then
++    // DEVICE_HUNG), even with every rt64 queue serialised and the allocations made while the GPU was idle. Waiting
++    // 50 ms or more after the regrow avoided it (10 ms didn't always). The settings-apply hang (aki-roadmap#4, first
++    // draws after the targets are recreated) is probably the same case; not verified yet. overrideMs: WCW_REGROW_SETTLE_MS (negative = unset, 0 = off). Small regrows
++    // (N64-sized targets, low resolutions) never wait.
++    // deferringRelease: released textures are destroyed later (DeferredReleaseList), which is what the wait really
++    // bought: the hang came from destroying the textures a regrow releases, not from first use of the new ones
++    // (keeping them alive with no wait was clean, destroying them at once with no wait hung). Then nothing waits
++    // unless overrideMs asks for it.
++    uint32_t regrowSettleMs(uint64_t regrownPixels, int32_t overrideMs, bool deferringRelease);
++
++    // Deferred release of render target textures (aki-roadmap#4)
++
++    // When a render target's textures were released: how many presents had started and how many workloads had
++    // finished (their GPU work waited for) by then, and the time.
++    struct ReleaseStamp {
++        uint64_t presentsStarted = 0;
++        uint64_t workloadsDone = 0;
++        uint64_t ms = 0;
++    };
++
++    // Released textures live on for at least this many finished workloads and this long.
++    constexpr uint64_t DeferredReleaseWorkloads = 2;
++    constexpr uint64_t DeferredReleaseMinMs = 100;
++
++    // Whether textures released at stamp can be destroyed: every present that had started by then has finished (the
++    // present thread records the targets' textures without the workload thread's locks), the workload thread has
++    // finished DeferredReleaseWorkloads more workloads, and DeferredReleaseMinMs have passed (the old settle needed
++    // 50 ms or more). A clock that went backwards isn't ready.
++    bool releaseReady(const ReleaseStamp &stamp, uint64_t presentsFinished, uint64_t workloadsDone, uint64_t nowMs);
++
++    // Released render target textures waiting to be destroyed, oldest first. T is the bundle of GPU objects a target
++    // released (destroyed with the entry).
++    template<typename T>
++    class DeferredReleaseList {
++    public:
++        void push(const ReleaseStamp &stamp, uint64_t bytes, std::unique_ptr<T> item) {
++            if (item == nullptr) {
++                return;
++            }
++
++            entries.push_back({ stamp, bytes, std::move(item) });
++            pending += bytes;
++            peakPending = std::max(peakPending, pending);
++        }
++
++        // Destroys the entries that are ready (releaseReady), oldest first, stopping at the first that isn't: stamps
++        // only grow, so later entries aren't ready either. Returns how many were destroyed.
++        size_t collect(uint64_t presentsFinished, uint64_t workloadsDone, uint64_t nowMs) {
++            size_t count = 0;
++            while (!entries.empty() && releaseReady(entries.front().stamp, presentsFinished, workloadsDone, nowMs)) {
++                pending -= entries.front().bytes;
++                entries.pop_front();
++                count++;
++            }
++
++            destroyed += count;
++            return count;
++        }
++
++        // Destroys everything (shutdown, once no queue uses the textures).
++        size_t clear() {
++            const size_t count = entries.size();
++            entries.clear();
++            pending = 0;
++            destroyed += count;
++            return count;
++        }
++
++        uint64_t pendingBytes() const { return pending; }
++        uint64_t peakPendingBytes() const { return peakPending; }
++        uint64_t destroyedCount() const { return destroyed; }
++        size_t size() const { return entries.size(); }
++
++    private:
++        struct Entry {
++            ReleaseStamp stamp;
++            uint64_t bytes;
++            std::unique_ptr<T> item;
++        };
++
++        std::deque<Entry> entries;
++        uint64_t pending = 0;
++        uint64_t peakPending = 0;
++        uint64_t destroyed = 0;
++    };
++
++    // HDR readback for the luminance log and BMP dumps (aki-roadmap#128)
++
++    // An IEEE half float's value (subnormals, infinities and NaNs included).
++    float halfToFloat(uint16_t half);
++
++    // Converts the scRGB (RGBA16F) swap chain read back by WCW_PRESENT_LUM / WCW_BMP_* to 8-bit sRGB BGRA, undoing
++    // the paper white scale, so the luminance log and BMPs stay comparable with SDR, and adds up the nits. Per pixel
++    // this was three powf calls and three half conversions on the present thread: 30+ ms a present at 1280x720,
++    // which took HDR runs with the luminance log from 60 presents/s to 10-20 from present 240 on (where the log
++    // starts). Tables indexed by the half's bits do the same per channel; the sRGB table is rebuilt when the scale
++    // changes.
++    class HdrReadbackConverter {
++    public:
++        // src: width RGBA16F pixels; dst: width BGRA8 pixels. invScale: 1 / the paper white scale.
++        void convertRow(const uint16_t *src, uint8_t *dst, uint32_t width, float invScale, double &nitsSum, float &nitsMax);
++        // How many times the sRGB table was built (tests).
++        uint32_t srgbTableBuilds() const { return srgbBuilds; }
++
++    private:
++        std::vector<float> halfTable;
++        std::vector<uint8_t> srgbTable;
++        float srgbTableScale = 0.0f;
++        uint32_t srgbBuilds = 0;
++    };
++
++    // The 8-bit sRGB value of a linear value (clamped to 0-1), as the readback always converted it.
++    uint8_t linearToSrgb8(float linearValue);
++
++    // In-game Datadog metrics (aki-roadmap#125)
++
++    // WCW_DD_METRICS=1 sends aggregated performance numbers to the local Datadog Agent (DogStatsD, udp
++    // 127.0.0.1:8125) every DdWindowSeconds while the game runs. Off by default. The aggregation and the DogStatsD
++    // lines are here; common/rt64_wcw_dd is the sink. Names follow AkiTools lib\ddmetrics.ps1 (aki.run.*) with the
++    // aki.game. prefix, so one dashboard can show test runs and play sessions side by side.
++    constexpr double DdWindowSeconds = 10.0;
++    // Each UDP packet stays under this, several lines per packet (as ddmetrics.ps1).
++    constexpr size_t DdMaxPacketBytes = 1400;
++    // A present interval above this many times the expected frame time is a hitch.
++    constexpr double DdHitchFactor = 2.0;
++
++    // Whether an environment value turns a switch on: set, not empty and not "0" (WCW_DD_METRICS, WCW_PERF_LOG).
++    bool envSwitchOn(const char *value);
++
++    // One window's numbers. Percentiles and the 1%-low rate need at least one present interval (hasIntervals); the
++    // GPU numbers need GPU timing rows (gpuRenderRows / gpuPresentRows).
++    // Deliberate differences from aki-run's numbers of the same name (aki-shot pacing, from wcw_present_lum.csv):
++    // - hitches: above 2x the larger of the target frame time and the median interval; aki-shot counts above 1.5x
++    //   the target, so a 30 fps scene on a 60 target counts every frame there and none here;
++    // - p50/p95/p99: nearest-rank, aki-shot interpolates (numpy);
++    // - real_fps: presents minus generated presents, so a repeated real frame counts; aki-run prefers distinct
++    //   frames from the luminance log (pacing.game_fps), which the renderer doesn't have.
++    struct DdFrameStats {
++        double seconds = 0.0;
++        uint32_t presents = 0;
++        uint32_t generated = 0;
++        uint32_t repeated = 0;
++        double presentsPerS = 0.0;
++        double realFps = 0.0;
++        double interpolatedPerS = 0.0;
++        double repeatedPerMin = 0.0;
++        bool hasIntervals = false;
++        double p50Ms = 0.0;
++        double p95Ms = 0.0;
++        double p99Ms = 0.0;
++        double maxMs = 0.0;
++        // 1000 / the mean of the slowest 1% of the intervals (at least one).
++        double low1PctFps = 0.0;
++        uint32_t hitches = 0;
++        double hitchesPerMin = 0.0;
++        // Per GPU timing row (one recorded command list; medians as aki-shot perf / aki.run.perf.*).
++        uint32_t gpuRenderRows = 0;
++        double gpuRenderMs = 0.0;
++        double gpuRenderP95Ms = 0.0;
++        double rtBuildMs = 0.0;
++        double rtTraceMs = 0.0;
++        // Per game frame: the rows of one presentId summed (every workload, every interpolated frame rendered from
++        // it), median and p95; and its RT build + trace. Only game frames whose rows all landed in the window.
++        uint32_t gameFrames = 0;
++        double gpuGameFrameMs = 0.0;
++        double gpuGameFrameP95Ms = 0.0;
++        double rtGameFrameMs = 0.0;
++        uint32_t gpuPresentRows = 0;
++        double gpuPresentMs = 0.0;
++    };
++
++    // Collects presents and GPU rows and summarizes them per window. Not thread-safe (the sink locks it).
++    class DdFrameWindow {
++    public:
++        // Starts a window at nowMs (steady clock ms) and forgets its samples. The last present time is kept, so the
++        // first interval of a window spans the boundary.
++        void start(double nowMs);
++        // A present at tMs. generated: an in-between frame; repeated: the real frame shown again.
++        void addPresent(double tMs, bool generated, bool repeated);
++        // GPU time of one render timing row (whole row; its RT build and trace parts), for the game frame presentId
++        // (rows of one game frame arrive together), or of one present.
++        void addGpuRender(uint64_t presentId, double gpuMs, double rtBuildMs, double rtTraceMs);
++        void addGpuPresent(double gpuMs);
++        // Summarizes the window up to nowMs and starts the next one there. fpsTarget: the expected present rate
++        // (ddFpsTarget). A hitch is an interval above DdHitchFactor times the larger of the target's frame time and
++        // the window's median interval, so a game that steadily draws below the target (30 fps on a 60 target) has
++        // no hitches, only its real stalls.
++        DdFrameStats take(double nowMs, uint32_t fpsTarget);
++    private:
++        double windowStartMs = -1.0;
++        double lastPresentMs = -1.0;
++        uint32_t presents = 0;
++        uint32_t generated = 0;
++        uint32_t repeated = 0;
++        std::vector<double> intervals;
++        std::vector<double> gpuRender;
++        std::vector<double> rtBuild;
++        std::vector<double> rtTrace;
++        std::vector<double> gpuPresent;
++        std::vector<double> frameGpu;
++        std::vector<double> frameRt;
++        // The game frame whose rows are arriving (kept across windows).
++        bool frameOpen = false;
++        uint64_t framePresentId = 0;
++        double frameGpuSum = 0.0;
++        double frameRtSum = 0.0;
++    };
++
++    // Nearest-rank percentile (p in 0..1) of unsorted values; 0 for none.
++    double ddPercentile(std::vector<double> values, double p);
++
++    // The present rate to expect: the target rate when the framerate setting sets one (Display, Manual), else the
++    // game's VI rate (Original). 0 when neither is known.
++    uint32_t ddFpsTarget(uint32_t targetRate, uint32_t viOriginalRate);
++
++    // Process numbers (Windows; has = false elsewhere), and VRAM from DXGI QueryVideoMemoryInfo (hasVram).
++    struct DdProcessSample {
++        bool has = false;
++        double privateMb = 0.0;
++        double workingSetMb = 0.0;
++        uint32_t handles = 0;
++        bool hasVram = false;
++        double vramMb = 0.0;
++        double vramBudgetMb = 0.0;
++    };
++
++    // The gauges for one window, by full name (aki.game.*), only those with data.
++    std::vector<std::pair<std::string, double>> ddWindowMetrics(const DdFrameStats &stats, const DdProcessSample &process);
++
++    // Whether the window that started at windowStartMs is due to be sent at nowMs (DdWindowSeconds).
++    bool ddWindowDue(double nowMs, double windowStartMs);
++
++    // One adapter's DXGI QueryVideoMemoryInfo (local segment): this process's usage and its budget, bytes.
++    struct DdVramAdapter {
++        uint64_t usage = 0;
++        uint64_t budget = 0;
++    };
++
++    // The process's VRAM: usage summed over the adapters (it is 0 on the ones it doesn't use), and the budget of
++    // the adapter it uses most (the first one on a tie, so an idle second GPU never replaces the first's budget).
++    DdVramAdapter ddPickVram(const std::vector<DdVramAdapter> &adapters);
++
++    // The settings and scene the numbers belong to, turned into tags. Gauges carry these tags, so they must stay low
++    // cardinality: no per-session ids.
++    struct DdContext {
++        std::string game;
++        uint32_t fpsTarget = 0;
++        // UserConfiguration::RefreshRate: original / display / manual.
++        std::string framerate;
++        bool rt = false;
++        uint32_t rtQuality = 0;
++        std::string resolution;
++        std::string aspect;
++        std::string msaa;
++        int downsample = 1;
++        bool hdr = false;
++        // The CRT preset (a name or a .slangp path; the tag is its file stem), empty when the filter is off.
++        std::string crt;
++        bool beam = false;
++        // The ray tracer's detected venue (rt only), empty when unknown.
++        std::string venue;
++        // WCW_DD_TAGS, already sanitized (ddParseTags).
++        std::vector<std::string> extraTags;
++        bool operator==(const DdContext &o) const;
++        bool operator!=(const DdContext &o) const { return !(*this == o); }
++    };
++
++    const char *rtQualityName(uint32_t quality);
++    // "crt/presets/crt-guest-advanced-ntsc.slangp" -> "crt-guest-advanced-ntsc": no folders (user paths) in tags.
++    std::string ddCrtPresetName(const std::string &preset);
++    // The context's tags. Extra tags whose key is one of these tags' own keys are dropped (WCW_DD_TAGS=game:x would
++    // otherwise add a second game tag).
++    std::vector<std::string> ddContextTags(const DdContext &context);
++    // "rt:off -> rt:on, fps_target:60 -> fps_target:120": the tags that changed, by key; empty when none did.
++    std::string ddTagChanges(const std::vector<std::string> &before, const std::vector<std::string> &after);
++
++    // The aki-run game key from the executable's name: "NoMercyRecompiled.exe" -> "nomercy", "WCWRecompiled" -> "wt"
++    // (AkiTools games.psd1). Unknown names are lowercased without "recompiled" and the extension.
++    std::string ddGameFromExe(const std::string &exeName);
++    // A play session's tags and events. The sink feeds it the renderer's settings every present and the ray tracer's
++    // venue on a change, and sends what it decides:
++    // - the first settings start the session (SessionStart);
++    // - changes in the first DdSettleSeconds after that are the startup settling (the swap chain's rate arriving,
++    //   the saved settings applied) and become the baseline silently; later ones are SettingsChanged, with the tag
++    //   changes as text;
++    // - a venue is a tag only while ray tracing runs (only the ray tracer detects it); a venue change with RT on and
++    //   a session started is VenueChanged.
++    constexpr double DdSettleSeconds = 3.0;
++
++    class DdSession {
++    public:
++        enum class Event {
++            None,
++            SessionStart,
++            SettingsChanged,
++            VenueChanged
++        };
++
++        struct Decision {
++            Event event = Event::None;
++            // SettingsChanged / VenueChanged: ddTagChanges of the tags.
++            std::string changes;
++        };
++
++        // The game and WCW_DD_TAGS, fixed for the session.
++        void setIdentity(const std::string &game, const std::vector<std::string> &extraTags);
++        // The renderer's settings at nowMs (ms); its game, extraTags and venue fields are ignored.
++        Decision noteContext(const DdContext &context, double nowMs);
++        Decision noteVenue(const std::string &venue);
++        bool started() const { return haveContext; }
++        const DdContext &context() const { return current; }
++        // The tags gauges and events carry: the context's, or only the game before the session started.
++        std::vector<std::string> tags() const;
++    private:
++        DdContext current;
++        std::vector<std::string> currentTags;
++        bool haveContext = false;
++        double startMs = 0.0;
++        std::string game;
++        std::vector<std::string> extraTags;
++        std::string venue;
++    };
++
++    // "conversion:btbw,owner:Fire Ant" -> sanitized tags; entries without a ':' or with an empty value are dropped.
++    std::vector<std::string> ddParseTags(const char *list);
++
++    // ddmetrics.ps1 ConvertTo-AkiMetricName: lowercase ASCII letters, digits, '_' and '.', starting with a letter.
++    std::string ddMetricName(const std::string &name);
++    // ddmetrics.ps1 ConvertTo-AkiTag: "key:value", lowercase, other characters as '_', at most 200 characters; empty
++    // when the value is empty.
++    std::string ddTag(const std::string &key, const std::string &value);
++    // '0.######' (ddmetrics.ps1 Format-AkiValue): up to 6 decimals, no trailing zeros, no exponent.
++    std::string ddFormatValue(double value);
++    // "name:value|g|#tag,tag"; empty for a value that isn't finite.
++    std::string ddGaugeLine(const std::string &name, double value, const std::vector<std::string> &tags);
++    // "_e{title,text}:title|text|k:key|s:aki-game|t:alert|#tags" (lengths in bytes; text newlines as \n).
++    std::string ddEventLine(const std::string &title, const std::string &text, const std::vector<std::string> &tags,
++        const std::string &alertType, const std::string &aggregationKey);
++    // Joins lines with '\n' into packets of at most maxBytes; a longer line goes alone.
++    std::vector<std::string> ddPackets(const std::vector<std::string> &lines, size_t maxBytes = DdMaxPacketBytes);
 +};
 diff --git a/src/common/rt64_wcw_perf.cpp b/src/common/rt64_wcw_perf.cpp
 new file mode 100644
-index 0000000..cf603ce
+index 0000000..9c75c1f
 --- /dev/null
 +++ b/src/common/rt64_wcw_perf.cpp
-@@ -0,0 +1,365 @@
+@@ -0,0 +1,372 @@
 +//
 +// RT64
 +//
 +
 +#include "rt64_wcw_perf.h"
++
++#include "rt64_wcw_logic.h"
 +
 +#include <algorithm>
 +#include <atomic>
@@ -2561,6 +4022,11 @@ index 0000000..cf603ce
 +        return on;
 +    }
 +
++    bool timingEnabled() {
++        static const bool on = enabled() || WcwLogic::envSwitchOn(getenv("WCW_DD_METRICS"));
++        return on;
++    }
++
 +    double clockMs(Clock::time_point t) {
 +        return std::chrono::duration<double, std::milli>(t.time_since_epoch()).count();
 +    }
@@ -2640,10 +4106,10 @@ index 0000000..cf603ce
 +};
 diff --git a/src/common/rt64_wcw_perf.h b/src/common/rt64_wcw_perf.h
 new file mode 100644
-index 0000000..9f5ad78
+index 0000000..d333dc2
 --- /dev/null
 +++ b/src/common/rt64_wcw_perf.h
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,172 @@
 +//
 +// RT64
 +//
@@ -2781,6 +4247,9 @@ index 0000000..9f5ad78
 +
 +    // Sink (not pure). WCW_PERF_LOG=1 enables it; the files go to the working directory.
 +    bool enabled();
++    // The GPU pass timer and the CPU timestamps around it run for WCW_PERF_LOG and for the in-game Datadog metrics
++    // (WCW_DD_METRICS, common/rt64_wcw_dd); only WCW_PERF_LOG writes the CSV files.
++    bool timingEnabled();
 +    using Clock = std::chrono::steady_clock;
 +    // Milliseconds since the steady clock's epoch, the time base of the other wcw_*.csv logs.
 +    double clockMs(Clock::time_point t);
@@ -16429,7 +17898,7 @@ index 16b4b9c..f9156e0 100644
                  break;
              }
 diff --git a/src/hle/rt64_application.cpp b/src/hle/rt64_application.cpp
-index 785de27..9904e4e 100644
+index 785de27..785f1ed 100644
 --- a/src/hle/rt64_application.cpp
 +++ b/src/hle/rt64_application.cpp
 @@ -4,6 +4,8 @@
@@ -16569,6 +18038,14 @@ index 785de27..9904e4e 100644
          if (userConfig.developerMode && (presentQueue != nullptr) && (state != nullptr) && !FileDialog::isOpen) {
              const std::lock_guard lock(presentQueue->inspectorMutex);
              if ((presentQueue->inspector != nullptr) && presentQueue->inspector->handleSdlEvent(event)) {
+@@ -686,6 +757,7 @@ namespace RT64 {
+         workloadVelocityUploader.reset();
+         workloadTilesUploader.reset();
+         sharedQueueResources.reset();
++        RenderTarget::wcwCloseDeferred();
+         rasterShaderCache.reset();
+ #   if RT_ENABLED
+         rtShaderCache.reset();
 diff --git a/src/hle/rt64_application_window.cpp b/src/hle/rt64_application_window.cpp
 index 86ae197..6a24b1d 100755
 --- a/src/hle/rt64_application_window.cpp
@@ -17146,19 +18623,21 @@ index dccaa87..8cb5dc2 100644
      }
  };
 diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
-index 3227ab1..214a9df 100644
+index 3227ab1..c7d4338 100644
 --- a/src/hle/rt64_present_queue.cpp
 +++ b/src/hle/rt64_present_queue.cpp
-@@ -4,12 +4,36 @@
+@@ -4,12 +4,93 @@
  
  #include "rt64_present_queue.h"
  
 +#include <thread>
 +
  #include "common/rt64_thread.h"
++#include "common/rt64_wcw_dd.h"
 +#include "common/rt64_wcw_logic.h"
 +#include "common/rt64_wcw_perf.h"
 +#include "render/rt64_hdr_output.h"
++#include "render/rt64_wcw_raytracer.h"
 +#include "render/rt64_wcw_device_lost.h"
  #include "rhi/rt64_render_hooks.h"
  
@@ -17183,10 +18662,65 @@ index 3227ab1..214a9df 100644
 +
 +    static uint32_t beamWaitForVBlank(RenderWindow window, uint32_t refreshRate);
 +
++    // [wcw dd] WCW_DD_METRICS: the settings the in-game Datadog metrics are tagged with (WcwLogic::DdContext).
++    static const char *wcwDdRefreshRateName(UserConfiguration::RefreshRate v) {
++        switch (v) {
++        case UserConfiguration::RefreshRate::Original:
++            return "original";
++        case UserConfiguration::RefreshRate::Display:
++            return "display";
++        case UserConfiguration::RefreshRate::Manual:
++            return "manual";
++        default:
++            return "unknown";
++        }
++    }
++
++    static const char *wcwDdResolutionName(UserConfiguration::Resolution v) {
++        switch (v) {
++        case UserConfiguration::Resolution::Original:
++            return "original";
++        case UserConfiguration::Resolution::WindowIntegerScale:
++            return "windowintegerscale";
++        case UserConfiguration::Resolution::Manual:
++            return "manual";
++        default:
++            return "unknown";
++        }
++    }
++
++    static const char *wcwDdAspectName(UserConfiguration::AspectRatio v) {
++        switch (v) {
++        case UserConfiguration::AspectRatio::Original:
++            return "original";
++        case UserConfiguration::AspectRatio::Expand:
++            return "expand";
++        case UserConfiguration::AspectRatio::Manual:
++            return "manual";
++        default:
++            return "unknown";
++        }
++    }
++
++    static const char *wcwDdMsaaName(UserConfiguration::Antialiasing v) {
++        switch (v) {
++        case UserConfiguration::Antialiasing::None:
++            return "none";
++        case UserConfiguration::Antialiasing::MSAA2X:
++            return "msaa2x";
++        case UserConfiguration::Antialiasing::MSAA4X:
++            return "msaa4x";
++        case UserConfiguration::Antialiasing::MSAA8X:
++            return "msaa8x";
++        default:
++            return "unknown";
++        }
++    }
++
      // PresentQueue
  
      PresentQueue::PresentQueue() {
-@@ -88,10 +112,25 @@ namespace RT64 {
+@@ -88,10 +169,25 @@ namespace RT64 {
  
          viRenderer = std::make_unique<VIRenderer>();
  
@@ -17212,7 +18746,26 @@ index 3227ab1..214a9df 100644
      void PresentQueue::threadPresent(const Present &present, bool &swapChainValid) {
          FramebufferManager &fbManager = ext.sharedResources->framebufferManager;
          RenderTargetManager &targetManager = ext.sharedResources->renderTargetManager;
-@@ -116,8 +155,13 @@ namespace RT64 {
+@@ -103,6 +199,10 @@ namespace RT64 {
+         UserConfiguration::Filtering filtering;
+         uint32_t viOriginalRate;
+         uint32_t targetRate;
++        UserConfiguration::Resolution wcwDdResolution;
++        UserConfiguration::AspectRatio wcwDdAspect;
++        UserConfiguration::Antialiasing wcwDdMsaa;
++        int wcwDdDownsample;
+         {
+             std::scoped_lock<std::mutex> configurationLock(ext.sharedResources->configurationMutex);
+             resolutionScale = ext.sharedResources->resolutionScale;
+@@ -112,12 +212,21 @@ namespace RT64 {
+             filtering = ext.sharedResources->userConfig.filtering;
+             viOriginalRate = ext.sharedResources->viOriginalRate;
+             targetRate = ext.sharedResources->targetRate;
++            wcwDdResolution = ext.sharedResources->userConfig.resolution;
++            wcwDdAspect = ext.sharedResources->userConfig.aspectRatio;
++            wcwDdMsaa = ext.sharedResources->userConfig.antialiasing;
++            wcwDdDownsample = ext.sharedResources->userConfig.downsampleMultiplier;
+         }
  
          RenderTarget *colorTarget = nullptr;
          int32_t framesToPresent = 1;
@@ -17227,7 +18780,7 @@ index 3227ab1..214a9df 100644
  
          // TODO: There's a possible race condition interactions that can happen while the workload
          // queue is rendering extra frames and the present event is processed while it's generating
-@@ -127,6 +171,16 @@ namespace RT64 {
+@@ -127,6 +236,16 @@ namespace RT64 {
          
          // Perform any external write operations indicated by the event.
          if (!present.fbOperations.empty()) {
@@ -17244,7 +18797,7 @@ index 3227ab1..214a9df 100644
              const std::scoped_lock lock(screenFbChangePoolMutex);
              {
                  RenderWorkerExecution workerExecution(ext.presentGraphicsWorker);
-@@ -177,6 +231,20 @@ namespace RT64 {
+@@ -177,6 +296,20 @@ namespace RT64 {
                          }
                      }
  
@@ -17265,7 +18818,7 @@ index 3227ab1..214a9df 100644
                      // Present early (or games that behave like it) will make it so that the presented image is a color image
                      // that the workload modified. We run a basic check to see if that holds true to indicate it was presented
                      // so interpolation is possible.
-@@ -194,11 +262,66 @@ namespace RT64 {
+@@ -194,11 +327,66 @@ namespace RT64 {
                      ext.sharedResources->workloadMutex.lock();
                  }
  
@@ -17333,7 +18886,7 @@ index 3227ab1..214a9df 100644
                          RenderTargetKey otherColorTargetKey(presentFb->addressStart, presentFb->width, presentFb->siz, presentFb->lastWriteType);
                          RenderTarget &otherColorTarget = targetManager.get(otherColorTargetKey, true);
                          if (!otherColorTarget.isEmpty()) {
-@@ -210,6 +333,7 @@ namespace RT64 {
+@@ -210,6 +398,7 @@ namespace RT64 {
                  }
                  else {
                      colorTarget = nullptr;
@@ -17341,7 +18894,7 @@ index 3227ab1..214a9df 100644
                  }
  
                  if (!present.paused && (viHistory.top().vi != present.screenVI)) {
-@@ -219,6 +343,13 @@ namespace RT64 {
+@@ -219,6 +408,13 @@ namespace RT64 {
              else {
                  uint32_t fbAddress = present.screenVI.fbAddress();
  
@@ -17355,7 +18908,7 @@ index 3227ab1..214a9df 100644
                  // Use a scratch framebuffer to upload the RAM to the render target.
                  hlslpp::uint2 fbSize = present.screenVI.fbSize();
                  scratchFb.addressStart = fbAddress;
-@@ -266,18 +397,29 @@ namespace RT64 {
+@@ -266,18 +462,29 @@ namespace RT64 {
              }
          }
          
@@ -17387,7 +18940,7 @@ index 3227ab1..214a9df 100644
                      framesToPresent = std::min(int(frameCounters.available), i + 1);
                      frameCountersNextPresented = frameCounters.count;
                  }
-@@ -287,7 +429,33 @@ namespace RT64 {
+@@ -287,7 +494,33 @@ namespace RT64 {
  
                  if (i < framesToPresent) {
                      uint32_t targetIndex = usingMSAA ? i : (i - 1);
@@ -17422,7 +18975,7 @@ index 3227ab1..214a9df 100644
                  }
                  else {
                      colorTarget = nullptr;
-@@ -299,8 +467,121 @@ namespace RT64 {
+@@ -299,8 +532,121 @@ namespace RT64 {
  
              uint32_t swapChainIndex = 0;
              const bool presentFrame = (i < framesToPresent) && swapChainValid;
@@ -17544,11 +19097,11 @@ index 3227ab1..214a9df 100644
              }
  
              if (presentFrame && swapChainValid) {
-@@ -308,11 +589,15 @@ namespace RT64 {
+@@ -308,11 +654,15 @@ namespace RT64 {
                  RenderTexture *swapChainTexture = ext.swapChain->getTexture(swapChainIndex);
                  RenderFramebuffer *swapChainFramebuffer = swapChainFramebuffers[swapChainIndex].get();
                  RenderCommandList *commandList = ext.presentGraphicsWorker->commandList.get();
-+                const bool wcwPerf = WcwPerf::enabled();
++                const bool wcwPerf = WcwPerf::timingEnabled();
 +                const WcwPerf::Clock::time_point wcwRecordStart = wcwPerf ? WcwPerf::Clock::now() : WcwPerf::Clock::time_point();
                  commandList->begin();
 +                wcwGpuTimer.begin(commandList);
@@ -17560,7 +19113,7 @@ index 3227ab1..214a9df 100644
                      renderParams.device = ext.device;
                      renderParams.commandList = commandList;
                      renderParams.swapChain = ext.swapChain;
-@@ -340,14 +625,47 @@ namespace RT64 {
+@@ -340,14 +690,47 @@ namespace RT64 {
                      }
                  }
                  
@@ -17609,7 +19162,7 @@ index 3227ab1..214a9df 100644
                  RenderHookDraw *drawHook = GetRenderHookDraw();
                  if (drawHook != nullptr) {
                      drawHook(commandList, swapChainFramebuffer);
-@@ -358,14 +676,261 @@ namespace RT64 {
+@@ -358,14 +741,230 @@ namespace RT64 {
                      if (inspector != nullptr) {
                          inspector->draw(commandList);
                      }
@@ -17690,6 +19243,7 @@ index 3227ab1..214a9df 100644
 +                            wcwRow.presentId = present.presentId;
 +                            wcwRow.generated = (i > 0);
 +                            WcwPerf::gpuRow(wcwRow);
++                            WcwDd::noteGpuRow(wcwRow);
 +                        }
 +                    }
 +
@@ -17700,33 +19254,9 @@ index 3227ab1..214a9df 100644
 +                        // (undoing the paper white scale) so the luminance log and BMPs stay comparable.
 +                        static std::vector<uint8_t> wcwHdrConverted;
 +                        if (HdrOutput::active()) {
-+                            auto halfToFloat = [](uint16_t h) {
-+                                const uint32_t sign = uint32_t(h & 0x8000) << 16;
-+                                const uint32_t exponent = (h >> 10) & 0x1F;
-+                                const uint32_t mantissa = h & 0x3FF;
-+                                uint32_t bits = sign;
-+                                if (exponent == 0x1F) {
-+                                    bits |= 0x7F800000 | (mantissa << 13);
-+                                }
-+                                else if (exponent != 0) {
-+                                    bits |= ((exponent + 112) << 23) | (mantissa << 13);
-+                                }
-+                                else if (mantissa != 0) {
-+                                    float value = float(mantissa) / 16777216.0f;
-+                                    return (sign != 0) ? -value : value;
-+                                }
-+
-+                                float value;
-+                                memcpy(&value, &bits, sizeof(value));
-+                                return value;
-+                            };
-+
-+                            auto toSrgb8 = [](float linearValue) {
-+                                const float c = std::clamp(linearValue, 0.0f, 1.0f);
-+                                const float s = (c <= 0.0031308f) ? (c * 12.92f) : (1.055f * powf(c, 1.0f / 2.4f) - 0.055f);
-+                                return uint8_t(std::lround(s * 255.0f));
-+                            };
-+
++                            // [wcw hdr] Table-driven (WcwLogic::HdrReadbackConverter): converting per pixel cost
++                            // 30+ ms a present and took HDR runs to 10-20 presents/s (aki-roadmap#128).
++                            static WcwLogic::HdrReadbackConverter wcwHdrConverter;
 +                            const float invScale = 1.0f / HdrOutput::sdrScale();
 +                            double nitsSum = 0.0;
 +                            float nitsMax = 0.0f;
@@ -17734,15 +19264,7 @@ index 3227ab1..214a9df 100644
 +                            for (uint32_t y = 0; y < wcwRbH; y++) {
 +                                const uint16_t *src = (const uint16_t *)(p + uint64_t(y) * wcwRbRow * 8);
 +                                uint8_t *dst = wcwHdrConverted.data() + uint64_t(y) * wcwRbRow * 4;
-+                                for (uint32_t x = 0; x < wcwRbW; x++) {
-+                                    const float nits = 80.0f * (0.2126f * halfToFloat(src[x * 4 + 0]) + 0.7152f * halfToFloat(src[x * 4 + 1]) + 0.0722f * halfToFloat(src[x * 4 + 2]));
-+                                    nitsSum += nits;
-+                                    nitsMax = std::max(nitsMax, nits);
-+                                    dst[x * 4 + 0] = toSrgb8(halfToFloat(src[x * 4 + 2]) * invScale);
-+                                    dst[x * 4 + 1] = toSrgb8(halfToFloat(src[x * 4 + 1]) * invScale);
-+                                    dst[x * 4 + 2] = toSrgb8(halfToFloat(src[x * 4 + 0]) * invScale);
-+                                    dst[x * 4 + 3] = 255;
-+                                }
++                                wcwHdrConverter.convertRow(src, dst, wcwRbW, invScale, nitsSum, nitsMax);
 +                            }
 +
 +                            fprintf(stderr, "[wcw hdr] present %d: mean %.0f nits, max %.0f nits\n", wcwPresentN, nitsSum / (double(wcwRbW) * wcwRbH), nitsMax);
@@ -17872,7 +19394,7 @@ index 3227ab1..214a9df 100644
                  }
              }
  
-@@ -390,17 +955,30 @@ namespace RT64 {
+@@ -390,17 +989,49 @@ namespace RT64 {
  
              if (presentFrame && swapChainValid) {
                  // Wait until the approximate time the next present should be at the current intended rate.
@@ -17901,10 +19423,29 @@ index 3227ab1..214a9df 100644
 +                    wcwPerfPresentCall(wcwPresentStart, WcwPerf::Clock::now());
 +                }
 +
++                // [wcw dd] WCW_DD_METRICS: the present (game presents only, as WCW_HFR_LOG counts them; beam sub-frames
++                // are not counted) and the settings it was drawn with.
++                if (WcwDd::enabled()) {
++                    WcwDd::notePresent(WcwDd::Clock::now(), i > 0, (i == 0) && wcwHfrRealRepeat);
++                    WcwLogic::DdContext wcwDdContext;
++                    wcwDdContext.fpsTarget = WcwLogic::ddFpsTarget(targetRate, viOriginalRate);
++                    wcwDdContext.framerate = wcwDdRefreshRateName(refreshRate);
++                    wcwDdContext.rt = WcwRaytracer::active();
++                    wcwDdContext.rtQuality = WcwRaytracer::userQuality();
++                    wcwDdContext.resolution = wcwDdResolutionName(wcwDdResolution);
++                    wcwDdContext.aspect = wcwDdAspectName(wcwDdAspect);
++                    wcwDdContext.msaa = wcwDdMsaaName(wcwDdMsaa);
++                    wcwDdContext.downsample = wcwDdDownsample;
++                    wcwDdContext.hdr = HdrOutput::active();
++                    wcwDdContext.crt = crtFilter->active() ? CrtFilter::userSettings().preset : std::string();
++                    wcwDdContext.beam = crtFilter->beamActive();
++                    WcwDd::noteContext(wcwDdContext);
++                }
++
                  presentProfiler.logAndRestart();
              }
          }
-@@ -430,6 +1008,274 @@ namespace RT64 {
+@@ -430,6 +1061,274 @@ namespace RT64 {
          barrierCursor = (barrierCursor + 1) % presents.size();
      }
  
@@ -18179,7 +19720,7 @@ index 3227ab1..214a9df 100644
      void PresentQueue::threadLoop() {
          Thread::setCurrentThreadName("RT64 Present");
  
-@@ -452,17 +1298,62 @@ namespace RT64 {
+@@ -452,15 +1351,60 @@ namespace RT64 {
          while (presentThreadRunning) {
              {
                  std::unique_lock<std::mutex> cursorLock(cursorMutex);
@@ -18215,9 +19756,9 @@ index 3227ab1..214a9df 100644
 +                            }
 +                        }
 +                    }
-                 }
-             }
- 
++                }
++            }
++
 +            // [wcw] After device loss the swap chain can't be resized or presented (its buffers may already be
 +            // released): present nothing, but complete each present so the workload thread and the game don't wait on
 +            // it while the application quits.
@@ -18235,24 +19776,26 @@ index 3227ab1..214a9df 100644
 +                    }
 +
 +                    threadAdvanceBarrier();
-+                }
+                 }
 +
 +                processCursor = -1;
 +                continue;
-+            }
-+
+             }
+ 
              if (processCursor >= 0) {
-                 std::unique_lock<std::mutex> threadLock(threadMutex);
-                 const bool needsResize = ext.swapChain->needsResize() || !swapChainValid;
-@@ -515,6 +1406,7 @@ namespace RT64 {
+@@ -515,7 +1459,11 @@ namespace RT64 {
                      notifyPresentId(present);
                  }
                  else {
 +                    std::scoped_lock<std::mutex> presentTargetsLock(wcwPresentTargetsMutex);
++                    // [wcw fix] Released render target textures outlive every present that started before (aki-roadmap#4).
++                    RenderTarget::wcwNotePresentStart();
                      threadPresent(present, swapChainValid);
++                    RenderTarget::wcwNotePresentEnd();
                  }
  
-@@ -533,8 +1425,9 @@ namespace RT64 {
+                 if (!present.paused) {
+@@ -533,8 +1481,9 @@ namespace RT64 {
          }
  
          // Transition the active swap chain render target out of the present state to avoid live references to the resource.
@@ -19327,20 +20870,37 @@ index 8ea27d5..b16db27 100644
  
          struct {
 diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
-index 5a331aa..060caf8 100644
+index 5a331aa..6d903ce 100644
 --- a/src/hle/rt64_workload_queue.cpp
 +++ b/src/hle/rt64_workload_queue.cpp
-@@ -5,6 +5,9 @@
+@@ -4,13 +4,26 @@
+ 
  #include "rt64_workload_queue.h"
  
++#include <chrono>
++#include <thread>
++
  #include "common/rt64_thread.h"
 +#include "common/rt64_wcw_logic.h"
++#include "common/rt64_wcw_dd.h"
 +#include "common/rt64_wcw_perf.h"
 +#include "render/rt64_wcw_device_lost.h"
  
  #include "rt64_present_queue.h"
  
-@@ -42,13 +45,13 @@ namespace RT64 {
+ #define ENABLE_HIGH_RESOLUTION_RENDERER 1
+ 
+ namespace RT64 {
++    // [wcw fix] WCW_REGROW_SETTLE_MS (aki-roadmap#4): negative when unset.
++    static int32_t wcwRegrowSettleOverride() {
++        static const int32_t value = []() { const char *v = getenv("WCW_REGROW_SETTLE_MS"); return (v != nullptr) ? int32_t(atoi(v)) : -1; }();
++        return value;
++    }
++
+     // WorkloadQueue
+ 
+     WorkloadQueue::WorkloadQueue() {
+@@ -42,13 +55,13 @@ namespace RT64 {
  
          threadCursor = 0;
          writeCursor = 0;
@@ -19356,7 +20916,7 @@ index 5a331aa..060caf8 100644
  
          // Stall the thread until the barrier is lifted if we're trying to write on a workload being used by the GPU.
          bool waitForBarrier;
-@@ -80,7 +83,7 @@ namespace RT64 {
+@@ -80,7 +93,7 @@ namespace RT64 {
              return writeCursor - 1;
          }
          else {
@@ -19365,7 +20925,7 @@ index 5a331aa..060caf8 100644
          }
      }
  
-@@ -103,6 +106,7 @@ namespace RT64 {
+@@ -103,6 +116,7 @@ namespace RT64 {
          framebufferRenderer = std::make_unique<FramebufferRenderer>(ext.workloadGraphicsWorker, true, ext.createdGraphicsAPI, ext.shaderLibrary);
          renderFramebufferManager = std::make_unique<RenderFramebufferManager>(ext.device);
          queryPool = ext.device->createQueryPool(2);
@@ -19373,7 +20933,7 @@ index 5a331aa..060caf8 100644
  
          projectionProcessor.setup(ext.workloadGraphicsWorker);
          transformProcessor.setup(ext.workloadGraphicsWorker);
-@@ -131,7 +135,14 @@ namespace RT64 {
+@@ -131,7 +145,14 @@ namespace RT64 {
          const uint32_t referenceHeight = (viFbSize[1] > 0) ? std::max(viFbSize[1], MinimumReferenceHeight) : 240;
  
          // Compute the aspect ratio to be used for the frame.
@@ -19389,7 +20949,7 @@ index 5a331aa..060caf8 100644
  
          const auto ratioMode = ext.sharedResources->userConfig.aspectRatio;
          switch (ratioMode) {
-@@ -187,13 +198,10 @@ namespace RT64 {
+@@ -187,13 +208,10 @@ namespace RT64 {
          const auto resolutionMode = ext.sharedResources->userConfig.resolution;
          switch (resolutionMode) {
          case UserConfiguration::Resolution::WindowIntegerScale:
@@ -19407,7 +20967,7 @@ index 5a331aa..060caf8 100644
              break;
          case UserConfiguration::Resolution::Manual:
              resolutionMultiplier = float(ext.sharedResources->userConfig.resolutionMultiplier);
-@@ -258,9 +266,30 @@ namespace RT64 {
+@@ -258,9 +276,30 @@ namespace RT64 {
                  // Wait until the other queue has stopped using the interpolated color targets.
                  std::unique_lock<std::mutex> interpolatedLock(ext.sharedResources->interpolatedMutex);
                  InterpolatedFrameCounters &curFrameCounters = ext.sharedResources->interpolatedFrames[ext.sharedResources->interpolatedFramesIndex];
@@ -19439,7 +20999,7 @@ index 5a331aa..060caf8 100644
              }
  
              std::scoped_lock<std::mutex> managerLock(ext.sharedResources->managerMutex);
-@@ -271,6 +300,8 @@ namespace RT64 {
+@@ -271,6 +310,8 @@ namespace RT64 {
              fbManager.destroyAllTileCopies();
              ext.sharedResources->fbConfigChanged = false;
              ext.sharedResources->interpolatedColorTargets.clear();
@@ -19448,7 +21008,7 @@ index 5a331aa..060caf8 100644
          }
  
          if (ext.sharedResources->userConfigChanged) {
-@@ -289,6 +320,10 @@ namespace RT64 {
+@@ -289,6 +330,10 @@ namespace RT64 {
          }
      }
      
@@ -19459,18 +21019,19 @@ index 5a331aa..060caf8 100644
      void WorkloadQueue::threadRenderFrame(GameFrame &curFrame, const GameFrame &prevFrame, const WorkloadConfiguration &workloadConfig,
          const DebuggerRenderer &debuggerRenderer, const DebuggerCamera &debuggerCamera, float curFrameWeight, float prevFrameWeight,
          float deltaTimeMs, RenderTargetKey overrideTargetKey, int32_t overrideTargetFbPairIndex, RenderTarget *overrideTarget,
-@@ -301,6 +336,10 @@ namespace RT64 {
+@@ -301,6 +346,11 @@ namespace RT64 {
          const bool usingMSAA = (targetManager.multisampling.sampleCount > 1);
  
          rendererCPUProfiler.start();
-+        // [wcw perf] WCW_PERF_LOG: CPU time recording this frame, then waiting for its GPU work.
-+        const bool wcwPerf = WcwPerf::enabled();
++        // [wcw perf] WCW_PERF_LOG: CPU time recording this frame, then waiting for its GPU work. The GPU rows also feed
++        // the in-game Datadog metrics (WCW_DD_METRICS).
++        const bool wcwPerf = WcwPerf::timingEnabled();
 +        // A frame of several workloads records one command list each; each row starts where the last one ended.
 +        WcwPerf::Clock::time_point wcwRecordStart = wcwPerf ? WcwPerf::Clock::now() : WcwPerf::Clock::time_point();
  
          const bool aspectRatioAdjustment = (abs(workloadConfig.aspectRatioScale - 1.0f) > 1e-6f);
          const bool processProjections = aspectRatioAdjustment || prevFrame.matched|| curFrame.isDebuggerCameraEnabled(*this);
-@@ -387,7 +426,8 @@ namespace RT64 {
+@@ -387,7 +437,8 @@ namespace RT64 {
                  rspProcessor->process(rspParams);
              }
  
@@ -19480,7 +21041,7 @@ index 5a331aa..060caf8 100644
              if (processWorldVertices) {
                  workload.resetWorldOutputBuffers();
  
-@@ -452,6 +492,24 @@ namespace RT64 {
+@@ -452,6 +503,24 @@ namespace RT64 {
                      if (colorFb != nullptr) {
                          fbKey.colorTargetKey = RenderTargetKey(colorFb->addressStart, colorFb->width, colorFb->siz, Framebuffer::Type::Color);
                          colorTarget = &targetManager.get(fbKey.colorTargetKey);
@@ -19505,7 +21066,34 @@ index 5a331aa..060caf8 100644
                      }
                      else {
                          colorTarget = nullptr;
-@@ -604,6 +662,10 @@ namespace RT64 {
+@@ -548,6 +617,7 @@ namespace RT64 {
+                         if (dummyDepthTarget == nullptr) {
+                             dummyDepthTarget = std::make_unique<RenderTarget>(0, Framebuffer::Type::Depth, targetManager.multisampling, targetManager.usesHDR);
+                             dummyDepthTarget->setupDepth(ext.workloadGraphicsWorker, rtWidth, rtHeight);
++                            resizedTargets.emplace(dummyDepthTarget.get());
+                         }
+ 
+                         if ((dummyDepthTarget != nullptr) && dummyDepthTarget->resize(ext.workloadGraphicsWorker, rtWidth, rtHeight)) {
+@@ -581,8 +651,18 @@ namespace RT64 {
+                 }
+             }
+ 
++            uint64_t wcwRegrownPixels = 0;
+             for (RenderTarget *renderTarget : resizedTargets) {
+                 renderFramebufferManager->destroyAllWithRenderTarget(renderTarget);
++                wcwRegrownPixels += uint64_t(renderTarget->width) * renderTarget->height;
++            }
++
++            // [wcw fix] Let big new render targets settle before the first workload records into them (aki-roadmap#4).
++            // Only with WCW_TARGET_DEFER=0 or WCW_REGROW_SETTLE_MS: released textures are destroyed later instead.
++            const uint32_t wcwSettleMs = WcwLogic::regrowSettleMs(wcwRegrownPixels, wcwRegrowSettleOverride(), RenderTarget::wcwDeferringRelease());
++            if (wcwSettleMs > 0) {
++                fprintf(stderr, "[wcw] render targets regrown (%.1f Mpx); waiting %u ms before using them\n", double(wcwRegrownPixels) / 1e6, wcwSettleMs);
++                std::this_thread::sleep_for(std::chrono::milliseconds(wcwSettleMs));
+             }
+ 
+             uint32_t gameCallCursor = 0;
+@@ -604,6 +684,10 @@ namespace RT64 {
              // Add all framebuffer pairs to the framebuffer renderer and setup the operations.
              scratchFbChangePool.reset();
              fbManager.resetOperations();
@@ -19516,7 +21104,7 @@ index 5a331aa..060caf8 100644
              framebufferRenderer->resetFramebuffers(ext.workloadGraphicsWorker, ubershadersVisible, workload.extended.ditherNoiseStrength, targetManager.multisampling);
  
  #       if RT_ENABLED
-@@ -701,11 +763,50 @@ namespace RT64 {
+@@ -701,11 +785,57 @@ namespace RT64 {
              ext.workloadGraphicsWorker->commandList->begin();
              ext.workloadGraphicsWorker->commandList->resetQueryPool(queryPool.get(), 0, 2);
              ext.workloadGraphicsWorker->commandList->writeTimestamp(queryPool.get(), 0);
@@ -19549,7 +21137,14 @@ index 5a331aa..060caf8 100644
 +                        continue;
 +                    }
 +
-+                    primeTarget->resize(ext.workloadGraphicsWorker, liveTarget.width, liveTarget.height);
++                    if (primeTarget->resize(ext.workloadGraphicsWorker, liveTarget.width, liveTarget.height)) {
++                        const uint32_t wcwPrimeSettleMs = WcwLogic::regrowSettleMs(uint64_t(primeTarget->width) * primeTarget->height, wcwRegrowSettleOverride(), RenderTarget::wcwDeferringRelease());
++                        if (wcwPrimeSettleMs > 0) {
++                            fprintf(stderr, "[wcw] generated-frame target regrown; waiting %u ms before using it\n", wcwPrimeSettleMs);
++                            std::this_thread::sleep_for(std::chrono::milliseconds(wcwPrimeSettleMs));
++                        }
++                    }
++
 +                    RenderTextureBarrier primeBarriers[] = {
 +                        RenderTextureBarrier(liveTarget.texture.get(), RenderTextureLayout::COPY_SOURCE),
 +                        RenderTextureBarrier(primeTarget->texture.get(), RenderTextureLayout::COPY_DEST)
@@ -19570,7 +21165,7 @@ index 5a331aa..060caf8 100644
              for (uint32_t f = 0; f < fbPairCount; f++) {
                  const FramebufferPair &fbPair = workload.fbPairs[f];
                  bool validTargets = getTargetsFromPair(f);
-@@ -789,7 +890,10 @@ namespace RT64 {
+@@ -789,7 +919,10 @@ namespace RT64 {
                          }
                      }
                      
@@ -19582,7 +21177,7 @@ index 5a331aa..060caf8 100644
  
                      // Transition the render targets in case the present queue will show them so it doesn't have to perform transitions.
                      if (colorTarget != nullptr && depthTarget != nullptr) {
-@@ -814,7 +918,11 @@ namespace RT64 {
+@@ -814,7 +947,11 @@ namespace RT64 {
                      const uint64_t writeTimestamp = fbManager.nextWriteTimestamp();
                      FixedRect depthFbRect;
                      if (colorFb != nullptr) {
@@ -19595,7 +21190,7 @@ index 5a331aa..060caf8 100644
                          colorFb->lastWriteType = Framebuffer::Type::Color;
                          colorFb->lastWriteFmt = colorImg.fmt;
                          colorFb->lastWriteTimestamp = writeTimestamp;
-@@ -837,17 +945,108 @@ namespace RT64 {
+@@ -837,17 +974,110 @@ namespace RT64 {
                      fbPair.endFbOperations, targetManager, fixedResScale, f, workload.submissionFrame);
              }
  
@@ -19606,6 +21201,7 @@ index 5a331aa..060caf8 100644
 +            const WcwPerf::Clock::time_point wcwSubmit = wcwPerf ? WcwPerf::Clock::now() : WcwPerf::Clock::time_point();
              ext.workloadGraphicsWorker->execute();
              ext.workloadGraphicsWorker->wait();
++            RenderTarget::wcwNoteWorkloadDone();
 +            if (wcwPerf) {
 +                const WcwPerf::Clock::time_point wcwDone = WcwPerf::Clock::now();
 +                WcwPerf::cpuPhase(WcwPerf::CpuPhase::Rt64Record, wcwRecordStart, wcwSubmit);
@@ -19620,6 +21216,7 @@ index 5a331aa..060caf8 100644
 +                    // game frame is the generated one, drawn into the game target; the real frame goes to an override.
 +                    wcwRow.generated = WcwLogic::generatedFrame(curFrameWeight);
 +                    WcwPerf::gpuRow(wcwRow);
++                    WcwDd::noteGpuRow(wcwRow);
 +                }
 +
 +                wcwRecordStart = wcwDone;
@@ -19704,7 +21301,7 @@ index 5a331aa..060caf8 100644
  
              // Indicate to the texture cache it's safe to delete the textures if no locks are active.
              ext.textureCache->decrementLock();
-@@ -866,7 +1065,7 @@ namespace RT64 {
+@@ -866,7 +1096,7 @@ namespace RT64 {
  
      void WorkloadQueue::threadAdvanceBarrier() {
          std::scoped_lock<std::mutex> cursorLock(cursorMutex);
@@ -19713,7 +21310,7 @@ index 5a331aa..060caf8 100644
      }
  
      void WorkloadQueue::threadAdvanceWorkloadId(uint64_t newWorkloadId) {
-@@ -882,12 +1081,41 @@ namespace RT64 {
+@@ -882,12 +1112,41 @@ namespace RT64 {
          Thread::setCurrentThreadName("RT64 Workload");
  
          WorkloadConfiguration workloadConfig;
@@ -19758,7 +21355,7 @@ index 5a331aa..060caf8 100644
          while (threadsRunning) {
              {
                  std::unique_lock<std::mutex> cursorLock(cursorMutex);
-@@ -897,28 +1125,235 @@ namespace RT64 {
+@@ -897,28 +1156,235 @@ namespace RT64 {
  
                  if (threadsRunning) {
                      processCursor = threadCursor;
@@ -19995,7 +21592,7 @@ index 5a331aa..060caf8 100644
                  
                  // TODO: The frame detection needs to be more elaborate than just matching one workload to one frame.
                  GameFrame &curFrame = gameFrames[curFrameIndex];
-@@ -959,6 +1394,15 @@ namespace RT64 {
+@@ -959,6 +1425,15 @@ namespace RT64 {
                              continue;
                          }
  
@@ -20011,7 +21608,7 @@ index 5a331aa..060caf8 100644
                          Framebuffer *interpolationFb = fbManager.find(colorImg.address);
                          if ((interpolationFb != nullptr) && interpolationFb->interpolationEnabled) {
                              interpolationTargetKey.fbType = Framebuffer::Type::Color;
-@@ -970,6 +1414,43 @@ namespace RT64 {
+@@ -970,6 +1445,43 @@ namespace RT64 {
                      }
                  }
  
@@ -20055,7 +21652,7 @@ index 5a331aa..060caf8 100644
                  float prevFrameWeight = 0.0f;
                  float curFrameWeight = 1.0f;
                  float deltaTimeMs = 1.0f / 30.0f;
-@@ -985,13 +1466,84 @@ namespace RT64 {
+@@ -985,13 +1497,84 @@ namespace RT64 {
                      matchingProfiler.end();
                      matchingProfiler.log();
  
@@ -20143,7 +21740,7 @@ index 5a331aa..060caf8 100644
                          originalRateForTicks = workload.viOriginalRate;
                          displayRateForTicks = workloadConfig.targetRate;
                      }
-@@ -1000,18 +1552,24 @@ namespace RT64 {
+@@ -1000,18 +1583,24 @@ namespace RT64 {
                  // Estimate amount of frames to render based on how many display frames it'd take to reach the next logical frame.
                  uint32_t displayFrames = 1;
                  if (generateInterpolatedFrames) {
@@ -20176,7 +21773,7 @@ index 5a331aa..060caf8 100644
                      assert((displayFrames > 0) && "At least one display frame must be generated.");
                  }
                  else if (workload.viOriginalRate > 0) {
-@@ -1022,16 +1580,64 @@ namespace RT64 {
+@@ -1022,16 +1611,64 @@ namespace RT64 {
                  
                  // Get the current and previous set of frame counters. The other set can be in use by the present queue. Skip if no new present event has arrived before this workload event.
                  InterpolatedFrameCounters &prevFrameCounters = ext.sharedResources->interpolatedFrames[ext.sharedResources->interpolatedFramesIndex];
@@ -20243,7 +21840,7 @@ index 5a331aa..060caf8 100644
                          return (prevFrameCounters.presented == 0) || (prevFrameCounters.presented >= prevFrameCounters.available);
                      });
                  }
-@@ -1043,7 +1649,11 @@ namespace RT64 {
+@@ -1043,7 +1680,11 @@ namespace RT64 {
                  curFrameCounters.count = displayFrames;
  
                  // Create as many render targets as required to store the interpolated targets.
@@ -20256,7 +21853,7 @@ index 5a331aa..060caf8 100644
                  const bool usingMSAA = (ext.sharedResources->renderTargetManager.multisampling.sampleCount > 1);
                  const bool usesHDR = ext.sharedResources->renderTargetManager.usesHDR;
                  uint32_t requiredFrames = (usingMSAA && generateInterpolatedFrames) ? displayFrames : (displayFrames - 1);
-@@ -1061,18 +1671,33 @@ namespace RT64 {
+@@ -1061,18 +1702,33 @@ namespace RT64 {
                  const int64_t maxTimePerFrameMicro = adjustedTimeWindowMicro / displayFrames;
                  bool skippedFrames = false;
                  bool skipWorkloadNow = false;
@@ -20292,7 +21889,7 @@ index 5a331aa..060caf8 100644
                              continue;
                          }
                      }
-@@ -1080,23 +1705,20 @@ namespace RT64 {
+@@ -1080,23 +1736,20 @@ namespace RT64 {
                      RenderTarget *overrideTarget = nullptr;
                      uint32_t overrideModifier = 0;
                      if (generateInterpolatedFrames) {
@@ -20326,7 +21923,7 @@ index 5a331aa..060caf8 100644
  
                              targetIndex++;
                          }
-@@ -1120,6 +1742,19 @@ namespace RT64 {
+@@ -1120,6 +1773,19 @@ namespace RT64 {
                      threadRenderFrame(curFrame, prevFrame, workloadConfig, workload.debuggerRenderer, workload.debuggerCamera, curFrameWeight, prevFrameWeight, deltaTimeMs,
                          interpolationTargetKey, interpolationTargetFbPairIndex, overrideTarget, overrideModifier, velocityUploaderUsed, uploadExtras, tileInterpolationUsed, lookAtInterpolationUsed);
  
@@ -20346,7 +21943,7 @@ index 5a331aa..060caf8 100644
                      // Add total time the frame took to render.
                      renderTimeTotalMicro += workloadTimer.elapsedMicroseconds() - renderTimeMicro;
  
-@@ -1130,20 +1765,98 @@ namespace RT64 {
+@@ -1130,20 +1796,98 @@ namespace RT64 {
  
                      // For every additional frame, we increase the frames available and notify the present queue.
                      if (generateInterpolatedFrames && (usingMSAA || (frame > 0))) {
@@ -20449,7 +22046,7 @@ index 5a331aa..060caf8 100644
                          }
  
                          ext.sharedResources->interpolatedCondition.notify_all();
-@@ -1162,6 +1875,64 @@ namespace RT64 {
+@@ -1162,6 +1906,64 @@ namespace RT64 {
                      ext.sharedResources->interpolatedCondition.notify_all();
                  }
  
@@ -20514,7 +22111,7 @@ index 5a331aa..060caf8 100644
                  threadConfigurationValidate();
  
                  if (!workload.paused) {
-@@ -1206,6 +1977,12 @@ namespace RT64 {
+@@ -1206,6 +2008,12 @@ namespace RT64 {
              }
  
              if (threadsRunning) {
@@ -22660,6 +24257,223 @@ index 721a01e..41ee077 100644
  #   if SAMPLE_LOCATIONS_REQUIRED
          if (!sampleLocationsSupported) {
              return RenderMultisampling();
+diff --git a/src/render/rt64_render_target.cpp b/src/render/rt64_render_target.cpp
+index 81917bc..835e9c1 100644
+--- a/src/render/rt64_render_target.cpp
++++ b/src/render/rt64_render_target.cpp
+@@ -5,12 +5,16 @@
+ #include "rt64_render_target.h"
+ 
+ #include <algorithm>
++#include <chrono>
++#include <mutex>
+ 
+ #include "gbi/rt64_f3d.h"
+ #include "shared/rt64_fb_common.h"
+ #include "shared/rt64_render_target_copy.h"
+ #include "shared/rt64_texture_copy.h"
+ 
++#include "common/rt64_wcw_logic.h"
++
+ #include "rt64_raster_shader.h"
+ 
+ #define PRINT_CONSTRUCTOR_DESTRUCTOR 0
+@@ -20,6 +24,104 @@ namespace RT64 {
+     
+     const long RenderTarget::MaxDimension = 0x4000L;
+ 
++    // [wcw fix] Deferred release of render target textures (aki-roadmap#4). Supersampling 2x hung the GPU (NVIDIA
++    // Xid 13, DEVICE_HUNG) when a regrow destroyed the textures it replaced; keeping them alive avoided it with no
++    // wait at all. Everything a target made from its textures goes with them and is destroyed first.
++    struct WcwReleasedTextures {
++        std::unique_ptr<RenderTexture> texture;
++        std::unique_ptr<RenderTexture> resolvedTexture;
++        std::unique_ptr<RenderTexture> downsampledTexture;
++        std::unique_ptr<RenderTexture> dummyTexture;
++        std::unique_ptr<RenderTextureView> textureView;
++        std::unique_ptr<RenderTextureView> resolvedTextureView;
++        std::unique_ptr<RenderFramebuffer> textureFramebuffer;
++        std::unique_ptr<RenderFramebuffer> resolveFramebuffer;
++        std::unique_ptr<RenderTargetCopyDescriptorSet> targetCopyDescSet;
++        std::unique_ptr<TextureCopyDescriptorSet> textureCopyDescSet;
++        std::unique_ptr<TextureCopyDescriptorSet> textureResolveDescSet;
++        std::unique_ptr<BoxFilterDescriptorSet> filterDescSet;
++        std::unique_ptr<FramebufferWriteDescriptorTextureSet> fbWriteDescSet;
++
++        ~WcwReleasedTextures() {
++            fbWriteDescSet.reset();
++            filterDescSet.reset();
++            textureResolveDescSet.reset();
++            textureCopyDescSet.reset();
++            targetCopyDescSet.reset();
++            resolveFramebuffer.reset();
++            textureFramebuffer.reset();
++            resolvedTextureView.reset();
++            textureView.reset();
++            dummyTexture.reset();
++            downsampledTexture.reset();
++            resolvedTexture.reset();
++            texture.reset();
++        }
++    };
++
++    std::atomic<uint64_t> RenderTarget::wcwPresentsStarted = 0;
++    std::atomic<uint64_t> RenderTarget::wcwPresentsFinished = 0;
++    std::atomic<uint64_t> RenderTarget::wcwWorkloadsDone = 0;
++
++    // Never destroyed statically: whatever is left at exit is destroyed by wcwCloseDeferred, before the device.
++    static std::mutex wcwDeferredMutex;
++    static WcwLogic::DeferredReleaseList<WcwReleasedTextures> &wcwDeferred = *new WcwLogic::DeferredReleaseList<WcwReleasedTextures>();
++    static bool wcwDeferredClosed = false;
++    static uint64_t wcwDeferredLoggedPeak = 0;
++
++    static uint64_t wcwNowMs() {
++        return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
++    }
++
++    // Stamps released textures and keeps them until WcwLogic::releaseReady (after close they're destroyed at once).
++    static void wcwDefer(std::unique_ptr<WcwReleasedTextures> released, uint64_t bytes) {
++        std::scoped_lock<std::mutex> lock(wcwDeferredMutex);
++        if (wcwDeferredClosed) {
++            return;
++        }
++
++        WcwLogic::ReleaseStamp stamp;
++        stamp.presentsStarted = RenderTarget::wcwPresentsStarted.load();
++        stamp.workloadsDone = RenderTarget::wcwWorkloadsDone.load();
++        stamp.ms = wcwNowMs();
++        wcwDeferred.push(stamp, bytes, std::move(released));
++        if (wcwDeferred.peakPendingBytes() >= (wcwDeferredLoggedPeak + (16ULL << 20))) {
++            wcwDeferredLoggedPeak = wcwDeferred.peakPendingBytes();
++            fprintf(stderr, "[wcw] render target deferred release: peak %.1f MB pending, %llu released\n", double(wcwDeferredLoggedPeak) / 1048576.0,
++                (unsigned long long)(wcwDeferred.destroyedCount() + wcwDeferred.size()));
++        }
++    }
++
++    bool RenderTarget::wcwDeferringRelease() {
++        static const bool enabled = []() { const char *v = getenv("WCW_TARGET_DEFER"); return (v == nullptr) || (strcmp(v, "0") != 0); }();
++        return enabled;
++    }
++
++    void RenderTarget::wcwNotePresentStart() {
++        wcwPresentsStarted++;
++    }
++
++    void RenderTarget::wcwNotePresentEnd() {
++        wcwPresentsFinished++;
++    }
++
++    void RenderTarget::wcwNoteWorkloadDone() {
++        const uint64_t done = ++wcwWorkloadsDone;
++        std::scoped_lock<std::mutex> lock(wcwDeferredMutex);
++        wcwDeferred.collect(wcwPresentsFinished.load(), done, wcwNowMs());
++    }
++
++    void RenderTarget::wcwCloseDeferred() {
++        std::scoped_lock<std::mutex> lock(wcwDeferredMutex);
++        if (wcwDeferred.destroyedCount() > 0) {
++            fprintf(stderr, "[wcw] render target deferred release: peak %.1f MB pending, %llu released\n", double(wcwDeferred.peakPendingBytes()) / 1048576.0,
++                (unsigned long long)(wcwDeferred.destroyedCount() + wcwDeferred.size()));
++        }
++
++        wcwDeferred.clear();
++        wcwDeferredClosed = true;
++    }
++
+     RenderTarget::RenderTarget(uint32_t addressForName, Framebuffer::Type type, const RenderMultisampling &multisampling, bool usesHDR) {
+         this->addressForName = addressForName;
+         this->type = type;
+@@ -32,12 +134,49 @@ namespace RT64 {
+     }
+ 
+     RenderTarget::~RenderTarget() {
++        // [wcw fix] Deferred too (settings applies destroy every target; aki-roadmap#4). With WCW_TARGET_DEFER=0 the
++        // members go in reverse order, as before.
++        if (wcwDeferringRelease()) {
++            releaseTextures();
++        }
++
+ #if PRINT_CONSTRUCTOR_DESTRUCTOR
+         fprintf(stdout, "~RenderTarget(0x%p)\n", this);
+ #endif
+     }
+ 
+     void RenderTarget::releaseTextures() {
++        // [wcw fix] Defer the textures' destruction (aki-roadmap#4). The stamp is taken after they left the target,
++        // so a present that starts later can't pick them up.
++        if (wcwDeferringRelease() && ((texture != nullptr) || (resolvedTexture != nullptr) || (dummyTexture != nullptr))) {
++            std::unique_ptr<WcwReleasedTextures> released = std::make_unique<WcwReleasedTextures>();
++            released->texture = std::move(texture);
++            released->resolvedTexture = std::move(resolvedTexture);
++            released->downsampledTexture = std::move(downsampledTexture);
++            released->dummyTexture = std::move(dummyTexture);
++            released->textureView = std::move(textureView);
++            released->resolvedTextureView = std::move(resolvedTextureView);
++            released->textureFramebuffer = std::move(textureFramebuffer);
++            released->resolveFramebuffer = std::move(resolveFramebuffer);
++            released->targetCopyDescSet = std::move(targetCopyDescSet);
++            released->textureCopyDescSet = std::move(textureCopyDescSet);
++            released->textureResolveDescSet = std::move(textureResolveDescSet);
++            released->filterDescSet = std::move(filterDescSet);
++            released->fbWriteDescSet = std::move(fbWriteDescSet);
++            const uint64_t pixels = uint64_t(width) * height;
++            const uint64_t samples = std::max<uint32_t>(multisampling.sampleCount, 1);
++            const uint64_t formatBytes = (format != RenderFormat::UNKNOWN) ? RenderFormatSize(format) : 0;
++            uint64_t bytes = 0;
++            bytes += (released->texture != nullptr) ? (pixels * samples * formatBytes) : 0;
++            bytes += (released->resolvedTexture != nullptr) ? (pixels * formatBytes) : 0;
++            if ((released->downsampledTexture != nullptr) && (downsampledTextureMultiplier > 0)) {
++                bytes += uint64_t(width / downsampledTextureMultiplier) * (height / downsampledTextureMultiplier) * formatBytes;
++            }
++            bytes += (released->dummyTexture != nullptr) ? (pixels * samples * RenderFormatSize(colorBufferFormat(usesHDR))) : 0;
++
++            wcwDefer(std::move(released), bytes);
++        }
++
+         textureView.reset();
+         resolvedTextureView.reset();
+         texture.reset();
+@@ -363,6 +502,15 @@ namespace RT64 {
+         };
+ 
+         if (downsampledTextureMultiplier != downsampleMultiplier) {
++            // [wcw fix] Deferred like the other released textures (aki-roadmap#4).
++            if (wcwDeferringRelease() && (downsampledTexture != nullptr)) {
++                std::unique_ptr<WcwReleasedTextures> released = std::make_unique<WcwReleasedTextures>();
++                released->downsampledTexture = std::move(downsampledTexture);
++                const uint64_t bytes = uint64_t(width / std::max(downsampledTextureMultiplier, 1U)) * (height / std::max(downsampledTextureMultiplier, 1U)) *
++                    RenderFormatSize(colorBufferFormat(usesHDR));
++                wcwDefer(std::move(released), bytes);
++            }
++
+             downsampledTexture.reset(nullptr);
+             downsampledTextureMultiplier = 0;
+         }
+diff --git a/src/render/rt64_render_target.h b/src/render/rt64_render_target.h
+index 82d8a36..170ad7b 100644
+--- a/src/render/rt64_render_target.h
++++ b/src/render/rt64_render_target.h
+@@ -18,6 +18,20 @@ namespace RT64 {
+ 
+     struct RenderTarget {
+         static const long MaxDimension;
++        // [wcw fix] Deferred release (aki-roadmap#4): releaseTextures hands the textures and the objects made from
++        // them to a list, destroyed once WcwLogic::releaseReady says no queue can still be using them. The counters
++        // it uses: presents started and finished by the present thread (wcwNotePresentStart / wcwNotePresentEnd) and
++        // workloads finished by the workload thread (wcwNoteWorkloadDone, which also destroys what is ready).
++        static std::atomic<uint64_t> wcwPresentsStarted;
++        static std::atomic<uint64_t> wcwPresentsFinished;
++        static std::atomic<uint64_t> wcwWorkloadsDone;
++        static void wcwNotePresentStart();
++        static void wcwNotePresentEnd();
++        static void wcwNoteWorkloadDone();
++        // Whether released textures are deferred (WCW_TARGET_DEFER=0 destroys them at once, as before).
++        static bool wcwDeferringRelease();
++        // Destroys everything still deferred and stops deferring (Application::end, before the device goes).
++        static void wcwCloseDeferred();
+ 
+         std::unique_ptr<RenderTexture> texture;
+         std::unique_ptr<RenderTexture> resolvedTexture;
 diff --git a/src/render/rt64_render_target_manager.cpp b/src/render/rt64_render_target_manager.cpp
 index 494d99e..d3d406a 100644
 --- a/src/render/rt64_render_target_manager.cpp
@@ -23327,7 +25141,7 @@ index 0000000..4b966b8
 +};
 diff --git a/src/render/rt64_wcw_gpu_timer.cpp b/src/render/rt64_wcw_gpu_timer.cpp
 new file mode 100644
-index 0000000..6ebbe7f
+index 0000000..7389dcf
 --- /dev/null
 +++ b/src/render/rt64_wcw_gpu_timer.cpp
 @@ -0,0 +1,104 @@
@@ -23341,7 +25155,7 @@ index 0000000..6ebbe7f
 +    static thread_local WcwGpuTimer *activeTimer = nullptr;
 +
 +    void WcwGpuTimer::setup(RenderDevice *device) {
-+        if (!WcwPerf::enabled() || (device == nullptr) || !device->getCapabilities().queryPools) {
++        if (!WcwPerf::timingEnabled() || (device == nullptr) || !device->getCapabilities().queryPools) {
 +            return;
 +        }
 +
@@ -23416,7 +25230,7 @@ index 0000000..6ebbe7f
 +    }
 +
 +    WcwGpuScope::WcwGpuScope(const RenderCommandList *commandList, WcwPerf::GpuPass pass) {
-+        timer = WcwPerf::enabled() ? WcwGpuTimer::active(commandList) : nullptr;
++        timer = WcwPerf::timingEnabled() ? WcwGpuTimer::active(commandList) : nullptr;
 +        if (timer != nullptr) {
 +            timer->push(pass);
 +        }
@@ -23437,7 +25251,7 @@ index 0000000..6ebbe7f
 +};
 diff --git a/src/render/rt64_wcw_gpu_timer.h b/src/render/rt64_wcw_gpu_timer.h
 new file mode 100644
-index 0000000..0ff9fed
+index 0000000..3e92f2b
 --- /dev/null
 +++ b/src/render/rt64_wcw_gpu_timer.h
 @@ -0,0 +1,61 @@
@@ -23467,7 +25281,7 @@ index 0000000..0ff9fed
 +        std::vector<WcwPerf::Marker> markers;
 +        bool recorded = false;
 +
-+        // Creates the query pool when WCW_PERF_LOG is set and the device supports timestamps.
++        // Creates the query pool when WCW_PERF_LOG or WCW_DD_METRICS is set and the device supports timestamps.
 +        void setup(RenderDevice *device);
 +        bool available() const { return pool != nullptr; }
 +
@@ -23933,16 +25747,17 @@ index 0000000..29fb84f
 +};
 diff --git a/src/render/rt64_wcw_raytracer.cpp b/src/render/rt64_wcw_raytracer.cpp
 new file mode 100644
-index 0000000..efb1670
+index 0000000..b003d91
 --- /dev/null
 +++ b/src/render/rt64_wcw_raytracer.cpp
-@@ -0,0 +1,1478 @@
+@@ -0,0 +1,1480 @@
 +//
 +// RT64
 +//
 +
 +#include "rt64_wcw_raytracer.h"
 +
++#include "common/rt64_wcw_dd.h"
 +#include "common/rt64_wcw_logic.h"
 +#include "rt64_wcw_gpu_timer.h"
 +
@@ -24254,6 +26069,7 @@ index 0000000..efb1670
 +        if (change != WcwLogic::VenueSelector::Change::None) {
 +            // AkiTools' aki-run reads the venue from the last "venue:" line: keep it the bare name.
 +            fprintf(stderr, "[wcw rt] venue: %s\n", venueName(activeVenue));
++            WcwDd::noteVenue(venueName(activeVenue));
 +            if (venueTrace) {
 +                fprintf(stderr, "[wcw rt] venue switch: %s (%s, present %d, %.3f s)\n", venueName(activeVenue),
 +                    (change == WcwLogic::VenueSelector::Change::Cut) ? "cut" : "window", int(wcwRtPresentCounter), presentSeconds);
@@ -27094,12 +28910,514 @@ index 42cd7b6..728c967 100644
  
  target_include_directories(texture_packer PRIVATE "../../contrib")
  target_link_libraries(texture_packer PRIVATE libzstd_static)
+diff --git a/tests/wcw/rt64_wcw_dd_tests.cpp b/tests/wcw/rt64_wcw_dd_tests.cpp
+new file mode 100644
+index 0000000..2570541
+--- /dev/null
++++ b/tests/wcw/rt64_wcw_dd_tests.cpp
+@@ -0,0 +1,496 @@
++//
++// RT64
++//
++
++// [wcw dd] Unit tests for the in-game Datadog metrics logic (WCW_DD_METRICS, aki-roadmap#125): the window aggregation
++// (rates, percentiles, 1% low, hitches, GPU medians), the context tags and their change text, and the DogStatsD lines,
++// which must match AkiTools lib\ddmetrics.ps1 (the expected strings below are that script's output). Built and run
++// with the other wcw tests on every rt64 build.
++
++#include "common/rt64_wcw_logic.h"
++
++#include <algorithm>
++#include <limits>
++#include <string>
++#include <vector>
++
++#include "wcw_test.h"
++
++using namespace RT64::WcwLogic;
++
++static double metric(const std::vector<std::pair<std::string, double>> &m, const std::string &name, double missing = -1.0) {
++    for (const auto &p : m) {
++        if (p.first == name) {
++            return p.second;
++        }
++    }
++
++    return missing;
++}
++
++static bool hasMetric(const std::vector<std::pair<std::string, double>> &m, const std::string &name) {
++    return metric(m, name, -12345.0) != -12345.0;
++}
++
++TEST_CASE("dd: WCW_DD_METRICS is on only when set, not empty and not 0") {
++    CHECK(!envSwitchOn(nullptr));
++    CHECK(!envSwitchOn(""));
++    CHECK(!envSwitchOn("0"));
++    CHECK(envSwitchOn("1"));
++    CHECK(envSwitchOn("yes"));
++}
++
++TEST_CASE("dd window: steady 60 fps gives 60 presents/s, 16.7 ms percentiles and no hitches") {
++    DdFrameWindow w;
++    w.start(0.0);
++    const double frameMs = 1000.0 / 60.0;
++    for (int i = 0; i < 600; i++) {
++        w.addPresent(i * frameMs, false, false);
++    }
++
++    const DdFrameStats s = w.take(10000.0, 60);
++    CHECK_NEAR(s.seconds, 10.0, 1e-9);
++    CHECK_EQ(s.presents, 600u);
++    CHECK_NEAR(s.presentsPerS, 60.0, 1e-9);
++    CHECK_NEAR(s.realFps, 60.0, 1e-9);
++    CHECK_NEAR(s.interpolatedPerS, 0.0, 1e-9);
++    CHECK(s.hasIntervals);
++    CHECK_NEAR(s.p50Ms, frameMs, 1e-6);
++    CHECK_NEAR(s.p99Ms, frameMs, 1e-6);
++    CHECK_NEAR(s.low1PctFps, 60.0, 1e-6);
++    CHECK_EQ(s.hitches, 0u);
++}
++
++TEST_CASE("dd window: generated and repeated presents split real fps from presents/s") {
++    DdFrameWindow w;
++    w.start(0.0);
++    // 120 presents/s for 1 s, every other one generated; 3 repeated real frames.
++    for (int i = 0; i < 120; i++) {
++        w.addPresent(i * (1000.0 / 120.0), (i % 2) == 1, (i == 10) || (i == 20) || (i == 30));
++    }
++
++    const DdFrameStats s = w.take(1000.0, 120);
++    CHECK_NEAR(s.presentsPerS, 120.0, 1e-9);
++    CHECK_NEAR(s.interpolatedPerS, 60.0, 1e-9);
++    CHECK_NEAR(s.realFps, 60.0, 1e-9);
++    CHECK_EQ(s.repeated, 3u);
++    CHECK_NEAR(s.repeatedPerMin, 180.0, 1e-9);
++}
++
++TEST_CASE("dd window: a stall is a hitch, shows in max, p99 and the 1% low") {
++    DdFrameWindow w;
++    w.start(0.0);
++    double t = 0.0;
++    // 199 intervals of 16.67 ms and one of 100 ms.
++    for (int i = 0; i < 200; i++) {
++        w.addPresent(t, false, false);
++        t += (i == 100) ? 100.0 : (1000.0 / 60.0);
++    }
++
++    const DdFrameStats s = w.take(t, 60);
++    CHECK_EQ(s.hitches, 1u);
++    CHECK_NEAR(s.maxMs, 100.0, 1e-9);
++    CHECK_NEAR(s.p50Ms, 1000.0 / 60.0, 1e-6);
++    // 199 intervals: the slowest 1% is one interval, the stall.
++    CHECK_NEAR(s.low1PctFps, 10.0, 1e-9);
++    CHECK_NEAR(s.hitchesPerMin, 60.0 / s.seconds, 1e-9);
++}
++
++TEST_CASE("dd window: a game steadily below the target (30 fps on 60) has no hitches") {
++    DdFrameWindow w;
++    w.start(0.0);
++    for (int i = 0; i < 300; i++) {
++        w.addPresent(i * (1000.0 / 30.0), false, false);
++    }
++
++    const DdFrameStats s = w.take(10000.0, 60);
++    CHECK_EQ(s.hitches, 0u);
++    // ...but a 3x stall at 30 fps is one.
++    DdFrameWindow w2;
++    w2.start(0.0);
++    double t = 0.0;
++    for (int i = 0; i < 100; i++) {
++        w2.addPresent(t, false, false);
++        t += (i == 50) ? 100.0 : (1000.0 / 30.0);
++    }
++
++    CHECK_EQ(w2.take(t, 60).hitches, 1u);
++}
++
++TEST_CASE("dd window: the first interval spans the window boundary; take starts the next window") {
++    DdFrameWindow w;
++    w.start(0.0);
++    w.addPresent(990.0, false, false);
++    const DdFrameStats a = w.take(1000.0, 60);
++    CHECK_EQ(a.presents, 1u);
++    CHECK(!a.hasIntervals);
++    w.addPresent(1010.0, false, false);
++    const DdFrameStats b = w.take(2000.0, 60);
++    CHECK_EQ(b.presents, 1u);
++    CHECK(b.hasIntervals);
++    CHECK_NEAR(b.p50Ms, 20.0, 1e-9);
++    CHECK_NEAR(b.seconds, 1.0, 1e-9);
++    // No presents at all (a hang): rates are 0, no percentiles.
++    const DdFrameStats c = w.take(12000.0, 60);
++    CHECK_EQ(c.presents, 0u);
++    CHECK_NEAR(c.presentsPerS, 0.0, 1e-9);
++    CHECK(!c.hasIntervals);
++}
++
++TEST_CASE("dd window: GPU medians and p95 from the timing rows") {
++    DdFrameWindow w;
++    w.start(0.0);
++    for (int i = 1; i <= 20; i++) {
++        w.addGpuRender(uint64_t(i), double(i), 0.5, 2.0);
++    }
++
++    w.addGpuPresent(1.0);
++    w.addGpuPresent(3.0);
++    w.addGpuPresent(2.0);
++    const DdFrameStats s = w.take(1000.0, 60);
++    CHECK_EQ(s.gpuRenderRows, 20u);
++    CHECK_NEAR(s.gpuRenderMs, 10.0, 1e-9);
++    CHECK_NEAR(s.gpuRenderP95Ms, 19.0, 1e-9);
++    CHECK_NEAR(s.rtBuildMs, 0.5, 1e-9);
++    CHECK_NEAR(s.rtTraceMs, 2.0, 1e-9);
++    CHECK_NEAR(s.gpuPresentMs, 2.0, 1e-9);
++    // Cleared for the next window.
++    CHECK_EQ(w.take(2000.0, 60).gpuRenderRows, 0u);
++}
++
++TEST_CASE("dd window: GPU per game frame sums the rows of one presentId, open frames carry over") {
++    DdFrameWindow w;
++    w.start(0.0);
++    // Game frame 7: three workloads, one traces; frame 8: two workloads.
++    w.addGpuRender(7, 1.0, 0.0, 0.0);
++    w.addGpuRender(7, 2.0, 0.5, 1.5);
++    w.addGpuRender(7, 1.0, 0.0, 0.0);
++    w.addGpuRender(8, 3.0, 0.0, 0.0);
++    w.addGpuRender(8, 3.0, 0.0, 0.0);
++    // Frame 9 is still arriving at the window's end.
++    w.addGpuRender(9, 10.0, 0.0, 0.0);
++    DdFrameStats s = w.take(1000.0, 60);
++    CHECK_EQ(s.gameFrames, 2u);
++    CHECK_NEAR(s.gpuGameFrameMs, 4.0, 1e-9);
++    CHECK_NEAR(s.gpuGameFrameP95Ms, 6.0, 1e-9);
++    CHECK_NEAR(s.rtGameFrameMs, 0.0, 1e-9);
++    // The per-row median misses the one tracing row; the per-frame RT doesn't.
++    CHECK_NEAR(s.rtTraceMs, 0.0, 1e-9);
++    w.addGpuRender(9, 5.0, 1.0, 2.0);
++    w.addGpuRender(10, 1.0, 0.0, 0.0);
++    s = w.take(2000.0, 60);
++    CHECK_EQ(s.gameFrames, 1u);
++    CHECK_NEAR(s.gpuGameFrameMs, 15.0, 1e-9);
++    CHECK_NEAR(s.rtGameFrameMs, 3.0, 1e-9);
++    const auto m = ddWindowMetrics(s, DdProcessSample());
++    CHECK_NEAR(metric(m, "aki.game.perf.gpu_game_frame_ms"), 15.0, 1e-9);
++    CHECK_NEAR(metric(m, "aki.game.perf.rt_game_frame_ms"), 3.0, 1e-9);
++    CHECK(hasMetric(m, "aki.game.perf.rt_trace_ms"));
++}
++
++TEST_CASE("dd: nearest-rank percentile") {
++    CHECK_NEAR(ddPercentile({}, 0.5), 0.0, 1e-9);
++    CHECK_NEAR(ddPercentile({ 5.0 }, 0.99), 5.0, 1e-9);
++    CHECK_NEAR(ddPercentile({ 4.0, 1.0, 3.0, 2.0 }, 0.5), 2.0, 1e-9);
++    CHECK_NEAR(ddPercentile({ 4.0, 1.0, 3.0, 2.0 }, 1.0), 4.0, 1e-9);
++    CHECK_NEAR(ddPercentile({ 4.0, 1.0, 3.0, 2.0 }, 0.0), 1.0, 1e-9);
++}
++
++TEST_CASE("dd: fps target is the set rate, else the VI rate (Original)") {
++    CHECK_EQ(ddFpsTarget(120, 60), 120u);
++    CHECK_EQ(ddFpsTarget(0, 60), 60u);
++    CHECK_EQ(ddFpsTarget(0, 0), 0u);
++}
++
++TEST_CASE("dd metrics: only gauges with data, RT ms only while ray tracing runs") {
++    DdFrameStats s;
++    DdProcessSample p;
++    auto m = ddWindowMetrics(s, p);
++    CHECK(hasMetric(m, "aki.game.active"));
++    CHECK(!hasMetric(m, "aki.game.presents_per_s"));
++    CHECK(!hasMetric(m, "aki.game.pacing.p99_ms"));
++    CHECK(!hasMetric(m, "aki.game.perf.gpu_render_ms"));
++    CHECK(!hasMetric(m, "aki.game.memory.private_mb"));
++    CHECK(!hasMetric(m, "aki.game.memory.vram_mb"));
++
++    s.seconds = 10.0;
++    s.presentsPerS = 60.0;
++    s.hasIntervals = true;
++    s.p99Ms = 17.0;
++    s.gpuRenderRows = 5;
++    s.gpuRenderMs = 4.0;
++    p.has = true;
++    p.privateMb = 900.0;
++    p.handles = 512;
++    p.hasVram = true;
++    p.vramMb = 1500.0;
++    m = ddWindowMetrics(s, p);
++    CHECK_NEAR(metric(m, "aki.game.presents_per_s"), 60.0, 1e-9);
++    CHECK_NEAR(metric(m, "aki.game.pacing.p99_ms"), 17.0, 1e-9);
++    CHECK_NEAR(metric(m, "aki.game.perf.gpu_render_ms"), 4.0, 1e-9);
++    CHECK(!hasMetric(m, "aki.game.perf.rt_trace_ms"));
++    CHECK(!hasMetric(m, "aki.game.perf.gpu_present_ms"));
++    CHECK_NEAR(metric(m, "aki.game.memory.private_mb"), 900.0, 1e-9);
++    CHECK_NEAR(metric(m, "aki.game.process.handles"), 512.0, 1e-9);
++    CHECK_NEAR(metric(m, "aki.game.memory.vram_mb"), 1500.0, 1e-9);
++    s.rtTraceMs = 2.5;
++    m = ddWindowMetrics(s, p);
++    CHECK_NEAR(metric(m, "aki.game.perf.rt_trace_ms"), 2.5, 1e-9);
++    CHECK(hasMetric(m, "aki.game.perf.rt_build_ms"));
++    // Every name is already a valid Datadog metric name.
++    for (const auto &e : m) {
++        CHECK(ddMetricName(e.first) == e.first);
++    }
++}
++
++TEST_CASE("dd context: tags use ddmetrics.ps1 keys; rt_quality only with RT on") {
++    DdContext c;
++    c.game = "nomercy";
++    c.fpsTarget = 120;
++    c.framerate = "manual";
++    c.rt = false;
++    c.rtQuality = 2;
++    c.resolution = "WindowIntegerScale";
++    c.aspect = "Expand";
++    c.msaa = "None";
++    c.extraTags = { "conversion:btbw" };
++    std::vector<std::string> t = ddContextTags(c);
++    const std::vector<std::string> expected = { "game:nomercy", "fps_target:120", "framerate:manual", "rt:off", "resolution:windowintegerscale",
++        "aspect:expand", "msaa:none", "downsample:1", "hdr:off", "crt:off", "beam:off", "conversion:btbw" };
++    CHECK(t == expected);
++    c.rt = true;
++    c.crt = "crt-guest-advanced-ntsc";
++    c.venue = "Raw";
++    t = ddContextTags(c);
++    CHECK(std::find(t.begin(), t.end(), "rt_quality:quality") != t.end());
++    CHECK(std::find(t.begin(), t.end(), "crt:crt-guest-advanced-ntsc") != t.end());
++    CHECK(std::find(t.begin(), t.end(), "rt_venue:raw") != t.end());
++    CHECK(std::string(rtQualityName(3)) == "ultra");
++    CHECK(std::string(rtQualityName(9)) == "unknown");
++}
++
++TEST_CASE("dd context: equality covers every field (a settings change is never missed)") {
++    DdContext a;
++    DdContext b;
++    CHECK(a == b);
++    b.fpsTarget = 60;
++    CHECK(a != b);
++    b = a;
++    b.downsample = 2;
++    CHECK(a != b);
++    b = a;
++    b.beam = true;
++    CHECK(a != b);
++    b = a;
++    b.venue = "Raw";
++    CHECK(a != b);
++    b = a;
++    b.extraTags = { "x:y" };
++    CHECK(a != b);
++    b = a;
++    b.rtQuality = 1;
++    CHECK(a != b);
++}
++
++TEST_CASE("dd context: tag change text lists changed, added and removed keys") {
++    const std::vector<std::string> before = { "game:wt", "rt:off", "fps_target:60" };
++    const std::vector<std::string> after = { "game:wt", "rt:on", "rt_quality:ultra", "fps_target:60" };
++    CHECK(ddTagChanges(before, after) == "rt:off -> rt:on, rt_quality:(none) -> rt_quality:ultra");
++    CHECK(ddTagChanges(after, before) == "rt:on -> rt:off, rt_quality:ultra -> rt_quality:(none)");
++    CHECK(ddTagChanges(before, before).empty());
++}
++
++TEST_CASE("dd: game key from the executable name (AkiTools games.psd1)") {
++    CHECK(ddGameFromExe("NoMercyRecompiled.exe") == "nomercy");
++    CHECK(ddGameFromExe("C:\\games\\WCWRecompiled.exe") == "wt");
++    CHECK(ddGameFromExe("/x/y/RevengeRecompiled") == "revenge");
++    CHECK(ddGameFromExe("Vpw2Recompiled.EXE") == "vpw2");
++    CHECK(ddGameFromExe("Wm2kRecompiled.exe") == "wm2k");
++    CHECK(ddGameFromExe("Vpw64Recompiled.exe") == "vpw64");
++    CHECK(ddGameFromExe("SomethingElse.exe") == "somethingelse");
++}
++
++TEST_CASE("dd: WCW_DD_TAGS parsing") {
++    CHECK(ddParseTags(nullptr).empty());
++    const std::vector<std::string> t = ddParseTags("conversion:BTBW, owner:Fire Ant,novalue:,nocolon,conversion:btbw");
++    const std::vector<std::string> expected = { "conversion:btbw", "owner:fire_ant" };
++    CHECK(t == expected);
++}
++
++TEST_CASE("dd: names, tags and values match ddmetrics.ps1") {
++    CHECK(ddTag("owner", "Fire Ant") == "owner:fire_ant");
++    CHECK(ddTag("Git RT64", "  crt-guest-advanced/NTSC.slangp ") == "git_rt64:crt-guest-advanced/ntsc.slangp");
++    CHECK(ddTag("_9key", "__a__b__") == "t_9key:a_b");
++    CHECK(ddTag("k", "###").empty());
++    CHECK(ddTag("k", "").empty());
++    CHECK(ddTag("k", "C:\\Games\\x y") == "k:c:_games_x_y");
++    CHECK(ddTag("k", std::string(300, 'a')).size() == 200);
++    CHECK(ddMetricName("aki.game.Pacing-P99 ms") == "aki.game.pacing_p99_ms");
++    CHECK(ddMetricName("9lives") == "aki_9lives");
++    CHECK(ddFormatValue(60.8) == "60.8");
++    CHECK(ddFormatValue(16.6666666) == "16.666667");
++    CHECK(ddFormatValue(2.0) == "2");
++    CHECK(ddFormatValue(-0.0000001) == "0");
++    CHECK(ddFormatValue(1234567.25) == "1234567.25");
++}
++
++TEST_CASE("dd: gauge and event lines match ddmetrics.ps1 (source aki-game)") {
++    CHECK(ddGaugeLine("aki.run.presents_per_s", 60.8, { "game:nomercy", "rt:on" }) == "aki.run.presents_per_s:60.8|g|#game:nomercy,rt:on");
++    CHECK(ddGaugeLine("aki.game.x", 1.0, {}) == "aki.game.x:1|g");
++    CHECK(ddGaugeLine("aki.game.x", std::numeric_limits<double>::infinity(), {}).empty());
++    CHECK(ddEventLine("Title", "a\nb", { "game:wt" }, "error", "key1") == "_e{5,4}:Title|a\\nb|k:key1|s:aki-game|t:error|#game:wt");
++    CHECK(ddEventLine("T\r\nx", "", {}, "", "") == "_e{3,0}:T x||s:aki-game");
++}
++
++TEST_CASE("dd: packets join lines under the size limit, a long line goes alone") {
++    const std::vector<std::string> lines = { "aaaa", "bbbb", "", "cccc", std::string(20, 'd'), "ee" };
++    const std::vector<std::string> p = ddPackets(lines, 10);
++    const std::vector<std::string> expected = { "aaaa\nbbbb", "cccc", std::string(20, 'd'), "ee" };
++    CHECK(p == expected);
++    CHECK(ddPackets({}, 10).empty());
++    for (const std::string &packet : ddPackets(std::vector<std::string>(500, "aki.game.presents_per_s:60|g|#game:nomercy"))) {
++        CHECK(packet.size() <= DdMaxPacketBytes);
++    }
++}
++
++TEST_CASE("dd window: 1% low averages the slowest 1% of the intervals") {
++    DdFrameWindow w;
++    w.start(0.0);
++    double t = 0.0;
++    // 400 intervals: 396 of 10 ms, then 20, 30, 40, 50 ms; the slowest 1% (4) average 35 ms.
++    for (int i = 0; i <= 400; i++) {
++        w.addPresent(t, false, false);
++        t += (i < 396) ? 10.0 : (20.0 + 10.0 * (i - 396));
++    }
++
++    const DdFrameStats s = w.take(t, 100);
++    CHECK_NEAR(s.low1PctFps, 1000.0 / 35.0, 1e-9);
++    CHECK_NEAR(s.maxMs, 50.0, 1e-9);
++    // 2x the 10 ms frame: 30, 40 and 50 ms are hitches, 20 ms is not.
++    CHECK_EQ(s.hitches, 3u);
++}
++
++TEST_CASE("dd window: no fps target falls back to the median for hitches; out-of-order presents add no interval") {
++    DdFrameWindow w;
++    w.start(0.0);
++    double t = 0.0;
++    for (int i = 0; i < 50; i++) {
++        w.addPresent(t, false, false);
++        t += (i == 25) ? 70.0 : 20.0;
++    }
++
++    CHECK_EQ(w.take(t, 0).hitches, 1u);
++    DdFrameWindow w2;
++    w2.start(0.0);
++    w2.addPresent(100.0, false, false);
++    w2.addPresent(90.0, false, false);
++    w2.addPresent(110.0, false, false);
++    const DdFrameStats s = w2.take(200.0, 60);
++    CHECK_EQ(s.presents, 3u);
++    CHECK_NEAR(s.p50Ms, 20.0, 1e-9);
++    CHECK_NEAR(s.maxMs, 20.0, 1e-9);
++}
++
++TEST_CASE("dd: window cadence") {
++    CHECK(!ddWindowDue(9999.0, 0.0));
++    CHECK(ddWindowDue(10000.0, 0.0));
++    CHECK(ddWindowDue(25000.0, 14000.0));
++}
++
++TEST_CASE("dd: VRAM sums usage, takes the most-used adapter's budget, first on a tie") {
++    const DdVramAdapter none = ddPickVram({});
++    CHECK_EQ(none.usage, 0ull);
++    CHECK_EQ(none.budget, 0ull);
++    const DdVramAdapter a = ddPickVram({ { 100, 8000 }, { 0, 2000 } });
++    CHECK_EQ(a.usage, 100ull);
++    CHECK_EQ(a.budget, 8000ull);
++    const DdVramAdapter b = ddPickVram({ { 0, 2000 }, { 300, 8000 } });
++    CHECK_EQ(b.usage, 300ull);
++    CHECK_EQ(b.budget, 8000ull);
++    // Nothing used yet (startup): the first adapter's budget, not an idle second GPU's.
++    const DdVramAdapter c = ddPickVram({ { 0, 8000 }, { 0, 2000 } });
++    CHECK_EQ(c.budget, 8000ull);
++}
++
++TEST_CASE("dd context: CRT tag is the preset's stem, never a user path") {
++    CHECK(ddCrtPresetName("crt-guest-advanced-ntsc") == "crt-guest-advanced-ntsc");
++    CHECK(ddCrtPresetName("C:\\Users\\me\\crt\\my-crt.slangp") == "my-crt");
++    CHECK(ddCrtPresetName("crt/presets/crt-royale.SLANGP") == "crt-royale");
++    CHECK(ddCrtPresetName("v1.2") == "v1.2");
++    DdContext c;
++    c.crt = "C:\\Users\\me\\crt\\my-crt.slangp";
++    const std::vector<std::string> t = ddContextTags(c);
++    CHECK(std::find(t.begin(), t.end(), "crt:my-crt") != t.end());
++}
++
++TEST_CASE("dd context: WCW_DD_TAGS cannot add a second built-in key") {
++    DdContext c;
++    c.game = "nomercy";
++    c.extraTags = ddParseTags("game:other,rt_quality:ultra,conversion:btbw");
++    const std::vector<std::string> t = ddContextTags(c);
++    CHECK(std::count_if(t.begin(), t.end(), [](const std::string &x) { return x.rfind("game:", 0) == 0; }) == 1);
++    CHECK(std::find(t.begin(), t.end(), "rt_quality:ultra") == t.end());
++    CHECK(std::find(t.begin(), t.end(), "conversion:btbw") != t.end());
++}
++
++TEST_CASE("dd session: first context starts it, settling changes are silent, later changes are events") {
++    DdSession s;
++    s.setIdentity("nomercy", { "source:aki-run" });
++    const std::vector<std::string> before = s.tags();
++    CHECK((before == std::vector<std::string>{ "game:nomercy" }));
++    DdContext c;
++    c.game = "ignored";
++    c.fpsTarget = 0;
++    CHECK(s.noteContext(c, 1000.0).event == DdSession::Event::SessionStart);
++    CHECK(s.started());
++    CHECK(s.context().game == "nomercy");
++    CHECK(std::find(s.tags().begin(), s.tags().end(), "source:aki-run") != s.tags().end());
++    // Same settings: nothing.
++    CHECK(s.noteContext(c, 1500.0).event == DdSession::Event::None);
++    // The swap chain's rate arrives 2 s in: baseline, no event.
++    c.fpsTarget = 60;
++    CHECK(s.noteContext(c, 3000.0).event == DdSession::Event::None);
++    CHECK_EQ(s.context().fpsTarget, 60u);
++    // RT turned on 10 s in: an event with the changes.
++    c.rt = true;
++    const DdSession::Decision d = s.noteContext(c, 11000.0);
++    CHECK(d.event == DdSession::Event::SettingsChanged);
++    CHECK(d.changes == "rt:off -> rt:on, rt_quality:(none) -> rt_quality:performance");
++}
++
++TEST_CASE("dd session: venue tags and events only with RT on and a started session") {
++    DdSession s;
++    s.setIdentity("nomercy", {});
++    // Before the session: remembered, no event.
++    CHECK(s.noteVenue("Raw").event == DdSession::Event::None);
++    DdContext c;
++    c.rt = true;
++    CHECK(s.noteContext(c, 0.0).event == DdSession::Event::SessionStart);
++    CHECK(s.context().venue == "Raw");
++    const DdSession::Decision d = s.noteVenue("SmackDown");
++    CHECK(d.event == DdSession::Event::VenueChanged);
++    CHECK(d.changes == "rt_venue:raw -> rt_venue:smackdown");
++    CHECK(s.noteVenue("SmackDown").event == DdSession::Event::None);
++    // A venue change arriving in the same context is not also a settings change.
++    CHECK(s.noteContext(c, 20000.0).event == DdSession::Event::None);
++    // RT off drops the venue tag (a settings change), and venue changes stop being events.
++    c.rt = false;
++    const DdSession::Decision off = s.noteContext(c, 21000.0);
++    CHECK(off.event == DdSession::Event::SettingsChanged);
++    CHECK(off.changes.find("rt_venue:smackdown -> rt_venue:(none)") != std::string::npos);
++    CHECK(s.noteVenue("Raw").event == DdSession::Event::None);
++    // RT back on picks up the latest venue.
++    c.rt = true;
++    s.noteContext(c, 22000.0);
++    CHECK(s.context().venue == "Raw");
++}
++
++TEST_CASE("dd: value format edge cases, tag list whitespace and trailing commas") {
++    CHECK(ddFormatValue(1e12) == "1000000000000");
++    CHECK(ddFormatValue(0.0000004) == "0");
++    CHECK(ddFormatValue(0.25) == "0.25");
++    CHECK(ddGaugeLine("aki.game.x", std::numeric_limits<double>::quiet_NaN(), {}).empty());
++    const std::vector<std::string> t = ddParseTags(" Owner :Fire Ant,,conversion:btbw,");
++    const std::vector<std::string> expected = { "owner:fire_ant", "conversion:btbw" };
++    CHECK(t == expected);
++}
 diff --git a/tests/wcw/rt64_wcw_logic_tests.cpp b/tests/wcw/rt64_wcw_logic_tests.cpp
 new file mode 100644
-index 0000000..4efe8fc
+index 0000000..e205f3f
 --- /dev/null
 +++ b/tests/wcw/rt64_wcw_logic_tests.cpp
-@@ -0,0 +1,2051 @@
+@@ -0,0 +1,2257 @@
 +//
 +// RT64
 +//
@@ -29146,6 +31464,212 @@ index 0000000..4efe8fc
 +    for (int i = 0; i < 16; i++) {
 +        CHECK(out[i] == viewProj[i]);
 +    }
++}
++
++// Render target regrow settle (aki-roadmap#4)
++
++TEST_CASE("regrow settle: with deferred release nothing waits (#4 regression: 8.7 presents/s in the settings stress)") {
++    // The 100 ms wait on every big regrow cost No Mercy's settings stress 90% of its presents. Deferring the release
++    // of the old textures is what avoids the hang, so the wait goes.
++    CHECK(regrowSettleMs(2ULL * 7670 * 2880, -1, true) == 0);
++    CHECK(regrowSettleMs(2ULL * 5760 * 2160, -1, true) == 0);
++    // WCW_REGROW_SETTLE_MS still asks for one (diagnosis).
++    CHECK(regrowSettleMs(2ULL * 7670 * 2880, 100, true) == 100);
++}
++
++TEST_CASE("regrow settle: WCW_TARGET_DEFER=0 keeps the old wait for big regrows (SS 2x GPU hang #4)") {
++    // The hang: No Mercy's 3840x1920 targets regrown to 7670x2880 color + depth, used at once.
++    CHECK(regrowSettleMs(2ULL * 7670 * 2880, -1, false) == RegrowSettleDefaultMs);
++    // The settings-apply hang's 5760x2160 targets.
++    CHECK(regrowSettleMs(2ULL * 5760 * 2160, -1, false) == RegrowSettleDefaultMs);
++    CHECK(RegrowSettleDefaultMs >= 50);
++}
++
++TEST_CASE("regrow settle: no regrow or small regrows never wait") {
++    CHECK(regrowSettleMs(0, -1, false) == 0);
++    // N64-sized and 1x targets (480x240 color + depth), and 1080p-class ones.
++    CHECK(regrowSettleMs(2ULL * 480 * 240, -1, false) == 0);
++    CHECK(regrowSettleMs(1920ULL * 1080, -1, false) == 0);
++    CHECK(regrowSettleMs(RegrowSettleMinPixels - 1, -1, false) == 0);
++    CHECK(regrowSettleMs(RegrowSettleMinPixels, -1, false) == RegrowSettleDefaultMs);
++}
++
++TEST_CASE("regrow settle: WCW_REGROW_SETTLE_MS overrides the wait, 0 turns it off") {
++    CHECK(regrowSettleMs(2ULL * 7670 * 2880, 0, false) == 0);
++    CHECK(regrowSettleMs(2ULL * 7670 * 2880, 250, false) == 250);
++    // The size threshold still applies.
++    CHECK(regrowSettleMs(2ULL * 480 * 240, 250, false) == 0);
++    CHECK(regrowSettleMs(2ULL * 480 * 240, 250, true) == 0);
++}
++
++// Deferred release of render target textures (aki-roadmap#4)
++
++static ReleaseStamp releaseStamp(uint64_t presentsStarted, uint64_t workloadsDone, uint64_t ms) {
++    ReleaseStamp stamp;
++    stamp.presentsStarted = presentsStarted;
++    stamp.workloadsDone = workloadsDone;
++    stamp.ms = ms;
++    return stamp;
++}
++
++TEST_CASE("deferred release: released textures outlive the present in flight (#4)") {
++    // Released while present 11 was being recorded (11 started, 10 finished), after workload 50.
++    const ReleaseStamp stamp = releaseStamp(11, 50, 1000);
++    // Everything else is ready; the present that may still hold the old texture hasn't finished.
++    CHECK(!releaseReady(stamp, 10, 60, 5000));
++    CHECK(releaseReady(stamp, 11, 60, 5000));
++    // The present thread was idle (as many finished as started): nothing holds them.
++    CHECK(releaseReady(releaseStamp(10, 50, 1000), 10, 60, 5000));
++}
++
++TEST_CASE("deferred release: released textures outlive two more workloads and the old settle time (#4)") {
++    const ReleaseStamp stamp = releaseStamp(10, 50, 1000);
++    // The workload that released them, and the next one.
++    CHECK(!releaseReady(stamp, 10, 50, 5000));
++    CHECK(!releaseReady(stamp, 10, 51, 5000));
++    CHECK(releaseReady(stamp, 10, 50 + DeferredReleaseWorkloads, 5000));
++    // Not before DeferredReleaseMinMs (the settle needed 50 ms or more; 120 fps workloads come every 8 ms).
++    CHECK(!releaseReady(stamp, 10, 60, 1000));
++    CHECK(!releaseReady(stamp, 10, 60, 1000 + DeferredReleaseMinMs - 1));
++    CHECK(releaseReady(stamp, 10, 60, 1000 + DeferredReleaseMinMs));
++    CHECK(DeferredReleaseMinMs >= 50);
++    // A clock that went backwards isn't ready.
++    CHECK(!releaseReady(stamp, 10, 60, 999));
++}
++
++// A stand-in for the released textures that counts how many were destroyed.
++struct DeferredTestTextures {
++    static int destroyed;
++    int id = 0;
++
++    explicit DeferredTestTextures(int id) : id(id) {}
++    ~DeferredTestTextures() { destroyed++; }
++};
++
++int DeferredTestTextures::destroyed = 0;
++
++TEST_CASE("deferred release: a settings apply's textures are destroyed a few frames later, not at once (#4 regression)") {
++    // SS 2x: a regrow releases No Mercy's 3840x1920 color + depth (the hang came from destroying them right away).
++    DeferredTestTextures::destroyed = 0;
++    DeferredReleaseList<DeferredTestTextures> list;
++    list.push(releaseStamp(5, 100, 1000), 29491200, std::make_unique<DeferredTestTextures>(1));
++    list.push(releaseStamp(5, 100, 1000), 29491200, std::make_unique<DeferredTestTextures>(2));
++    list.push(releaseStamp(5, 100, 1000), 0, nullptr);
++    CHECK(list.size() == 2);
++    CHECK(list.pendingBytes() == 58982400);
++    // The workload that regrew them finishes: nothing destroyed yet.
++    CHECK(list.collect(4, 101, 1016) == 0);
++    CHECK(DeferredTestTextures::destroyed == 0);
++    // Frames go by at 60 fps.
++    uint64_t presents = 5, workloads = 101, ms = 1016;
++    while (list.size() > 0) {
++        presents++;
++        workloads++;
++        ms += 16;
++        list.collect(presents, workloads, ms);
++    }
++
++    CHECK(ms >= 1000 + DeferredReleaseMinMs);
++    CHECK(DeferredTestTextures::destroyed == 2);
++    CHECK(list.pendingBytes() == 0);
++    CHECK(list.peakPendingBytes() == 58982400);
++    CHECK(list.destroyedCount() == 2);
++}
++
++TEST_CASE("deferred release: entries go oldest first and later releases wait their own turn (#4)") {
++    DeferredTestTextures::destroyed = 0;
++    DeferredReleaseList<DeferredTestTextures> list;
++    list.push(releaseStamp(5, 100, 1000), 10, std::make_unique<DeferredTestTextures>(1));
++    list.push(releaseStamp(9, 104, 1200), 20, std::make_unique<DeferredTestTextures>(2));
++    // Ready for the first only.
++    CHECK(list.collect(9, 104, 1150) == 1);
++    CHECK(list.pendingBytes() == 20);
++    CHECK(list.collect(9, 105, 1400) == 0);
++    CHECK(list.collect(9, 106, 1400) == 1);
++    CHECK(DeferredTestTextures::destroyed == 2);
++    // Shutdown destroys what is left.
++    list.push(releaseStamp(20, 200, 3000), 30, std::make_unique<DeferredTestTextures>(3));
++    CHECK(list.clear() == 1);
++    CHECK(DeferredTestTextures::destroyed == 3);
++    CHECK(list.size() == 0);
++    CHECK(list.pendingBytes() == 0);
++    CHECK(list.destroyedCount() == 3);
++}
++
++// HDR readback for the luminance log and BMP dumps (aki-roadmap#128)
++
++TEST_CASE("hdr readback: half floats convert exactly") {
++    CHECK(halfToFloat(0x0000) == 0.0f);
++    CHECK(halfToFloat(0x3C00) == 1.0f);
++    CHECK(halfToFloat(0xC000) == -2.0f);
++    CHECK(halfToFloat(0x3800) == 0.5f);
++    CHECK(halfToFloat(0x7BFF) == 65504.0f);
++    // Subnormals: the smallest is 2^-24.
++    CHECK(halfToFloat(0x0001) == 1.0f / 16777216.0f);
++    CHECK(halfToFloat(0x8001) == -1.0f / 16777216.0f);
++    CHECK(std::isinf(halfToFloat(0x7C00)));
++    CHECK(std::isnan(halfToFloat(0x7E00)));
++}
++
++TEST_CASE("hdr readback: the table conversion gives the same pixels and nits as the per-pixel one (#128)") {
++    // The old present-thread code: halfToFloat + sRGB per channel, nits from the linear values.
++    const float invScale = 1.0f / 3.0f;
++    std::vector<uint16_t> src;
++    for (uint32_t i = 0; i < 65536; i += 7) {
++        src.push_back(uint16_t(i));
++    }
++
++    while ((src.size() % 4) != 0) {
++        src.push_back(0x3C00);
++    }
++
++    const uint32_t width = uint32_t(src.size() / 4);
++    std::vector<uint8_t> dst(width * 4);
++    HdrReadbackConverter converter;
++    double nitsSum = 0.0;
++    float nitsMax = 0.0f;
++    converter.convertRow(src.data(), dst.data(), width, invScale, nitsSum, nitsMax);
++    double refSum = 0.0;
++    float refMax = 0.0f;
++    uint32_t mismatches = 0;
++    for (uint32_t x = 0; x < width; x++) {
++        const uint16_t *pixel = &src[x * 4];
++        const float nits = 80.0f * (0.2126f * halfToFloat(pixel[0]) + 0.7152f * halfToFloat(pixel[1]) + 0.0722f * halfToFloat(pixel[2]));
++        refSum += nits;
++        refMax = std::max(refMax, nits);
++        mismatches += (dst[x * 4 + 0] != linearToSrgb8(halfToFloat(pixel[2]) * invScale)) ? 1 : 0;
++        mismatches += (dst[x * 4 + 1] != linearToSrgb8(halfToFloat(pixel[1]) * invScale)) ? 1 : 0;
++        mismatches += (dst[x * 4 + 2] != linearToSrgb8(halfToFloat(pixel[0]) * invScale)) ? 1 : 0;
++        mismatches += (dst[x * 4 + 3] != 255) ? 1 : 0;
++    }
++
++    CHECK(mismatches == 0);
++    CHECK((std::isnan(refSum) && std::isnan(nitsSum)) || (refSum == nitsSum));
++    CHECK(nitsMax == refMax);
++}
++
++TEST_CASE("hdr readback: paper white maps to sRGB white, black and negatives to 0, and the table follows the scale (#128)") {
++    HdrReadbackConverter converter;
++    // Paper white 240 nits: scRGB 3.0 (0x4200), scale 3.
++    const uint16_t white[4] = { 0x4200, 0x4200, 0x4200, 0x3C00 };
++    const uint16_t black[4] = { 0x0000, 0x8000, 0xBC00, 0x3C00 };
++    uint8_t out[4] = {};
++    double nitsSum = 0.0;
++    float nitsMax = 0.0f;
++    converter.convertRow(white, out, 1, 1.0f / 3.0f, nitsSum, nitsMax);
++    CHECK((out[0] == 255) && (out[1] == 255) && (out[2] == 255) && (out[3] == 255));
++    CHECK(std::fabs(nitsMax - 240.0f) < 0.01f);
++    converter.convertRow(black, out, 1, 1.0f / 3.0f, nitsSum, nitsMax);
++    CHECK((out[0] == 0) && (out[1] == 0) && (out[2] == 0));
++    CHECK(converter.srgbTableBuilds() == 1);
++    // Another HDR Picture setting (paper white 160 nits, scale 2): the same pixel is now over-white, clamped.
++    converter.convertRow(white, out, 1, 1.0f / 2.0f, nitsSum, nitsMax);
++    CHECK(converter.srgbTableBuilds() == 2);
++    CHECK(out[0] == 255);
++    const uint16_t grey[4] = { 0x3C00, 0x3C00, 0x3C00, 0x3C00 };
++    converter.convertRow(grey, out, 1, 1.0f / 2.0f, nitsSum, nitsMax);
++    CHECK(out[0] == linearToSrgb8(0.5f));
++    CHECK(converter.srgbTableBuilds() == 2);
 +}
 +
 +int main() {
