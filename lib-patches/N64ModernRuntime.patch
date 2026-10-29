@@ -1222,7 +1222,7 @@ index 62656ad..232b0a0 100644
              // Send a message to the mq to indicate that the transfer completed
              ultramodern::enqueue_external_message(mq, 0, false, true);
 diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
-index 1200f77..aad9c57 100644
+index 1200f77..f59f2bb 100644
 --- a/librecomp/src/recomp.cpp
 +++ b/librecomp/src/recomp.cpp
 @@ -23,6 +23,8 @@
@@ -1279,7 +1279,25 @@ index 1200f77..aad9c57 100644
  moodycamel::LightweightSemaphore graphics_shutdown_ready;
  
  void ultramodern::quit() {
-@@ -841,12 +867,15 @@ void recomp::start(
+@@ -743,7 +769,17 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
+                             mod_error_stream << "\n";                                
+                         }
+                         ultramodern::error_handling::message_box(mod_error_stream.str().c_str());
++                        // [wcw fix] A quit requested while the error box was up (quit() only moves None to
++                        // Quit, and the status was Running) would otherwise leave this thread waiting for a start
++                        // that never comes, and the process never exits. None is stored before exited is read
++                        // (both seq_cst): a quit() that comes after the store finds None and moves it to Quit
++                        // itself, and one that came before it is seen here, so no quit falls in between.
+                         game_status.store(GameStatus::None);
++                        if (exited.load()) {
++                            game_status.store(GameStatus::Quit);
++                            game_status.notify_all();
++                            return true;
++                        }
+                         return false;
+                     }
+                 }
+@@ -841,12 +877,15 @@ void recomp::start(
      uint8_t* rdram;
      bool alloc_failed;
  #ifdef _WIN32
@@ -1299,7 +1317,7 @@ index 1200f77..aad9c57 100644
          if (alloc_failed) {
              VirtualFree(rdram, 0, MEM_RELEASE);
          }
-@@ -878,6 +907,7 @@ void recomp::start(
+@@ -878,6 +917,7 @@ void recomp::start(
          ultramodern::set_native_thread_name("Game Start Thread");
  
          ultramodern::preinit(rdram, window_handle);
@@ -1307,7 +1325,7 @@ index 1200f77..aad9c57 100644
  
          recomp_context context{};
  
-@@ -885,20 +915,41 @@ void recomp::start(
+@@ -885,20 +925,41 @@ void recomp::start(
          while (!wait_for_game_started(rdram, &context)) {}
      }, window_handle, rdram};
  
