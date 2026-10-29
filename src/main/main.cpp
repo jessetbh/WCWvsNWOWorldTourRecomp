@@ -194,6 +194,16 @@ static void wcw_sample_all_threads() {
 #endif
 
 extern "C" void recomp_entrypoint(uint8_t* rdram, recomp_context* ctx);
+extern "C" void __osSiRawStartDma_recomp(uint8_t* rdram, recomp_context* ctx);
+extern "C" void __osSiDeviceBusy_recomp(uint8_t* rdram, recomp_context* ctx);
+
+// [wcw fullconv] N64Recomp leaves the raw-SI primitives out of the function table (static callers call the
+// _recomp versions directly), so code a conversion live-compiles found nothing at their addresses and ran the
+// ROM's version, which touches the SI registers (9 Underground's rev 1 controller code, aki-roadmap#120).
+static void wt_on_init(uint8_t* rdram, recomp_context* ctx) {
+    recomp::overlays::add_loaded_function((int32_t)0x80023970, __osSiRawStartDma_recomp);
+    recomp::overlays::add_loaded_function((int32_t)0x800251E0, __osSiDeviceBusy_recomp);
+}
 
 static const recomp::Version version { 0, 2, 0, "" };
 
@@ -799,6 +809,7 @@ int main(int argc, char** argv) {
     // in the initial boot DMA. Cast through int32_t so it sign-extends to 0xFFFFFFFF80000400.
     game.entrypoint_address = (gpr)(int32_t)0x80000400;
     game.entrypoint = recomp_entrypoint;
+    game.on_init_callback = wt_on_init;
     supported_games.push_back(game);
     recomp::register_game(supported_games[0]);
 
