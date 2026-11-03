@@ -571,7 +571,161 @@ static void mod_set_keyboard_suppressed(uint8_t* rdram, recomp_context* ctx) {
     recompinput::set_keyboard_suppressed(_arg<0, uint32_t>(rdram, ctx) != 0);
 }
 
+// [aki] Model packs (aki-roadmap#130, the aki_modelimport mod). Everything is read from <mods folder>/models/ only:
+// "models.txt" (the player's assignments) or "<pack>.akimodel/<file>" (one folder level, the folder must end in
+// .akimodel). No absolute paths, drive letters, backslashes or "..".
+//   aki_log(str, len)                  -> prints "[mod] <str>" to stderr
+//   aki_models_read(path, dest, max)   -> bytes copied into RDRAM at dest; -1 missing, -2 bigger than max, -3 bad path
+//   aki_models_list(index, out, max)   -> the index-th pack id (folder name without .akimodel, sorted) NUL-terminated
+//                                         into out, its length; -1 past the end, -2 longer than max - 1
+static std::string mod_read_string(uint8_t* rdram, gpr ptr, uint32_t limit) {
+    std::string out;
+    for (uint32_t i = 0; i < limit; i++) {
+        const char c = char(MEM_B(i, ptr));
+        if (c == '\0') {
+            break;
+        }
+
+        out.push_back(c);
+    }
+
+    return out;
+}
+
+static std::filesystem::path models_directory() {
+    return recomp::mods::get_mods_directory() / "models";
+}
+
+static bool models_path_ok(const std::string& path) {
+    if (path.empty() || (path.size() > 200) || (path.find_first_of("\\:") != std::string::npos) ||
+        (path.find("..") != std::string::npos) || (path.front() == '/')) {
+        return false;
+    }
+
+    // Printable ASCII only: no codepage conversions (they throw on Windows), no control characters.
+    for (const char c : path) {
+        if ((c < 0x20) || (c > 0x7E)) {
+            return false;
+        }
+    }
+
+    const size_t slash = path.find('/');
+    if (slash == std::string::npos) {
+        return true;
+    }
+
+    const std::string folder = path.substr(0, slash);
+    const std::string file = path.substr(slash + 1);
+    const std::string ext = ".akimodel";
+    return (folder.size() > ext.size()) && (folder.compare(folder.size() - ext.size(), ext.size(), ext) == 0) &&
+        !file.empty() && (file.find('/') == std::string::npos);
+}
+
+static void aki_log(uint8_t* rdram, recomp_context* ctx) {
+    const gpr str = gpr(int32_t(_arg<0, uint32_t>(rdram, ctx)));
+    const uint32_t length = _arg<1, uint32_t>(rdram, ctx);
+    std::string text;
+    for (uint32_t i = 0; (i < length) && (i < 4096); i++) {
+        text.push_back(char(MEM_B(i, str)));
+    }
+
+    fprintf(stderr, "[mod] %s\n", text.c_str());
+}
+
+static void aki_models_read(uint8_t* rdram, recomp_context* ctx) {
+    const std::string path = mod_read_string(rdram, gpr(int32_t(_arg<0, uint32_t>(rdram, ctx))), 256);
+    const gpr dest = gpr(int32_t(_arg<1, uint32_t>(rdram, ctx)));
+    const uint32_t max = _arg<2, uint32_t>(rdram, ctx);
+    if (!models_path_ok(path)) {
+        _return(ctx, int32_t(-3));
+        return;
+    }
+
+    std::error_code ec;
+    std::filesystem::path file_path;
+    try {
+        file_path = models_directory() / std::filesystem::u8path(path);
+    } catch (...) {
+        _return(ctx, int32_t(-3));
+        return;
+    }
+
+    const uintmax_t size = std::filesystem::file_size(file_path, ec);
+    if (ec || !std::filesystem::is_regular_file(file_path, ec)) {
+        _return(ctx, int32_t(-1));
+        return;
+    }
+
+    if (size > max) {
+        fprintf(stderr, "[mod] aki_models_read %s: %llu bytes, more than %u\n", path.c_str(), (unsigned long long)size, max);
+        _return(ctx, int32_t(-2));
+        return;
+    }
+
+    std::ifstream file(file_path, std::ios::binary);
+    std::vector<char> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if (bytes.size() != size) {
+        _return(ctx, int32_t(-1));
+        return;
+    }
+
+    for (size_t i = 0; i < bytes.size(); i++) {
+        MEM_B(i, dest) = int8_t(bytes[i]);
+    }
+
+    _return(ctx, int32_t(bytes.size()));
+}
+
+static void aki_models_list(uint8_t* rdram, recomp_context* ctx) {
+    const uint32_t index = _arg<0, uint32_t>(rdram, ctx);
+    const gpr out = gpr(int32_t(_arg<1, uint32_t>(rdram, ctx)));
+    const uint32_t max = _arg<2, uint32_t>(rdram, ctx);
+    std::vector<std::string> packs;
+    try {
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(models_directory(), ec)) {
+            // Names outside ASCII can't be pack ids: skip them without converting (that throws on Windows).
+            const std::wstring wide = entry.path().filename().wstring();
+            if (std::any_of(wide.begin(), wide.end(), [](wchar_t c) { return (c < 0x20) || (c > 0x7E); })) {
+                continue;
+            }
+
+            const std::string name(wide.begin(), wide.end());
+            const std::string ext = ".akimodel";
+            std::error_code dir_ec;
+            if (entry.is_directory(dir_ec) && (name.size() > ext.size()) && (name.compare(name.size() - ext.size(), ext.size(), ext) == 0)) {
+                packs.push_back(name.substr(0, name.size() - ext.size()));
+            }
+        }
+    } catch (...) {
+        _return(ctx, int32_t(-1));
+        return;
+    }
+
+    std::sort(packs.begin(), packs.end());
+    if (index >= packs.size()) {
+        _return(ctx, int32_t(-1));
+        return;
+    }
+
+    const std::string& name = packs[index];
+    if ((max == 0) || (name.size() > max - 1)) {
+        _return(ctx, int32_t(-2));
+        return;
+    }
+
+    for (size_t i = 0; i < name.size(); i++) {
+        MEM_B(i, out) = int8_t(name[i]);
+    }
+
+    MEM_B(name.size(), out) = 0;
+    _return(ctx, int32_t(name.size()));
+}
+
 static void register_mod_input_exports() {
+    recomp::overlays::register_base_export("aki_log", aki_log);
+    recomp::overlays::register_base_export("aki_models_read", aki_models_read);
+    recomp::overlays::register_base_export("aki_models_list", aki_models_list);
     recomp::overlays::register_base_export("recomp_get_key_down", mod_get_key_down);
     recomp::overlays::register_base_export("recomp_take_mouse_motion", mod_take_mouse_motion);
     recomp::overlays::register_base_export("recomp_get_mouse_dx", mod_get_mouse_dx);
