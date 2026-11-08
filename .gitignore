@@ -103,3 +103,6 @@ local-config.cmake
 *.err.log
 *.out.log
 wcw_*_log.csv
+
+# Installed conversions (AKI_CONVERSION, portable runs)
+/conversions/
