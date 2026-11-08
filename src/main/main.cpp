@@ -37,6 +37,8 @@
 #include "librecomp/rsp.hpp"
 #include "librecomp/helpers.hpp"
 #include "librecomp/overlays.hpp"
+#include "librecomp/conversion.hpp"
+#include "librecomp/addresses.hpp" // recomp::alloc (conversion codes export)
 #include "ovl_patches.hpp"
 #include "icon_bytes.h"
 #include "logo_bytes.h"
@@ -192,6 +194,16 @@ static void wcw_sample_all_threads() {
 #endif
 
 extern "C" void recomp_entrypoint(uint8_t* rdram, recomp_context* ctx);
+extern "C" void __osSiRawStartDma_recomp(uint8_t* rdram, recomp_context* ctx);
+extern "C" void __osSiDeviceBusy_recomp(uint8_t* rdram, recomp_context* ctx);
+
+// [wcw fullconv] N64Recomp leaves the raw-SI primitives out of the function table (static callers call the
+// _recomp versions directly), so code a conversion live-compiles found nothing at their addresses and ran the
+// ROM's version, which touches the SI registers (9 Underground's rev 1 controller code, aki-roadmap#120).
+static void wt_on_init(uint8_t* rdram, recomp_context* ctx) {
+    recomp::overlays::add_loaded_function((int32_t)0x80023970, __osSiRawStartDma_recomp);
+    recomp::overlays::add_loaded_function((int32_t)0x800251E0, __osSiDeviceBusy_recomp);
+}
 
 static const recomp::Version version { 0, 2, 0, "" };
 
@@ -559,7 +571,161 @@ static void mod_set_keyboard_suppressed(uint8_t* rdram, recomp_context* ctx) {
     recompinput::set_keyboard_suppressed(_arg<0, uint32_t>(rdram, ctx) != 0);
 }
 
+// [aki] Model packs (aki-roadmap#130, the aki_modelimport mod). Everything is read from <mods folder>/models/ only:
+// "models.txt" (the player's assignments) or "<pack>.akimodel/<file>" (one folder level, the folder must end in
+// .akimodel). No absolute paths, drive letters, backslashes or "..".
+//   aki_log(str, len)                  -> prints "[mod] <str>" to stderr
+//   aki_models_read(path, dest, max)   -> bytes copied into RDRAM at dest; -1 missing, -2 bigger than max, -3 bad path
+//   aki_models_list(index, out, max)   -> the index-th pack id (folder name without .akimodel, sorted) NUL-terminated
+//                                         into out, its length; -1 past the end, -2 longer than max - 1
+static std::string mod_read_string(uint8_t* rdram, gpr ptr, uint32_t limit) {
+    std::string out;
+    for (uint32_t i = 0; i < limit; i++) {
+        const char c = char(MEM_B(i, ptr));
+        if (c == '\0') {
+            break;
+        }
+
+        out.push_back(c);
+    }
+
+    return out;
+}
+
+static std::filesystem::path models_directory() {
+    return recomp::mods::get_mods_directory() / "models";
+}
+
+static bool models_path_ok(const std::string& path) {
+    if (path.empty() || (path.size() > 200) || (path.find_first_of("\\:") != std::string::npos) ||
+        (path.find("..") != std::string::npos) || (path.front() == '/')) {
+        return false;
+    }
+
+    // Printable ASCII only: no codepage conversions (they throw on Windows), no control characters.
+    for (const char c : path) {
+        if ((c < 0x20) || (c > 0x7E)) {
+            return false;
+        }
+    }
+
+    const size_t slash = path.find('/');
+    if (slash == std::string::npos) {
+        return true;
+    }
+
+    const std::string folder = path.substr(0, slash);
+    const std::string file = path.substr(slash + 1);
+    const std::string ext = ".akimodel";
+    return (folder.size() > ext.size()) && (folder.compare(folder.size() - ext.size(), ext.size(), ext) == 0) &&
+        !file.empty() && (file.find('/') == std::string::npos);
+}
+
+static void aki_log(uint8_t* rdram, recomp_context* ctx) {
+    const gpr str = gpr(int32_t(_arg<0, uint32_t>(rdram, ctx)));
+    const uint32_t length = _arg<1, uint32_t>(rdram, ctx);
+    std::string text;
+    for (uint32_t i = 0; (i < length) && (i < 4096); i++) {
+        text.push_back(char(MEM_B(i, str)));
+    }
+
+    fprintf(stderr, "[mod] %s\n", text.c_str());
+}
+
+static void aki_models_read(uint8_t* rdram, recomp_context* ctx) {
+    const std::string path = mod_read_string(rdram, gpr(int32_t(_arg<0, uint32_t>(rdram, ctx))), 256);
+    const gpr dest = gpr(int32_t(_arg<1, uint32_t>(rdram, ctx)));
+    const uint32_t max = _arg<2, uint32_t>(rdram, ctx);
+    if (!models_path_ok(path)) {
+        _return(ctx, int32_t(-3));
+        return;
+    }
+
+    std::error_code ec;
+    std::filesystem::path file_path;
+    try {
+        file_path = models_directory() / std::filesystem::u8path(path);
+    } catch (...) {
+        _return(ctx, int32_t(-3));
+        return;
+    }
+
+    const uintmax_t size = std::filesystem::file_size(file_path, ec);
+    if (ec || !std::filesystem::is_regular_file(file_path, ec)) {
+        _return(ctx, int32_t(-1));
+        return;
+    }
+
+    if (size > max) {
+        fprintf(stderr, "[mod] aki_models_read %s: %llu bytes, more than %u\n", path.c_str(), (unsigned long long)size, max);
+        _return(ctx, int32_t(-2));
+        return;
+    }
+
+    std::ifstream file(file_path, std::ios::binary);
+    std::vector<char> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if (bytes.size() != size) {
+        _return(ctx, int32_t(-1));
+        return;
+    }
+
+    for (size_t i = 0; i < bytes.size(); i++) {
+        MEM_B(i, dest) = int8_t(bytes[i]);
+    }
+
+    _return(ctx, int32_t(bytes.size()));
+}
+
+static void aki_models_list(uint8_t* rdram, recomp_context* ctx) {
+    const uint32_t index = _arg<0, uint32_t>(rdram, ctx);
+    const gpr out = gpr(int32_t(_arg<1, uint32_t>(rdram, ctx)));
+    const uint32_t max = _arg<2, uint32_t>(rdram, ctx);
+    std::vector<std::string> packs;
+    try {
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(models_directory(), ec)) {
+            // Names outside ASCII can't be pack ids: skip them without converting (that throws on Windows).
+            const std::wstring wide = entry.path().filename().wstring();
+            if (std::any_of(wide.begin(), wide.end(), [](wchar_t c) { return (c < 0x20) || (c > 0x7E); })) {
+                continue;
+            }
+
+            const std::string name(wide.begin(), wide.end());
+            const std::string ext = ".akimodel";
+            std::error_code dir_ec;
+            if (entry.is_directory(dir_ec) && (name.size() > ext.size()) && (name.compare(name.size() - ext.size(), ext.size(), ext) == 0)) {
+                packs.push_back(name.substr(0, name.size() - ext.size()));
+            }
+        }
+    } catch (...) {
+        _return(ctx, int32_t(-1));
+        return;
+    }
+
+    std::sort(packs.begin(), packs.end());
+    if (index >= packs.size()) {
+        _return(ctx, int32_t(-1));
+        return;
+    }
+
+    const std::string& name = packs[index];
+    if ((max == 0) || (name.size() > max - 1)) {
+        _return(ctx, int32_t(-2));
+        return;
+    }
+
+    for (size_t i = 0; i < name.size(); i++) {
+        MEM_B(i, out) = int8_t(name[i]);
+    }
+
+    MEM_B(name.size(), out) = 0;
+    _return(ctx, int32_t(name.size()));
+}
+
 static void register_mod_input_exports() {
+    recomp::overlays::register_base_export("aki_log", aki_log);
+    recomp::overlays::register_base_export("aki_models_read", aki_models_read);
+    recomp::overlays::register_base_export("aki_models_list", aki_models_list);
     recomp::overlays::register_base_export("recomp_get_key_down", mod_get_key_down);
     recomp::overlays::register_base_export("recomp_take_mouse_motion", mod_take_mouse_motion);
     recomp::overlays::register_base_export("recomp_get_mouse_dx", mod_get_mouse_dx);
@@ -572,6 +738,76 @@ static void register_mod_input_exports() {
     recomp::overlays::register_base_export("recomp_set_right_analog_suppressed", mod_set_right_analog_suppressed);
     recomp::overlays::register_base_export("recomp_get_right_stick_click", mod_get_right_stick_click);
     recomp::overlays::register_base_export("recomp_set_movement_rotation", mod_set_movement_rotation);
+}
+
+// [wcw fullconv] Conversion codes. AKI_CONVERSION=<id> (set by AKI Launcher) names an installed conversion,
+// <app folder>/conversions/<id>/aki.json. The runtime's loader (librecomp conversion.cpp) owns that manifest: the id
+// rules and the codes file path. When the conversion has a codes component, its text goes to the AkiMods cheats engine
+// (aki_cheats, built with AKI_HOST_CONVERSION), which applies it every frame. Grammar and contract: AkiMods
+// mods/cheats/README.md, "Codes files". Without AKI_CONVERSION, or without codes, aki_conversion_codes returns NULL.
+static std::string conversion_codes_text;
+static bool conversion_has_codes = false;
+
+// Fetched the first time the cheats mod asks (after the mod scan has loaded the conversion).
+static void fetch_conversion_codes() {
+    static bool fetched = false;
+    if (fetched) {
+        return;
+    }
+    fetched = true;
+    if (recomp::mods::active_native_codes_ready()) {
+        return; // the runtime runs these itself, every frame (aki_conversion_apply)
+    }
+    std::string text = recomp::mods::active_conversion_codes();
+    if (text.empty()) {
+        return;
+    }
+    constexpr size_t max_codes_bytes = 1024 * 1024;
+    if (text.size() > max_codes_bytes) {
+        fprintf(stderr, "[conversion] codes file is over 1 MB; ignored\n");
+        return;
+    }
+    text.erase(std::remove(text.begin(), text.end(), '\0'), text.end()); // the mod reads a C string
+    conversion_codes_text = std::move(text);
+    conversion_has_codes = true;
+    fprintf(stderr, "[conversion] codes (%zu bytes) handed to the cheats engine\n", conversion_codes_text.size());
+}
+
+// char* aki_conversion_codes(void): the codes text as a NUL-terminated string in the recomp heap (the mod frees it
+// with recomp_free), or NULL.
+static void mod_conversion_codes(uint8_t* rdram, recomp_context* ctx) {
+    fetch_conversion_codes();
+    if (!conversion_has_codes) {
+        ctx->r2 = 0;
+        return;
+    }
+    const std::string& s = conversion_codes_text;
+    const size_t alloc_size = (s.size() + 1 + 15) & ~size_t(15);
+    const gpr offset = reinterpret_cast<uint8_t*>(recomp::alloc(rdram, alloc_size)) - rdram;
+    const gpr addr = offset + 0xFFFFFFFF80000000ULL;
+    for (size_t i = 0; i < s.size(); i++) {
+        MEM_B(i, addr) = s[i];
+    }
+    MEM_B(s.size(), addr) = 0;
+    ctx->r2 = addr;
+}
+
+// void aki_conversion_apply(void): runs the conversion's native codes table once (librecomp conversion_codes.hpp:
+// codes written for this port's revision, any number of them). The cheats mod calls it from its frame hook.
+static void mod_conversion_apply(uint8_t* rdram, recomp_context* ctx) {
+    constexpr uint32_t rdram_size = 0x800000; // 8 MB (Expansion Pak), the cheats engine's range
+    recomp::mods::apply_active_native_codes(rdram, rdram_size);
+}
+
+// void aki_conversion_log(const char* msg): one line in the game's log.
+static void mod_conversion_log(uint8_t* rdram, recomp_context* ctx) {
+    fprintf(stderr, "[conversion] %s\n", _arg_string<0>(rdram, ctx).c_str());
+}
+
+static void register_conversion_exports() {
+    recomp::overlays::register_base_export("aki_conversion_codes", mod_conversion_codes);
+    recomp::overlays::register_base_export("aki_conversion_log", mod_conversion_log);
+    recomp::overlays::register_base_export("aki_conversion_apply", mod_conversion_apply);
 }
 
 // [wcw] Texture packs (aki-roadmap#48). A pack is a folder or an .rtz (a zip) with rt64.json at its root, in the mods
@@ -727,6 +963,7 @@ int main(int argc, char** argv) {
     // in the initial boot DMA. Cast through int32_t so it sign-extends to 0xFFFFFFFF80000400.
     game.entrypoint_address = (gpr)(int32_t)0x80000400;
     game.entrypoint = recomp_entrypoint;
+    game.on_init_callback = wt_on_init;
     supported_games.push_back(game);
     recomp::register_game(supported_games[0]);
 
@@ -739,8 +976,11 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(app_folder, app_folder_ec);
     recomp::register_config_path(app_folder);
     install_bundled_mods(app_folder);
+    // [wcw fullconv] Codes in a conversion (AKI_CONVERSION) only run when written for this ROM revision.
+    recomp::mods::set_port_rom_revision("wt-rev0");
     register_texture_packs(app_folder, dump_textures);
     register_mod_input_exports();
+    register_conversion_exports();
     wcw::register_wcw_overlays();
     wcw::register_wcw_patches();
 
