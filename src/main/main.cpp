@@ -575,9 +575,20 @@ static void mod_set_keyboard_suppressed(uint8_t* rdram, recomp_context* ctx) {
 // "models.txt" (the player's assignments) or "<pack>.akimodel/<file>" (one folder level, the folder must end in
 // .akimodel). No absolute paths, drive letters, backslashes or "..".
 //   aki_log(str, len)                  -> prints "[mod] <str>" to stderr
-//   aki_models_read(path, dest, max)   -> bytes copied into RDRAM at dest; -1 missing, -2 bigger than max, -3 bad path
+//   aki_models_read(path, dest, max)   -> bytes copied into RDRAM at dest; -1 missing, -2 bigger than max, -3 bad path,
+//                                         -4 dest..dest+size not inside RDRAM
 //   aki_models_list(index, out, max)   -> the index-th pack id (folder name without .akimodel, sorted) NUL-terminated
 //                                         into out, its length; -1 past the end, -2 longer than max - 1
+
+// True when [addr, addr + size) lies in KSEG0 RDRAM (8 MB, Expansion Pak): a mod's pointer must not make the host
+// write outside the game's memory.
+static bool mod_rdram_range_ok(gpr addr, uint64_t size) {
+    constexpr uint64_t kseg0 = 0xFFFFFFFF80000000ULL;
+    constexpr uint64_t rdram_size = 0x800000;
+    const uint64_t a = uint64_t(addr);
+    return (a >= kseg0) && (a - kseg0 <= rdram_size) && (size <= rdram_size - (a - kseg0));
+}
+
 static std::string mod_read_string(uint8_t* rdram, gpr ptr, uint32_t limit) {
     std::string out;
     for (uint32_t i = 0; i < limit; i++) {
@@ -662,6 +673,13 @@ static void aki_models_read(uint8_t* rdram, recomp_context* ctx) {
         return;
     }
 
+    if (!mod_rdram_range_ok(dest, size)) {
+        fprintf(stderr, "[mod] aki_models_read %s: destination 0x%08X + %llu bytes is outside RDRAM\n", path.c_str(),
+            uint32_t(dest), (unsigned long long)size);
+        _return(ctx, int32_t(-4));
+        return;
+    }
+
     std::ifstream file(file_path, std::ios::binary);
     std::vector<char> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     if (bytes.size() != size) {
@@ -710,6 +728,11 @@ static void aki_models_list(uint8_t* rdram, recomp_context* ctx) {
 
     const std::string& name = packs[index];
     if ((max == 0) || (name.size() > max - 1)) {
+        _return(ctx, int32_t(-2));
+        return;
+    }
+
+    if (!mod_rdram_range_ok(out, name.size() + 1)) {
         _return(ctx, int32_t(-2));
         return;
     }
@@ -783,7 +806,13 @@ static void mod_conversion_codes(uint8_t* rdram, recomp_context* ctx) {
     }
     const std::string& s = conversion_codes_text;
     const size_t alloc_size = (s.size() + 1 + 15) & ~size_t(15);
-    const gpr offset = reinterpret_cast<uint8_t*>(recomp::alloc(rdram, alloc_size)) - rdram;
+    void* mem = recomp::alloc(rdram, alloc_size);
+    if (mem == nullptr) {
+        fprintf(stderr, "[conversion] recomp heap has no room for the codes (%zu bytes); codes off\n", alloc_size);
+        ctx->r2 = 0;
+        return;
+    }
+    const gpr offset = reinterpret_cast<uint8_t*>(mem) - rdram;
     const gpr addr = offset + 0xFFFFFFFF80000000ULL;
     for (size_t i = 0; i < s.size(); i++) {
         MEM_B(i, addr) = s[i];
