@@ -603,7 +603,12 @@ static std::string mod_read_string(uint8_t* rdram, gpr ptr, uint32_t limit) {
     return out;
 }
 
+// aki-roadmap#226: while a conversion with a models component runs, its own models folder instead (models.txt and packs
+// included); empty when its models were refused (librecomp conversion::models_refusal), and then nothing is read.
 static std::filesystem::path models_directory() {
+    if (const recomp::mods::conversion::Conversion* conversion = recomp::mods::active_conversion(); conversion && conversion->has_models) {
+        return recomp::mods::active_conversion_models_dir();
+    }
     return recomp::mods::get_mods_directory() / "models";
 }
 
@@ -652,10 +657,29 @@ static void aki_models_read(uint8_t* rdram, recomp_context* ctx) {
         return;
     }
 
+    // aki-roadmap#226: a conversion's aki.json slots, served as its models.txt.
+    std::string slots_text;
+    if ((path == "models.txt") && recomp::mods::active_conversion_models_txt(slots_text)) {
+        if (slots_text.size() > max) {
+            _return(ctx, int32_t(-2));
+            return;
+        }
+        for (size_t i = 0; i < slots_text.size(); i++) {
+            MEM_B(i, dest) = int8_t(slots_text[i]);
+        }
+        _return(ctx, int32_t(slots_text.size()));
+        return;
+    }
+
     std::error_code ec;
     std::filesystem::path file_path;
+    const std::filesystem::path directory = models_directory();
+    if (directory.empty()) {
+        _return(ctx, int32_t(-1));
+        return;
+    }
     try {
-        file_path = models_directory() / std::filesystem::u8path(path);
+        file_path = directory / std::filesystem::u8path(path);
     } catch (...) {
         _return(ctx, int32_t(-3));
         return;
@@ -699,9 +723,14 @@ static void aki_models_list(uint8_t* rdram, recomp_context* ctx) {
     const gpr out = gpr(int32_t(_arg<1, uint32_t>(rdram, ctx)));
     const uint32_t max = _arg<2, uint32_t>(rdram, ctx);
     std::vector<std::string> packs;
+    const std::filesystem::path directory = models_directory();
+    if (directory.empty()) {
+        _return(ctx, int32_t(-1));
+        return;
+    }
     try {
         std::error_code ec;
-        for (const auto& entry : std::filesystem::directory_iterator(models_directory(), ec)) {
+        for (const auto& entry : std::filesystem::directory_iterator(directory, ec)) {
             // Names outside ASCII can't be pack ids: skip them without converting (that throws on Windows).
             const std::wstring wide = entry.path().filename().wstring();
             if (std::any_of(wide.begin(), wide.end(), [](wchar_t c) { return (c < 0x20) || (c > 0x7E); })) {
