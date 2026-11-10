@@ -205,7 +205,7 @@ static void wt_on_init(uint8_t* rdram, recomp_context* ctx) {
     recomp::overlays::add_loaded_function((int32_t)0x800251E0, __osSiDeviceBusy_recomp);
 }
 
-static const recomp::Version version { 0, 3, 0, "" };
+static const recomp::Version version { 0, 3, 1, "" };
 
 template <typename... Ts>
 [[noreturn]] static void exit_error(const char* str, Ts... args) {
