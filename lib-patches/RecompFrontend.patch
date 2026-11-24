@@ -1,8 +1,112 @@
+diff --git a/recompinput/include/recompinput/controls_rules.h b/recompinput/include/recompinput/controls_rules.h
+new file mode 100644
+index 0000000..b5e08c3
+--- /dev/null
++++ b/recompinput/include/recompinput/controls_rules.h
+@@ -0,0 +1,54 @@
++#pragma once
++
++#include <cstdint>
++#include <string>
++
++#include "json/json.hpp"
++
++// [wcw fix] Rules for saving and loading the controls (controls.json), kept free of SDL and UI state so they can be
++// unit tested (recompui/tests/controls_rules_tests.cpp, aki-roadmap#303; the code is in
++// recompinput/src/controls_rules.cpp). profiles.cpp and the UI call these; a change to the rules belongs here, with a test.
++namespace recompinput::controls_rules {
++    // The lookup hash of a controller GUID. It is never written to controls.json, so it must be rebuilt from the saved
++    // fields on load: before #303 a loaded GUID kept hash 0, every saved controller collapsed onto one entry and the
++    // file's "controllers" list came back with pads linked to each other's profiles. Includes the serial, like the profile
++    // key, so two pads of one model with different serials (DualShock 4, Switch Pro) don't share an entry. Never 0.
++    uint64_t controller_guid_hash(const std::string &serial, int vendor, int product, int version, int crc16);
++
++    // Which profile a controller saved in controls.json links to on load. Every per-pad profile is keyed by its pad's
++    // GUID string, so a link to a different pad's non-custom profile is the pre-#303 corruption; it falls back to the
++    // pad's own profile when that exists. Custom profiles (shared between pads) keep their link. Returns the profile key
++    // to use, or "" to skip the entry (the pad's profile is made when it is plugged in).
++    std::string saved_controller_profile_key(const std::string &guid_key, const std::string &saved_profile_key,
++        bool saved_profile_exists, bool saved_profile_custom, bool own_profile_exists);
++
++    // Whether the controls must be written now. The mappings change on every bind, clear, reset and new pad; they are
++    // saved as soon as they change (not only when the Controls tab closes: quitting from the menu or closing the window
++    // with the tab open lost every change, #303), but not while a bind is waiting for its input.
++    bool controls_need_save(uint64_t revision, uint64_t saved_revision, bool binding_active);
++}
++
++namespace recompinput {
++    struct ControllerGUID {
++        uint64_t hash{};
++        std::string serial;
++        int vendor{};
++        int product{};
++        int version{};
++        int crc16{};
++    };
++
++    inline void to_json(nlohmann::json& j, const ControllerGUID& guid) {
++        j = nlohmann::json{ {"serial", guid.serial}, {"vendor", guid.vendor}, {"product", guid.product}, {"version", guid.version}, {"crc16", guid.crc16} };
++    }
++
++    inline void from_json(const nlohmann::json& j, ControllerGUID& guid) {
++        j.at("serial").get_to(guid.serial);
++        j.at("vendor").get_to(guid.vendor);
++        j.at("product").get_to(guid.product);
++        j.at("version").get_to(guid.version);
++        j.at("crc16").get_to(guid.crc16);
++        // [wcw fix] The hash isn't saved; rebuild it (a loaded GUID used to keep hash 0, aki-roadmap#303).
++        guid.hash = controls_rules::controller_guid_hash(guid.serial, guid.vendor, guid.product, guid.version, guid.crc16);
++    }
++}
+diff --git a/recompinput/include/recompinput/input_rules.h b/recompinput/include/recompinput/input_rules.h
+new file mode 100644
+index 0000000..22cbf70
+--- /dev/null
++++ b/recompinput/include/recompinput/input_rules.h
+@@ -0,0 +1,38 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++// [wcw fix] Rules for turning host input into N64 input, kept free of SDL so they can be unit tested
++// (recompui/tests/input_rules_tests.cpp, aki-roadmap#305; the code is in recompinput/src/input_rules.cpp). input_state.cpp
++// calls these; a change to the rules belongs here, with a test.
++namespace recompinput::input_rules {
++    // A stick or trigger bound to a button (the family's default puts the left stick on the N64 d-pad) presses at
++    // analog_press_threshold and lets go only below analog_release_threshold. With one threshold a stick held near it,
++    // or wobbling as it springs back, crossed it more than once per push: the game saw press, release, press, and menus
++    // moved two rows (#305).
++    constexpr float analog_press_threshold = 0.5f;
++    constexpr float analog_release_threshold = 0.35f;
++
++    // Whether the bound button is down now, given whether it was down at the last read and the axis value (0..1, the
++    // bound direction).
++    bool analog_as_digital(bool was_pressed, float value);
++
++    // [wcw fix] Which player slot a newly connected pad takes (aki-roadmap#304). players.cpp keeps one SlotView per
++    // assigned player. A slot whose pad was unplugged stays assigned and remembers that pad (left_by = its controls
++    // profile key hash, 0 if unknown), so the pad gets the same player back when it reconnects, even if other pads come
++    // back before it. Before #304 a returning pad took the first empty slot: two pads that dropped out together (a
++    // hub, wireless sleep) came back swapped, and each player's pad drove the other player.
++    struct SlotView {
++        bool has_controller = false;  // a pad is connected in this slot
++        bool keyboard = false;        // a keyboard player (never given to a pad)
++        uint64_t left_by = 0;         // the pad that last left this slot (0 = none or unknown)
++    };
++    constexpr int slot_append = -1;  // add a new player slot
++    constexpr int slot_none = -2;    // every slot is taken
++    // pad_id = the connecting pad's profile key hash (0 = unknown). Order: the empty slot this pad left; else the first
++    // empty slot (a new or different pad, so a player who swaps pads keeps their player); else a new slot if
++    // slots.size() < max_slots; else slot_none.
++    int slot_for_connected_pad(const std::vector<SlotView> &slots, size_t max_slots, uint64_t pad_id);
++}
 diff --git a/recompinput/include/recompinput/input_state.h b/recompinput/include/recompinput/input_state.h
-index 1961e29..e7a76a3 100644
+index 1961e29..6bd07fe 100644
 --- a/recompinput/include/recompinput/input_state.h
 +++ b/recompinput/include/recompinput/input_state.h
-@@ -40,6 +40,14 @@ namespace recompinput {
+@@ -40,8 +40,20 @@ namespace recompinput {
      void get_right_analog(int controller_num, float* x, float* y);
      void apply_joystick_deadzone(float x_in, float y_in, float* x_out, float* y_out);
      void set_right_analog_suppressed(bool suppressed);
@@ -16,30 +120,138 @@ index 1961e29..e7a76a3 100644
 +    void take_raw_mouse_motion(float* delta_x, float* delta_y, int32_t* wheel);
      bool game_input_disabled();
      bool all_input_disabled();
++    // [wcw fix] Forgets which sticks/triggers bound to buttons were held, for one player (aki-roadmap#305): called while
++    // the game gets no input (a menu is open), so a stick resting between the release and press thresholds afterwards
++    // doesn't read as still held.
++    void reset_analog_digital_state(int controller_num);
      ControllerState &get_controller_state(SDL_JoystickID joystick_id);
+     SDL_GameController *get_controller_from_joystick_id(SDL_JoystickID joystick_id);
+     void add_controller_state(SDL_JoystickID joystick_id, SDL_GameController* controller);
 diff --git a/recompinput/include/recompinput/players.h b/recompinput/include/recompinput/players.h
-index 6c59b61..cad2b5e 100644
+index 6c59b61..c45e174 100644
 --- a/recompinput/include/recompinput/players.h
 +++ b/recompinput/include/recompinput/players.h
-@@ -26,6 +26,16 @@ namespace recompinput {
+@@ -7,6 +7,9 @@ namespace recompinput {
+     struct Player {
+         SDL_GameController* controller = nullptr;
+         bool keyboard_enabled = false;
++        // [wcw fix] The pad that was unplugged from this slot (its profile key hash, 0 = none), so it gets this
++        // player back when it reconnects (aki-roadmap#304).
++        uint64_t left_by = 0;
+         std::chrono::high_resolution_clock::duration last_button_press_timestamp = std::chrono::high_resolution_clock::duration::zero();
+ 
+         Player() : controller(nullptr), keyboard_enabled(false), last_button_press_timestamp(std::chrono::high_resolution_clock::duration::zero()) {};
+@@ -26,6 +29,17 @@ namespace recompinput {
          bool get_player_is_assigned(int player_index, bool temp_player = false);
          bool has_enough_players_assigned();
          InputDevice get_player_input_device(int player_index, bool temp_player = false);
 +
-+        // [wcw fix] Plug-and-play multiplayer: assign a newly detected controller to the first
-+        // free player slot (a vacated slot first, else the next unassigned player) without
-+        // requiring the assignment modal. No-op in single-player mode, while manual assignment
-+        // is active, or if the controller is already assigned.
++        // [wcw fix] Plug-and-play multiplayer: assign a newly detected controller to a player slot
++        // without requiring the assignment modal: the slot it was unplugged from, else the first
++        // vacated slot, else the next unassigned player (input_rules::slot_for_connected_pad, #304).
++        // No-op in single-player mode, while manual assignment is active, or if the controller is
++        // already assigned.
 +        void auto_assign_controller(SDL_GameController* controller);
 +        // [wcw fix] Clear a removed controller from any player slot holding it (the slot stays
-+        // assigned and reads neutral; replugging auto-assigns back into the vacated slot).
++        // assigned and reads neutral; the same pad replugging gets it back).
 +        // Without this the slot keeps a dangling SDL_GameController pointer.
 +        void handle_controller_removed(SDL_GameController* controller);
      }
  
      namespace playerassignment {
+diff --git a/recompinput/include/recompinput/profiles.h b/recompinput/include/recompinput/profiles.h
+index 45bedd1..3b7410b 100644
+--- a/recompinput/include/recompinput/profiles.h
++++ b/recompinput/include/recompinput/profiles.h
+@@ -5,29 +5,11 @@
+ #include <string>
+ #include "recompinput.h"
+ #include "json/json.hpp"
++#include "controls_rules.h"
+ 
+ 
+ namespace recompinput {
+-    struct ControllerGUID {
+-        uint64_t hash;
+-        std::string serial;
+-        int vendor{};
+-        int product{};
+-        int version{};
+-        int crc16{};
+-    };
+-
+-    inline void to_json(nlohmann::json& j, const ControllerGUID& guid) {
+-        j = nlohmann::json{ {"serial", guid.serial}, {"vendor", guid.vendor}, {"product", guid.product}, {"version", guid.version}, {"crc16", guid.crc16} };
+-    }
+-
+-    inline void from_json(const nlohmann::json& j, ControllerGUID& guid) {
+-        j.at("serial").get_to(guid.serial);
+-        j.at("vendor").get_to(guid.vendor);
+-        j.at("product").get_to(guid.product);
+-        j.at("version").get_to(guid.version);
+-        j.at("crc16").get_to(guid.crc16);
+-    }
++    // ControllerGUID and its json conversion live in controls_rules.h (unit tested without SDL).
+ 
+     namespace profiles {
+         constexpr int controls_config_version = 3;
+@@ -65,6 +47,9 @@ namespace recompinput {
+ 
+         bool load_controls_config(const std::filesystem::path& path);
+         bool save_controls_config(const std::filesystem::path& path);
++        // [wcw fix] Saves the controls when they changed since the last load or save (aki-roadmap#303). Called every UI
++        // frame; does nothing before load_controls_config or while binding_active.
++        bool save_controls_config_if_changed(const std::filesystem::path& path, bool binding_active);
+     }
+ }
+ 
+diff --git a/recompinput/src/controls_rules.cpp b/recompinput/src/controls_rules.cpp
+new file mode 100644
+index 0000000..2c206d7
+--- /dev/null
++++ b/recompinput/src/controls_rules.cpp
+@@ -0,0 +1,39 @@
++#include "recompinput/controls_rules.h"
++
++namespace recompinput::controls_rules {
++    uint64_t controller_guid_hash(const std::string &serial, int vendor, int product, int version, int crc16) {
++        // FNV-1a over the fields (the hash only lives in memory, so any stable function will do).
++        uint64_t hash = 0xcbf29ce484222325ull;
++        for (unsigned char c : serial) {
++            hash ^= c;
++            hash *= 0x100000001b3ull;
++        }
++        // Ends the serial, so "ab" + vendor 1 can't hash like "a" + bytes of another vendor.
++        hash ^= 0xFFu;
++        hash *= 0x100000001b3ull;
++        auto mix = [&hash](int value) {
++            const uint32_t bits = static_cast<uint32_t>(value);
++            for (int i = 0; i < 4; i++) {
++                hash ^= (bits >> (i * 8)) & 0xFFu;
++                hash *= 0x100000001b3ull;
++            }
++        };
++        mix(vendor);
++        mix(product);
++        mix(version);
++        mix(crc16);
++        return hash != 0 ? hash : 1;
++    }
++
++    std::string saved_controller_profile_key(const std::string &guid_key, const std::string &saved_profile_key,
++        bool saved_profile_exists, bool saved_profile_custom, bool own_profile_exists) {
++        if (saved_profile_exists && (saved_profile_custom || saved_profile_key == guid_key)) {
++            return saved_profile_key;
++        }
++        return own_profile_exists ? guid_key : std::string();
++    }
++
++    bool controls_need_save(uint64_t revision, uint64_t saved_revision, bool binding_active) {
++        return revision != saved_revision && !binding_active;
++    }
++}
 diff --git a/recompinput/src/input_events.cpp b/recompinput/src/input_events.cpp
-index c76a1dc..71ff174 100644
+index c76a1dc..cb8d335 100644
 --- a/recompinput/src/input_events.cpp
 +++ b/recompinput/src/input_events.cpp
 @@ -2,6 +2,7 @@
@@ -50,7 +262,21 @@ index c76a1dc..71ff174 100644
  #include "recompui/config.h"
  #include "ultramodern/ultramodern.hpp"
  
-@@ -95,12 +96,20 @@ bool sdl_event_filter(void* userdata, SDL_Event* event) {
+@@ -87,6 +88,13 @@ bool sdl_event_filter(void* userdata, SDL_Event* event) {
+         }
+         
+         ControllerGUID guid = profiles::get_guid_from_sdl_controller(controller);
++        // [wcw] Which pad this is (aki-roadmap#304/#305): two lines for one physical pad mean a duplicate device
++        // (DS4Windows, Steam Input, x360ce ...), and a changing key means the controls profile can't follow the pad.
++        if (controller != nullptr) {
++            const char* controller_name = SDL_GameControllerName(controller);
++            printf("  Name: %s, profile key: %s\n", controller_name != nullptr ? controller_name : "?",
++                profiles::get_string_from_controller_guid(guid).c_str());
++        }
+         if (profiles::get_controller_by_guid(guid) < 0) {
+             if (players::is_single_player_mode()) {
+                 deferred_controller_profiles[guid.hash] = guid;
+@@ -95,12 +103,20 @@ bool sdl_event_filter(void* userdata, SDL_Event* event) {
                  profiles::add_controller(guid, profile_index);
              }
          }
@@ -71,7 +297,25 @@ index c76a1dc..71ff174 100644
          recompinput::remove_controller_state(controller_event->which);
      }
      break;
-@@ -256,7 +265,8 @@ void handle_events() {
+@@ -110,7 +126,16 @@ bool sdl_event_filter(void* userdata, SDL_Event* event) {
+             return true;
+         }
+ 
+-        recompui::open_quit_game_prompt();
++        // [wcw fix] A close request from outside the game: the window's X, or the AKI Launcher's Return To Launcher
++        // (View held for a second, aki-roadmap#304). View also opens the config menu, so the prompt came up over it; Cancel
++        // left the player in that menu, where B does nothing, and the game took no input until View was pressed again.
++        // Now Cancel (or B) closes both. A second request while a prompt is waiting for an answer is dropped: the player
++        // answers the one on screen (re-opening it ran the old prompt's cancel on this thread).
++        if (recompui::is_answerable_prompt_open()) {
++            break;
++        }
++        const bool config_open = recompui::is_context_shown(recompui::config::get_config_context_id());
++        recompui::open_quit_game_prompt(config_open);
+         recompui::activate_mouse();
+         break;
+     }
+@@ -256,7 +281,8 @@ void handle_events() {
          bool has_mouse_sensitivity = recompui::config::general::has_mouse_sensitivity_option();
  
          // Lock the cursor if all three conditions are true: mouse aiming is enabled, game input is not disabled, and the game has been started. 
@@ -81,11 +325,54 @@ index c76a1dc..71ff174 100644
  
          // Hide the cursor based on its enable state, but override visibility to false if the cursor is locked.
          bool cursor_visible = recompui::get_cursor_visible();
+diff --git a/recompinput/src/input_rules.cpp b/recompinput/src/input_rules.cpp
+new file mode 100644
+index 0000000..af0ad8e
+--- /dev/null
++++ b/recompinput/src/input_rules.cpp
+@@ -0,0 +1,24 @@
++#include "recompinput/input_rules.h"
++
++namespace recompinput::input_rules {
++    bool analog_as_digital(bool was_pressed, float value) {
++        return value >= (was_pressed ? analog_release_threshold : analog_press_threshold);
++    }
++
++    int slot_for_connected_pad(const std::vector<SlotView> &slots, size_t max_slots, uint64_t pad_id) {
++        auto empty = [](const SlotView &slot) { return !slot.has_controller && !slot.keyboard; };
++        if (pad_id != 0) {
++            for (size_t i = 0; i < slots.size(); i++) {
++                if (empty(slots[i]) && slots[i].left_by == pad_id) {
++                    return (int)i;
++                }
++            }
++        }
++        for (size_t i = 0; i < slots.size(); i++) {
++            if (empty(slots[i])) {
++                return (int)i;
++            }
++        }
++        return slots.size() < max_slots ? slot_append : slot_none;
++    }
++}
 diff --git a/recompinput/src/input_state.cpp b/recompinput/src/input_state.cpp
-index 03ed871..3948a52 100644
+index 03ed871..81b87ae 100644
 --- a/recompinput/src/input_state.cpp
 +++ b/recompinput/src/input_state.cpp
-@@ -159,6 +159,11 @@ bool controller_button_state(int controller_num, int32_t input_id) {
+@@ -2,10 +2,12 @@
+ #include <mutex>
+ #include <span>
+ #include <atomic>
++#include <array>
+ 
+ #include "recompinput/recompinput.h"
+ #include "recompinput/input_state.h"
+ #include "recompinput/input_binding.h"
++#include "recompinput/input_rules.h"
+ #include "recompinput/players.h"
+ #include "recompui/config.h"
+ 
+@@ -159,6 +161,11 @@ bool controller_button_state(int controller_num, int32_t input_id) {
  }
  
  static std::atomic_bool right_analog_suppressed = false;
@@ -97,7 +384,7 @@ index 03ed871..3948a52 100644
  
  float controller_axis_state(int controller_num, int32_t input_id, bool allow_suppression) {
      if (abs(input_id) - 1 < SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_MAX) {
-@@ -218,6 +223,9 @@ bool recompinput::should_override_keystate(SDL_Scancode key, SDL_Keymod mod) {
+@@ -218,6 +225,9 @@ bool recompinput::should_override_keystate(SDL_Scancode key, SDL_Keymod mod) {
  float recompinput::get_input_analog(int controller_num, const InputField& field) {
      switch (field.input_type) {
      case InputType::Keyboard:
@@ -107,7 +394,35 @@ index 03ed871..3948a52 100644
          if (InputState.keys && field.input_id >= 0 && field.input_id < InputState.numkeys) {
              if (should_override_keystate(static_cast<SDL_Scancode>(field.input_id), InputState.keymod)) {
                  return 0.0f;
-@@ -248,6 +256,9 @@ float recompinput::get_input_analog(int controller_num, const std::span<const In
+@@ -245,9 +255,37 @@ float recompinput::get_input_analog(int controller_num, const std::span<const In
+     return std::clamp(ret, 0.0f, 1.0f);
+ }
+ 
++// [wcw fix] Last state of every axis direction bound to a button, per player, so the press/release thresholds can
++// differ (input_rules::analog_as_digital, aki-roadmap#305). Index: player, then the signed axis id + SDL_CONTROLLER_AXIS_MAX.
++static std::array<std::array<std::atomic_bool, 2 * SDL_CONTROLLER_AXIS_MAX + 1>, recompinput::max_num_players_supported> analog_digital_state{};
++
++static bool analog_field_pressed(int controller_num, int32_t input_id) {
++    const float value = controller_axis_state(controller_num, input_id, true);
++    const int slot = input_id + SDL_CONTROLLER_AXIS_MAX;
++    if (controller_num < 0 || controller_num >= (int)analog_digital_state.size() || slot < 0 || slot >= (int)analog_digital_state[0].size()) {
++        return value >= recompinput::input_rules::analog_press_threshold;
++    }
++    std::atomic_bool &state = analog_digital_state[controller_num][slot];
++    const bool pressed = recompinput::input_rules::analog_as_digital(state.load(), value);
++    state.store(pressed);
++    return pressed;
++}
++
++void recompinput::reset_analog_digital_state(int controller_num) {
++    if (controller_num < 0 || controller_num >= (int)analog_digital_state.size()) {
++        return;
++    }
++    for (std::atomic_bool &state : analog_digital_state[controller_num]) {
++        state.store(false);
++    }
++}
++
  bool recompinput::get_input_digital(int controller_num, const InputField& field) {
      switch (field.input_type) {
      case InputType::Keyboard:
@@ -117,7 +432,18 @@ index 03ed871..3948a52 100644
          if (InputState.keys && field.input_id >= 0 && field.input_id < InputState.numkeys) {
              if (should_override_keystate(static_cast<SDL_Scancode>(field.input_id), InputState.keymod)) {
                  return false;
-@@ -358,6 +369,28 @@ void recompinput::get_right_analog(int controller_num, float* x, float* y) {
+@@ -258,8 +296,8 @@ bool recompinput::get_input_digital(int controller_num, const InputField& field)
+     case InputType::ControllerDigital:
+         return controller_button_state(controller_num, field.input_id);
+     case InputType::ControllerAnalog:
+-        // TODO adjustable threshold
+-        return controller_axis_state(controller_num, field.input_id, true) >= recompinput::axis_digital_threshold;
++        // [wcw fix] Press at 0.5, release below 0.35 (aki-roadmap#305).
++        return analog_field_pressed(controller_num, field.input_id);
+     case InputType::Mouse:
+         // TODO mouse support
+         return false;
+@@ -358,6 +396,28 @@ void recompinput::get_right_analog(int controller_num, float* x, float* y) {
      apply_joystick_deadzone(x_val, y_val, x, y);
  }
  
@@ -146,7 +472,7 @@ index 03ed871..3948a52 100644
  void recompinput::set_right_analog_suppressed(bool suppressed) {
      right_analog_suppressed.store(suppressed);
  }
-@@ -410,7 +443,13 @@ void recompinput::add_mouse_deltas(float delta_x, float delta_y) {
+@@ -410,7 +470,13 @@ void recompinput::add_mouse_deltas(float delta_x, float delta_y) {
      std::lock_guard lock{ InputState.pending_input_mutex };
      InputState.pending_mouse_delta[0] += delta_x;
      InputState.pending_mouse_delta[1] += delta_y;
@@ -161,47 +487,56 @@ index 03ed871..3948a52 100644
 +    }
  }
 diff --git a/recompinput/src/players.cpp b/recompinput/src/players.cpp
-index 08cb3f3..45cfcf0 100644
+index 08cb3f3..bc48496 100644
 --- a/recompinput/src/players.cpp
 +++ b/recompinput/src/players.cpp
-@@ -129,6 +129,59 @@ InputDevice players::get_player_input_device(int player_index, bool temp_player)
+@@ -1,5 +1,6 @@
+ #include "recompinput/recompinput.h"
+ #include "recompinput/players.h"
++#include "recompinput/input_rules.h"
+ #include "recompinput/profiles.h"
+ #include "recompinput/input_events.h"
+ #include "ultramodern/ultramodern.hpp"
+@@ -129,6 +130,64 @@ InputDevice players::get_player_input_device(int player_index, bool temp_player)
      }
  }
  
-+// [wcw fix] Plug-and-play multiplayer assignment (see players.h).
++// [wcw fix] Plug-and-play multiplayer assignment (see players.h). The slot comes from
++// input_rules::slot_for_connected_pad (aki-roadmap#304): a pad that was unplugged gets its own player back.
 +void players::auto_assign_controller(SDL_GameController* controller) {
 +    if (controller == nullptr || PlayerState.single_player_mode || PlayerState.is_assigning) {
 +        return;
 +    }
 +
-+    int free_slot = -1;
++    std::vector<input_rules::SlotView> slots;
 +    for (size_t i = 0; i < PlayerState.players.get_count(); i++) {
-+        Player& player = PlayerState.players[i];
++        const Player& player = PlayerState.players[i];
 +        if (player.controller == controller) {
 +            return; // already assigned
 +        }
-+        if (free_slot < 0 && player.controller == nullptr && !player.keyboard_enabled) {
-+            free_slot = (int)i; // vacated slot (controller was unplugged)
-+        }
++        slots.push_back({ player.controller != nullptr, player.keyboard_enabled, player.left_by });
 +    }
 +
-+    if (free_slot >= 0) {
-+        PlayerState.players[free_slot].controller = controller;
-+        PlayerState.players[free_slot].button_pressed();
++    const uint64_t pad_id = profiles::get_guid_from_sdl_controller(controller).hash;
++    int slot = input_rules::slot_for_connected_pad(slots, players::get_max_number_of_players(), pad_id);
++    if (slot == input_rules::slot_none) {
++        return; // all player slots taken
 +    }
-+    else if (PlayerState.players.get_count() < players::get_max_number_of_players()) {
++    if (slot == input_rules::slot_append) {
 +        PlayerState.players.add_controller_player(controller);
-+        free_slot = (int)PlayerState.players.get_count() - 1;
++        slot = (int)PlayerState.players.get_count() - 1;
 +    }
 +    else {
-+        return; // all player slots taken
++        PlayerState.players[slot].controller = controller;
++        PlayerState.players[slot].left_by = 0;
++        PlayerState.players[slot].button_pressed();
 +    }
 +
 +    int cont_profile_index = profiles::get_controller_profile_index_from_sdl_controller(controller);
 +    if (cont_profile_index >= 0) {
-+        profiles::set_input_profile_for_player(free_slot, cont_profile_index, InputDevice::Controller);
++        profiles::set_input_profile_for_player(slot, cont_profile_index, InputDevice::Controller);
 +    }
-+    printf("Auto-assigned controller to player %d\n", free_slot + 1);
++    printf("Auto-assigned controller to player %d\n", slot + 1);
 +}
 +
 +// [wcw fix] See players.h.
@@ -209,9 +544,12 @@ index 08cb3f3..45cfcf0 100644
 +    if (controller == nullptr) {
 +        return;
 +    }
++    // The pad's key, so it gets this slot back when it reconnects (#304). The controller is still open here.
++    const uint64_t pad_id = profiles::get_guid_from_sdl_controller(controller).hash;
 +    for (size_t i = 0; i < PlayerState.players.get_count(); i++) {
 +        if (PlayerState.players[i].controller == controller) {
 +            PlayerState.players[i].controller = nullptr;
++            PlayerState.players[i].left_by = pad_id;
 +        }
 +    }
 +    for (size_t i = 0; i < PlayerState.temp_players.get_count(); i++) {
@@ -225,10 +563,113 @@ index 08cb3f3..45cfcf0 100644
  
  bool playerassignment::is_active() {
 diff --git a/recompinput/src/profiles.cpp b/recompinput/src/profiles.cpp
-index c89956e..73c8376 100644
+index c89956e..6ec8854 100644
 --- a/recompinput/src/profiles.cpp
 +++ b/recompinput/src/profiles.cpp
-@@ -343,6 +343,15 @@ namespace recompinput {
+@@ -1,10 +1,13 @@
++#include <atomic>
++#include <cstdio>
+ #include <filesystem>
+ #include <fstream>
++#include <mutex>
+ #include <iomanip>
+ #include <string>
+ #include "recompinput/profiles.h"
+ #include "./json.h"
+-#include "xxHash/xxh3.h"
++#include "recompinput/controls_rules.h"
+ 
+ // Arrays that hold the mappings for every input for keyboard and controller respectively.
+ using input_mapping = std::array<recompinput::InputField, recompinput::num_bindings_per_input>;
+@@ -32,6 +35,15 @@ struct Controller {
+ static std::vector<Controller> controllers;
+ static std::unordered_map<uint64_t, int> controller_hash_index_map{};
+ 
++// [wcw fix] Bumped on every change that controls.json keeps (bindings, profiles, pad links); see
++// save_controls_config_if_changed (aki-roadmap#303).
++static std::atomic<uint64_t> controls_revision{0};
++static std::atomic<uint64_t> controls_saved_revision{0};
++static std::atomic<bool> controls_loaded{false};
++// [wcw fix] The UI thread now saves while the event thread may be adding a just-plugged pad's profile; guard the
++// containers that can reallocate (input_profiles, controllers) for those two paths.
++static std::recursive_mutex controls_structure_mutex;
++
+ static int keyboard_sp_profile_index = -1;
+ static int controller_sp_profile_index = -1;
+ 
+@@ -66,8 +78,14 @@ namespace recompinput {
+     }
+ 
+     void profiles::set_input_binding(int profile_index, GameInput input, size_t binding_index, InputField value) {
++        // [wcw fix] Under the lock so a save never snapshots a profile mid-change (aki-roadmap#303 review).
++        std::lock_guard lock{ controls_structure_mutex };
+         input_mapping& cur_input_mapping = input_profiles[profile_index].mappings.at(static_cast<size_t>(input));
+         if (binding_index < cur_input_mapping.size()) {
++            const recompinput::InputField &old_value = cur_input_mapping[binding_index];
++            if (old_value.input_type != value.input_type || old_value.input_id != value.input_id) {
++                controls_revision++;
++            }
+             cur_input_mapping[binding_index] = value;
+         }
+     }
+@@ -124,6 +142,7 @@ namespace recompinput {
+     }
+ 
+     int profiles::add_input_profile(const std::string &key, const std::string &name, InputDevice device, bool custom) {
++        std::lock_guard lock{ controls_structure_mutex };
+         auto it = input_profile_key_index_map.find(key);
+         if (it != input_profile_key_index_map.end()) {
+             return it->second;
+@@ -137,6 +156,7 @@ namespace recompinput {
+         profile.custom = custom;
+         input_profiles.emplace_back(profile);
+         input_profile_key_index_map.emplace(key, index);
++        controls_revision++;
+ 
+         if (custom) {
+             switch (device) {
+@@ -226,9 +246,13 @@ namespace recompinput {
+     }
+ 
+     int profiles::add_controller(ControllerGUID guid, int profile_index) {
++        std::lock_guard lock{ controls_structure_mutex };
+         auto it = controller_hash_index_map.find(guid.hash);
+         if (it != controller_hash_index_map.end()) {
+-            controllers[it->second].profile_index = profile_index;
++            if (controllers[it->second].profile_index != profile_index) {
++                controllers[it->second].profile_index = profile_index;
++                controls_revision++;
++            }
+             return it->second;
+         }
+ 
+@@ -238,6 +262,7 @@ namespace recompinput {
+         controller.profile_index = profile_index;
+         controllers.emplace_back(controller);
+         controller_hash_index_map.emplace(guid.hash, index);
++        controls_revision++;
+         return index;
+     }
+ 
+@@ -285,14 +310,9 @@ namespace recompinput {
+         guid.version = version;
+         guid.crc16 = crc16;
+ 
+-        // Compute the hash from the GUID.
+-        XXH3_state_t state;
+-        XXH3_64bits_reset(&state);
+-        XXH3_64bits_update(&state, &guid.vendor, sizeof(guid.vendor));
+-        XXH3_64bits_update(&state, &guid.product, sizeof(guid.product));
+-        XXH3_64bits_update(&state, &guid.version, sizeof(guid.version));
+-        XXH3_64bits_update(&state, &guid.crc16, sizeof(guid.crc16));
+-        guid.hash = XXH3_64bits_digest(&state);
++        // Compute the hash from the GUID. [wcw fix] The same function rebuilds it for GUIDs loaded from
++        // controls.json (from_json), which used to keep hash 0 (aki-roadmap#303).
++        guid.hash = controls_rules::controller_guid_hash(guid.serial, guid.vendor, guid.product, guid.version, guid.crc16);
+ 
+         return guid;
+     }
+@@ -343,6 +363,15 @@ namespace recompinput {
          // Set Player 1 to the SP profiles by default.
          profiles::set_input_profile_for_player(0, keyboard_sp_profile_index, recompinput::InputDevice::Keyboard);
          profiles::set_input_profile_for_player(0, controller_sp_profile_index, recompinput::InputDevice::Controller);
@@ -244,7 +685,7 @@ index c89956e..73c8376 100644
      }
  
      int profiles::get_sp_controller_profile_index() {
-@@ -362,7 +371,22 @@ namespace recompinput {
+@@ -362,7 +391,22 @@ namespace recompinput {
                  InputDevice::Keyboard,
                  false
              );
@@ -268,8 +709,103 @@ index c89956e..73c8376 100644
          }
          return profile_index;
      }
+@@ -406,6 +450,10 @@ namespace recompinput {
+             recompinput::apply_joystick_deadzone(cur_x, cur_y, &cur_x, &cur_y);
+             check_joystick(profile_index_kb);
+         }
++        else {
++            // [wcw fix] No reads while a menu is open: start the stick-as-button state fresh afterwards (#305 review).
++            recompinput::reset_analog_digital_state(player_index);
++        }
+ 
+         *buttons_out = cur_buttons;
+         *x_out = std::clamp(cur_x, -1.0f, 1.0f);
+@@ -424,6 +472,10 @@ namespace recompinput {
+     }
+ 
+     bool profiles::save_controls_config(const std::filesystem::path& path) {
++        std::lock_guard lock{ controls_structure_mutex };
++        // [wcw fix] The revision this snapshot holds: read before building it, under the same lock as every change, so a
++        // change made after the snapshot always leaves the file marked unsaved (aki-roadmap#303 review).
++        const uint64_t revision = controls_revision.load();
+         int profile_count = profiles::get_input_profile_count();
+         int controller_count = profiles::get_controller_count();
+         json config_json{};
+@@ -452,7 +504,25 @@ namespace recompinput {
+             controller["profile"] = profiles::get_input_profile_key(profiles::get_controller_profile_index(i));
+         }
+ 
+-        return recompinput::save_json_with_backups(path, config_json);
++        const bool saved = recompinput::save_json_with_backups(path, config_json);
++        if (saved) {
++            controls_saved_revision = revision;
++        }
++        return saved;
++    }
++
++    bool profiles::save_controls_config_if_changed(const std::filesystem::path& path, bool binding_active) {
++        if (!controls_loaded.load() ||
++            !controls_rules::controls_need_save(controls_revision.load(), controls_saved_revision.load(), binding_active)) {
++            return false;
++        }
++        const bool saved = profiles::save_controls_config(path);
++        if (!saved) {
++            // Say so and wait for the next change instead of retrying every frame.
++            fprintf(stderr, "[wcw][input] couldn't save the controls to %s\n", path.string().c_str());
++            controls_saved_revision = controls_revision.load();
++        }
++        return saved;
+     }
+ 
+     static void assign_mapping(int profile_index, GameInput input, const std::vector<InputField>& value) {
+@@ -515,7 +585,18 @@ namespace recompinput {
+         return true;
+     }
+ 
++    static bool load_controls_config_impl(const std::filesystem::path& path);
++
+     bool profiles::load_controls_config(const std::filesystem::path& path) {
++        std::lock_guard lock{ controls_structure_mutex };
++        const bool loaded = load_controls_config_impl(path);
++        // [wcw fix] Whatever was loaded (or defaulted) counts as saved; only later changes are written (aki-roadmap#303).
++        controls_saved_revision = controls_revision.load();
++        controls_loaded = true;
++        return loaded;
++    }
++
++    static bool load_controls_config_impl(const std::filesystem::path& path) {
+         profiles::initialize_input_bindings();
+ 
+         json config_json{};
+@@ -554,9 +635,24 @@ namespace recompinput {
+                 auto guid = controller.find("guid");
+                 auto profile = controller.find("profile");
+                 if (guid != controller.end() && guid->is_object() && profile != controller.end() && profile->is_string()) {
+-                    int profile_index = profiles::get_input_profile_by_key(*profile);
++                    // [wcw fix] Older files link pads to each other's profiles (the hash-0 bug, aki-roadmap#303);
++                    // such a pad goes back to its own profile.
++                    ControllerGUID loaded_guid{};
++                    try {
++                        loaded_guid = guid->get<ControllerGUID>();
++                    }
++                    catch (const json::exception&) {
++                        continue;
++                    }
++                    const std::string saved_key = profile->get<std::string>();
++                    const int saved_index = profiles::get_input_profile_by_key(saved_key);
++                    const std::string own_key = profiles::get_string_from_controller_guid(loaded_guid);
++                    const std::string key = controls_rules::saved_controller_profile_key(own_key, saved_key, saved_index >= 0,
++                        saved_index >= 0 && profiles::is_input_profile_custom(saved_index),
++                        profiles::get_input_profile_by_key(own_key) >= 0);
++                    const int profile_index = key.empty() ? -1 : profiles::get_input_profile_by_key(key);
+                     if (profile_index >= 0) {
+-                        profiles::add_controller(*guid, profile_index);
++                        profiles::add_controller(loaded_guid, profile_index);
+                     }
+                 }
+             }
 diff --git a/recompui/CMakeLists.txt b/recompui/CMakeLists.txt
-index b9c5458..7763a4e 100644
+index b9c5458..d97279b 100644
 --- a/recompui/CMakeLists.txt
 +++ b/recompui/CMakeLists.txt
 @@ -98,6 +98,7 @@ target_include_directories(recompui PUBLIC
@@ -280,13 +816,15 @@ index b9c5458..7763a4e 100644
  
  target_include_directories(recompui PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include/recompui")
  
-@@ -121,3 +122,41 @@ target_link_libraries(recompui PUBLIC
+@@ -120,4 +121,72 @@ target_link_libraries(recompui PUBLIC
+     RmlUi::Debugger
      lunasvg
      miniz
++    wcw_texnames
  )
 +
-+# [wcw] Unit tests for the Framerate, resolution and MSAA options' rules, the graphics presets, the save backup list and
-+# radio options' states (tests/). They build and run as part of every recompui build, so a failing test fails the game's
++# [wcw] Unit tests for the Framerate, resolution and MSAA options' rules, the graphics presets, the save backup list,
++# radio options' states, the Model packs dialog's models.txt handling, the Conversions dialog's rows, the controls save/load rules and the stick-as-button thresholds (tests/). They build and run as part of every recompui build, so a failing test fails the game's
 +# build. RECOMPUI_WCW_TESTS=OFF skips them.
 +option(RECOMPUI_WCW_TESTS "Build and run the wcw unit tests with recompui" ON)
 +if (RECOMPUI_WCW_TESTS AND NOT CMAKE_CROSSCOMPILING)
@@ -301,11 +839,24 @@ index b9c5458..7763a4e 100644
 +        ${CMAKE_CURRENT_SOURCE_DIR}/src/config/save_backup_menu.cpp
 +        ${CMAKE_CURRENT_SOURCE_DIR}/tests/radio_rules_tests.cpp
 +        ${CMAKE_CURRENT_SOURCE_DIR}/src/elements/radio_rules.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/tests/model_pack_menu_tests.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/src/config/model_pack_menu.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/tests/conversion_menu_tests.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/src/config/conversion_menu.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/tests/mod_tabs_tests.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/src/config/mod_tabs.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/tests/dd_metrics_rules_tests.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/src/config/dd_metrics_rules.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/tests/controls_rules_tests.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/../recompinput/src/controls_rules.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/tests/input_rules_tests.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/../recompinput/src/input_rules.cpp
 +    )
 +    target_include_directories(recompui_wcw_tests PRIVATE
 +        ${CMAKE_CURRENT_SOURCE_DIR}/src/config
 +        ${CMAKE_CURRENT_SOURCE_DIR}/src/elements
 +        ${CMAKE_CURRENT_SOURCE_DIR}/tests
++        ${CMAKE_CURRENT_SOURCE_DIR}/../recompinput/include
 +        ${RECOMP_FRONTEND_N64MODERNRUNTIME_PATH}/librecomp/include
 +        ${RECOMP_FRONTEND_N64MODERNRUNTIME_PATH}/ultramodern/include
 +        ${RECOMP_FRONTEND_N64MODERNRUNTIME_PATH}/thirdparty
@@ -321,21 +872,51 @@ index b9c5458..7763a4e 100644
 +    )
 +    add_custom_target(recompui_wcw_tests_run DEPENDS "${RECOMPUI_WCW_TESTS_STAMP}")
 +    add_dependencies(recompui recompui_wcw_tests_run)
++
++    # One-definition-rule guard: no two .cpp files may define a type of the same name at namespace level (the
++    # Conversions dialog crash of 0.3.0/0.3.1). Reruns when a source changes; see tests/check_file_local_types.cmake.
++    file(GLOB_RECURSE RECOMPUI_WCW_ODR_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
++    set(RECOMPUI_WCW_ODR_STAMP "${CMAKE_CURRENT_BINARY_DIR}/recompui_wcw_odr_check.passed")
++    add_custom_command(
++        OUTPUT "${RECOMPUI_WCW_ODR_STAMP}"
++        COMMAND ${CMAKE_COMMAND} "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/src"
++            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_file_local_types.cmake"
++        COMMAND ${CMAKE_COMMAND} -E touch "${RECOMPUI_WCW_ODR_STAMP}"
++        DEPENDS ${RECOMPUI_WCW_ODR_SOURCES} "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_file_local_types.cmake"
++        COMMENT "Checking recompui for file-local types defined twice"
++        VERBATIM
++    )
++    add_custom_target(recompui_wcw_odr_check DEPENDS "${RECOMPUI_WCW_ODR_STAMP}")
++    add_dependencies(recompui recompui_wcw_odr_check)
 +endif()
 diff --git a/recompui/include/recompui/config.h b/recompui/include/recompui/config.h
-index 38b84f5..fdd3fc2 100644
+index 38b84f5..f7e0d15 100644
 --- a/recompui/include/recompui/config.h
 +++ b/recompui/include/recompui/config.h
-@@ -18,7 +18,7 @@ namespace recompui {
+@@ -18,8 +18,10 @@ namespace recompui {
                  inline const std::string mouse_sensitivity = "mouse_sensitivity";
                  inline const std::string joystick_deadzone = "joystick_deadzone";
                  inline const std::string background_input_mode = "background_input_mode";
 -        
 +
                  inline const std::string debug_mode = "debug_mode";
++                // [wcw dd] Sends the in-game Datadog metrics (WCW_DD_METRICS, aki-roadmap#148).
++                inline const std::string dd_metrics = "dd_metrics";
              }
  
-@@ -51,6 +51,8 @@ namespace recompui {
+             bool has_rumble_strength_option();
+@@ -31,6 +33,10 @@ namespace recompui {
+             double get_joystick_deadzone();
+             bool get_background_input_mode_enabled();
+             bool get_debug_mode_enabled();
++            bool get_dd_metrics_enabled();
++            // [wcw dd] Sets WCW_DD_METRICS for this process from the Datadog Metrics setting, unless the variable is
++            // already set (config::finalize calls it, before rt64 starts). Does nothing without a General tab.
++            void apply_dd_metrics_env();
+         }
+ 
+         namespace controls {
+@@ -51,6 +57,8 @@ namespace recompui {
      
              namespace options {
                  inline const std::string developer_mode = "developer_mode";
@@ -344,7 +925,7 @@ index 38b84f5..fdd3fc2 100644
                  inline const std::string res_option = "res_option";
                  inline const std::string wm_option = "wm_option";
                  inline const std::string hr_option = "hr_option";
-@@ -61,11 +63,32 @@ namespace recompui {
+@@ -61,11 +69,32 @@ namespace recompui {
                  inline const std::string hpfb_option = "hpfb_option";
                  inline const std::string rr_manual_value = "rr_manual_value";
                  inline const std::string ds_option = "ds_option";
@@ -377,7 +958,7 @@ index 38b84f5..fdd3fc2 100644
          }
  
          namespace sound {
-@@ -95,6 +118,23 @@ namespace recompui {
+@@ -95,6 +124,23 @@ namespace recompui {
           */
          recomp::config::Config &create_config_tab(const std::string &name, const std::string &id, bool requires_confirmation);
  
@@ -401,6 +982,15 @@ index 38b84f5..fdd3fc2 100644
          /**
           * @brief Adds a new tab to the config modal. This is for manually rendering your own tab's UI.
           * 
+@@ -122,6 +168,8 @@ namespace recompui {
+         // TODO: Explain how to hide/show options
+         recomp::config::Config &create_general_tab(const GeneralTabOptions& options, const std::string &name = config::general::tab_name);
+         void create_controls_tab(const std::string &name = config::controls::tab_name);
++        // [wcw fix] Writes controls.json when the mappings changed since the last save (aki-roadmap#303); the UI calls it every frame.
++        void save_controls_if_changed();
+         recomp::config::Config &create_graphics_tab(const std::string &name = config::graphics::tab_name);
+         recomp::config::Config &create_sound_tab(const std::string &name = config::sound::tab_name);
+         void create_mods_tab(const std::string &name = config::mods::tab_name);
 diff --git a/recompui/include/recompui/program_config.h b/recompui/include/recompui/program_config.h
 index 03f5048..e240cc3 100644
 --- a/recompui/include/recompui/program_config.h
@@ -437,6 +1027,40 @@ index 03f5048..e240cc3 100644
 +        const FrameInterpolation &get_frame_interpolation();
      }
  }
+diff --git a/recompui/include/recompui/recompui.h b/recompui/include/recompui/recompui.h
+index 30c463b..e292cac 100644
+--- a/recompui/include/recompui/recompui.h
++++ b/recompui/include/recompui/recompui.h
+@@ -74,7 +74,8 @@ namespace recompui {
+         std::function<void()> cancel_action,
+         ButtonStyle confirm_variant = ButtonStyle::Success,
+         ButtonStyle cancel_variant = ButtonStyle::Danger,
+-        bool focus_on_cancel = true
++        bool focus_on_cancel = true,
++        bool back_cancels = false  // [wcw fix] Back (B) presses the cancel button (aki-roadmap#304)
+     );
+     void open_info_prompt(
+         const std::string& header_text,
+@@ -89,12 +90,18 @@ namespace recompui {
+     );
+     void close_prompt();
+     bool is_prompt_open();
++    // [wcw fix] A prompt with a button to answer is shown (not a notification, aki-roadmap#304).
++    bool is_answerable_prompt_open();
++    // [wcw fix] Inside a prompt button's action: true if the player pressed it (not a replace or close by code, #304).
++    bool is_prompt_answered_by_player();
+     void update_mod_list(bool scan_mods = true);
+     void process_game_started();
+ 
+     void apply_color_hack();
+     void get_window_size(int& width, int& height);
+-    void open_quit_game_prompt();
++    // [wcw fix] close_config_on_cancel: Cancel also closes the config menu (#304; for a close request from outside the
++    // game, see input_events.cpp SDL_QUIT).
++    void open_quit_game_prompt(bool close_config_on_cancel = false);
+     bool get_cursor_visible();
+     void set_cursor_visible(bool visible);
+     void update_supported_options();
 diff --git a/recompui/shaders/InterfaceHdrPS.hlsl b/recompui/shaders/InterfaceHdrPS.hlsl
 new file mode 100644
 index 0000000..68283a7
@@ -472,10 +1096,47 @@ index 0000000..68283a7
 +    oColor = float4(linearColor * gInput.hdrScale, color.a);
 +}
 diff --git a/recompui/src/base/ui_state.cpp b/recompui/src/base/ui_state.cpp
-index 277a421..f5d6ad6 100644
+index 277a421..1eecc62 100644
 --- a/recompui/src/base/ui_state.cpp
 +++ b/recompui/src/base/ui_state.cpp
-@@ -659,6 +659,16 @@ void draw_hook(plume::RenderCommandList* command_list, plume::RenderFramebuffer*
+@@ -23,6 +23,8 @@
+ #include "recompinput/profiles.h"
+ 
+ #include "librecomp/game.hpp"
++#include "librecomp/packages.hpp"
++#include "config/mod_tabs.h"
+ 
+ #include "base/ui_launcher.h"
+ #include "composites/ui_mod_menu.h"
+@@ -35,7 +37,7 @@
+ 
+ static std::atomic_bool cursor_enabled = true;
+ 
+-void recompui::open_quit_game_prompt() {
++void recompui::open_quit_game_prompt(bool close_config_on_cancel) {
+     recompui::open_choice_prompt(
+         "Are you sure you want to quit?",
+         "Any progress since your last save will be lost.",
+@@ -44,9 +46,17 @@ void recompui::open_quit_game_prompt() {
+         []() {
+             ultramodern::quit();
+         },
+-        []() {},
++        [close_config_on_cancel]() {
++            // [wcw fix] #304: back to the game, not to a menu the player never meant to open. Only when the player
++            // answered (render thread); not when another prompt replaced this one, maybe on another thread.
++            if (close_config_on_cancel && recompui::is_prompt_answered_by_player() &&
++                recompui::is_context_shown(recompui::config::get_config_context_id())) {
++                recompui::config::close();
++            }
++        },
+         recompui::ButtonStyle::Danger,
+         recompui::ButtonStyle::Tertiary,
++        true,
+         true
+     );
+ }
+@@ -659,6 +669,16 @@ void draw_hook(plume::RenderCommandList* command_list, plume::RenderFramebuffer*
      if (!recompui::is_any_context_shown() && !ultramodern::is_game_started()) {
          recompui::show_context(recompui::get_launcher_context_id(), "");
      }
@@ -492,7 +1153,7 @@ index 277a421..f5d6ad6 100644
  
      std::lock_guard lock{ ui_state_mutex };
  
-@@ -838,6 +848,12 @@ void draw_hook(plume::RenderCommandList* command_list, plume::RenderFramebuffer*
+@@ -838,6 +858,12 @@ void draw_hook(plume::RenderCommandList* command_list, plume::RenderFramebuffer*
              }
  
              if (open_config) {
@@ -505,6 +1166,1061 @@ index 277a421..f5d6ad6 100644
                  recompui::config::open();
              }
          }
+@@ -856,6 +882,9 @@ void draw_hook(plume::RenderCommandList* command_list, plume::RenderFramebuffer*
+         recompui::set_cont_active(cont_interacted);
+     }
+ 
++    // [wcw fix] Keep controls.json in step with every bind/clear/reset/new pad (aki-roadmap#303).
++    recompui::config::save_controls_if_changed();
++
+     ui_state->update_primary_input(mouse_moved, non_mouse_interacted);
+     ui_state->update_focus(mouse_moved, non_mouse_interacted);
+ 
+@@ -1025,10 +1054,38 @@ void recompui::drop_files(const std::list<std::filesystem::path> &file_list) {
+     recompui::config::open();
+ 
+     recompui::open_notification("Installing Mods", "Please Wait");
++
++    // [wcw] aki-roadmap#154: packages (aki-package.json) install through librecomp's package installer (registry,
++    // upgrades, kept edited copies, conversions); anything else goes to the mod installer as before.
++    std::list<std::filesystem::path> legacy_files;
++    std::vector<recompui::config::mod_tabs::Outcome> package_outcomes;
++    for (const std::filesystem::path &path : file_list) {
++        if (!recomp::packages::looks_like_package(path)) {
++            legacy_files.push_back(path);
++            continue;
++        }
++        const recomp::packages::InstallResult r = recomp::packages::install_package(path);
++        const std::u8string file = path.filename().u8string();
++        package_outcomes.push_back({ r.display_name.empty() ? std::string(file.begin(), file.end()) : r.display_name,
++            recomp::packages::outcome_name(r.outcome), r.message, r.kept });
++    }
++    if (!package_outcomes.empty()) {
++        std::string summary;
++        const bool failed = recompui::config::mod_tabs::summarize(package_outcomes, summary);
++        recompui::close_prompt();
++        recompui::open_info_prompt(failed ? "Some packages weren't installed" : "Packages installed", summary, "OK", {},
++            recompui::ButtonStyle::Tertiary);
++        recompui::update_mod_list(true);
++        if (legacy_files.empty()) {
++            return;
++        }
++        recompui::open_notification("Installing Mods", "Please Wait");
++    }
++
+     // TODO: Needs a progress callback and a prompt for every mod that needs to be confirmed to be overwritten.
+     // TODO: Run this on a background thread and use the callbacks to advance the state instead of blocking.
+     ModInstaller::Result result;
+-    ModInstaller::start_mod_installation(file_list, nullptr, result);
++    ModInstaller::start_mod_installation(legacy_files, nullptr, result);
+ 
+     recompui::close_prompt();
+ 
+diff --git a/recompui/src/composites/ui_conversions_modal.cpp b/recompui/src/composites/ui_conversions_modal.cpp
+new file mode 100644
+index 0000000..6784a6b
+--- /dev/null
++++ b/recompui/src/composites/ui_conversions_modal.cpp
+@@ -0,0 +1,273 @@
++#include "ui_conversions_modal.h"
++
++#include <fstream>
++#include <iterator>
++
++#include "librecomp/conversion.hpp"
++#include "recompui/recompui.h"
++#include "elements/ui_modal.h"
++#include "elements/ui_label.h"
++#include "elements/ui_image.h"
++#include "elements/ui_container.h"
++#include "config/conversion_menu.h"
++
++namespace recompui {
++    namespace menu = config::conversion_menu;
++
++    static Modal *conversions_modal = nullptr;
++    // What had focus before the dialog opened (the Conversions button), to give it back on close.
++    static Element *return_focus = nullptr;
++    // Icon textures queued for the rows shown now, released when the dialog refills or closes.
++    static std::vector<std::string> icons;
++    static unsigned icon_generation = 0;   // in the texture names: the image cache never replaces a name
++    // The rows shown now. A choice updates them in place: rebuilding the list from a button's own callback would
++    // destroy that button while it runs.
++    // In an anonymous namespace: another dialog's RowWidgets in recompui is a different type, and two types of one
++    // name break the one-definition rule (the linker kept one std::vector<RowWidgets>::push_back for both, so the
++    // Conversions dialog crashed on open). tests/check_file_local_types.cmake guards against it.
++    namespace {
++        struct RowWidgets {
++            std::string id;
++            Button *choose = nullptr;
++            Label *note = nullptr;
++        };
++    }
++    static std::vector<RowWidgets> row_widgets;
++    static std::vector<menu::Entry> shown_entries;
++    static std::vector<std::filesystem::path> shown_folders;
++    static Label *status_label = nullptr;
++
++    static std::string read_file(const std::filesystem::path &path) {
++        std::ifstream file(path, std::ios::binary);
++        return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
++    }
++
++    static void list_entries() {
++        shown_entries.clear();
++        shown_folders.clear();
++        for (const recomp::mods::InstalledConversion &installed : recomp::mods::list_installed_conversions()) {
++            menu::Entry entry;
++            entry.id = installed.conversion.id;
++            entry.name = installed.conversion.name;
++            entry.patch = installed.conversion.has_patch;
++            entry.codes = installed.conversion.has_codes;
++            entry.saves = installed.conversion.has_saves;
++            entry.textures = installed.conversion.has_textures;
++            entry.rt = installed.conversion.has_rt;
++            entry.error = installed.error;
++            shown_entries.push_back(entry);
++            shown_folders.push_back(installed.folder);
++        }
++    }
++
++    static void release_icons() {
++        for (const std::string &src : icons) {
++            recompui::release_image(src);
++        }
++        icons.clear();
++    }
++
++    static void close_conversions_modal() {
++        if (conversions_modal != nullptr && conversions_modal->is_open_now()) {
++            conversions_modal->close();
++        }
++    }
++
++    // Shows the current choice on the rows (highlighted button, notes) and the status line.
++    static void show_rows() {
++        const std::string chosen = recomp::mods::chosen_conversion();
++        const std::string running = recomp::mods::session_conversion_id();
++        const bool from_launcher = recomp::mods::session_conversion_from_launcher();
++        const std::vector<menu::Row> rows = menu::rows(shown_entries, chosen, running, from_launcher);
++        for (RowWidgets &w : row_widgets) {
++            for (const menu::Row &row : rows) {
++                if (row.entry.id != w.id) {
++                    continue;
++                }
++                w.choose->apply_button_style(row.chosen ? ButtonStyle::Primary : ButtonStyle::Tertiary);
++                w.choose->set_text(row.chosen ? "Chosen" : "Choose");
++                w.note->set_text(row.note);
++                w.note->set_display(row.note.empty() ? Display::None : Display::Block);
++            }
++        }
++        if (status_label != nullptr) {
++            status_label->set_text(menu::status_line(shown_entries, chosen, running, from_launcher));
++        }
++    }
++
++    static void choose(const std::string &id) {
++        if (!recomp::mods::set_chosen_conversion(id)) {
++            recompui::open_info_prompt("Conversions", "Couldn't save the choice (check the conversions folder's permissions).",
++                "OK", {}, recompui::ButtonStyle::Primary);
++            return;
++        }
++        show_rows();
++    }
++
++    // Fills the dialog for the conversions on disk now. Must be called with the modal's context open; returns the
++    // element to focus (the current choice's button).
++    static Element *fill_modal(ContextId context) {
++        release_icons();
++        icon_generation++;
++        row_widgets.clear();
++        status_label = nullptr;
++
++        Element *header_left = conversions_modal->get_header()->get_left();
++        header_left->clear_children();
++        header_left->set_padding(16.0f);
++        header_left->set_padding_left(20.0f);
++        context.create_element<Label>(header_left, "Conversions", theme::Typography::Header3);
++
++        Element *header_right = conversions_modal->get_header()->get_right();
++        header_right->clear_children();
++        header_right->set_padding(16.0f);
++        Button *close_button = context.create_element<Button>(header_right, "Close", ButtonStyle::Secondary, ButtonSize::Medium);
++        close_button->add_pressed_callback(close_conversions_modal);
++
++        Element *body = conversions_modal->get_body();
++        body->clear_children();
++
++        Element *column = context.create_element<Element>(body, 0, "div", false);
++        column->set_display(Display::Flex);
++        column->set_flex_direction(FlexDirection::Column);
++        column->set_width(100.0f, Unit::Percent);
++        column->set_padding(20.0f);
++        column->set_padding_top(4.0f);
++        column->set_gap(16.0f);
++        column->set_as_navigation_container(NavigationType::Vertical);
++        column->set_background_color(theme::color::Background2);
++
++        const std::string notice = recomp::mods::conversion_choice_notice();
++        if (!notice.empty()) {
++            Label *notice_label = context.create_element<Label>(column, notice, theme::Typography::Body);
++            notice_label->set_color(theme::color::Primary);
++        }
++
++        list_entries();
++        Label *hint = context.create_element<Label>(column,
++            "A conversion is a ROM hack, cheat codes, saves and textures that play together, with saves of its own. The "
++            "choice applies from the next start. AKI Launcher's Play button picks its own.", theme::Typography::Body);
++        hint->set_color(theme::color::TextDim);
++        status_label = context.create_element<Label>(column, "", theme::Typography::LabelMD);
++
++        Element *list = context.create_element<Element>(column, 0, "div", false);
++        list->set_display(Display::Flex);
++        list->set_flex_direction(FlexDirection::Column);
++        list->set_width(100.0f, Unit::Percent);
++        list->set_max_height(560.0f);
++        list->set_overflow_y(Overflow::Auto);
++        list->set_gap(12.0f);
++        list->set_padding(4.0f);
++        list->set_as_navigation_container(NavigationType::Vertical);
++
++        const std::vector<menu::Row> rows = menu::rows(shown_entries, recomp::mods::chosen_conversion(),
++            recomp::mods::session_conversion_id(), recomp::mods::session_conversion_from_launcher());
++        Element *first = nullptr;
++        Element *off_button = nullptr;
++        for (size_t i = 0; i < rows.size(); i++) {
++            const menu::Row &row = rows[i];
++            RowWidgets widgets;
++            widgets.id = row.entry.id;
++
++            Container *line = context.create_element<Container>(list, FlexDirection::Row, JustifyContent::FlexStart);
++            line->set_align_items(AlignItems::Center);
++            line->set_gap(16.0f);
++            line->set_flex_shrink(0.0f);
++            line->set_as_navigation_container(NavigationType::Horizontal);
++
++            // The conversion's icon.png, as a texture of its own (released on refill / close); none for Off.
++            Image *image = context.create_element<Image>(line, "");
++            image->set_width(64.0f);
++            image->set_height(64.0f);
++            image->set_min_width(64.0f);
++            image->set_background_color(theme::color::BGOverlay);
++            if (!row.entry.id.empty() && (i - 1) < shown_folders.size()) {
++                const std::string png = read_file(shown_folders[i - 1] / "icon.png");
++                if (!png.empty()) {
++                    const std::string src = "?/conversions/" + row.entry.id + "/icon/" + std::to_string(icon_generation);
++                    recompui::queue_image_from_bytes_file(src, std::vector<char>(png.begin(), png.end()));
++                    icons.push_back(src);
++                    image->set_src(src);
++                }
++            }
++
++            Container *text_column = context.create_element<Container>(line, FlexDirection::Column, JustifyContent::Center);
++            text_column->set_flex_grow(1.0f);
++            text_column->set_gap(4.0f);
++            context.create_element<Label>(text_column, row.entry.id.empty() ? std::string("Off (the normal game)") : row.entry.name,
++                theme::Typography::LabelMD);
++            const std::string detail = row.entry.id.empty() ? std::string("Your own saves and mods") : menu::components_summary(row.entry);
++            if (!detail.empty()) {
++                Label *detail_label = context.create_element<Label>(text_column, detail, theme::Typography::LabelSM);
++                detail_label->set_color(theme::color::TextDim);
++            }
++            widgets.note = context.create_element<Label>(text_column, row.note, theme::Typography::LabelSM);
++            widgets.note->set_color(theme::color::Primary);
++            widgets.note->set_display(row.note.empty() ? Display::None : Display::Block);
++
++            widgets.choose = context.create_element<Button>(line, row.chosen ? "Chosen" : "Choose",
++                row.chosen ? ButtonStyle::Primary : ButtonStyle::Tertiary, ButtonSize::Small);
++            widgets.choose->set_white_space(WhiteSpace::Nowrap);
++            widgets.choose->set_flex_shrink(0.0f);
++            widgets.choose->set_enabled(row.selectable);
++            const std::string id = row.entry.id;
++            widgets.choose->add_pressed_callback([id]() { choose(id); });
++            // Focus the current choice, unless it can't be played (its button is disabled): then Off.
++            if (first == nullptr && row.chosen && row.selectable) {
++                first = widgets.choose;
++            }
++            if (row.entry.id.empty()) {
++                off_button = widgets.choose;
++            }
++            row_widgets.push_back(widgets);
++        }
++
++        show_rows();
++        if (first == nullptr) {
++            first = off_button;
++        }
++        return first != nullptr ? first : close_button;
++    }
++
++    void open_conversions_modal() {
++        ContextId prev_context = try_close_current_context();
++        return_focus = nullptr;
++        if (prev_context != ContextId::null()) {
++            // get_focused_element needs its context open.
++            prev_context.open();
++            return_focus = prev_context.get_focused_element();
++            prev_context.close();
++        }
++
++        const bool created = (conversions_modal == nullptr);
++        if (created) {
++            conversions_modal = Modal::create_modal(ModalType::Prompt);
++            conversions_modal->set_on_close_callback([]() {
++                release_icons();
++                row_widgets.clear();
++                status_label = nullptr;
++                if (return_focus != nullptr) {
++                    return_focus->focus();
++                    return_focus = nullptr;
++                }
++            });
++        }
++
++        ContextId modal_context = conversions_modal->modal_root_context;
++        modal_context.open();
++        if (created) {
++            // Renders the menu action hints, so it needs the modal's context open.
++            conversions_modal->set_menu_action_callback(MenuAction::Back, close_conversions_modal, "Back");
++        }
++        Element *focus = fill_modal(modal_context);
++        modal_context.close();
++
++        if (prev_context != ContextId::null()) {
++            prev_context.open();
++        }
++        conversions_modal->open();
++        if (focus != nullptr) {
++            focus->focus();
++        }
++    }
++}
+diff --git a/recompui/src/composites/ui_conversions_modal.h b/recompui/src/composites/ui_conversions_modal.h
+new file mode 100644
+index 0000000..6682f9d
+--- /dev/null
++++ b/recompui/src/composites/ui_conversions_modal.h
+@@ -0,0 +1,8 @@
++#pragma once
++
++namespace recompui {
++    // [wcw fullconv] Mods > Conversions (aki-roadmap#57): a dialog listing the conversions installed in <config>/conversions
++    // (icon, name, components) with Off and one choice; a choice writes conversions/active.txt through librecomp's
++    // conversion picker API and applies from the next start. Rules: config/conversion_menu.h.
++    void open_conversions_modal();
++}
+diff --git a/recompui/src/composites/ui_mod_details_panel.cpp b/recompui/src/composites/ui_mod_details_panel.cpp
+index 88291e2..77eadb9 100644
+--- a/recompui/src/composites/ui_mod_details_panel.cpp
++++ b/recompui/src/composites/ui_mod_details_panel.cpp
+@@ -1,6 +1,7 @@
+ #include "ui_mod_details_panel.h"
+ 
+ #include "librecomp/mods.hpp"
++#include "ui_model_packs_modal.h"
+ 
+ namespace recompui {
+ 
+@@ -71,7 +72,16 @@ ModDetailsPanel::ModDetailsPanel(ResourceId rid, Element *parent) : Element(rid,
+             enable_label->set_color(theme::color::Primary);
+         }
+ 
+-        configure_button = context.create_element<Button>(buttons_container, "Configure", recompui::ButtonStyle::Secondary);
++        // [wcw model import] The model packs dialog, shown only on the aki_modelimport mod's page (set_mod_details).
++        Container *right_buttons = context.create_element<Container>(buttons_container, FlexDirection::Row, JustifyContent::FlexEnd);
++        right_buttons->set_gap(16.0f);
++        right_buttons->set_as_navigation_container(NavigationType::Horizontal);
++        model_packs_button = context.create_element<Button>(right_buttons, "Model packs", recompui::ButtonStyle::Secondary);
++        model_packs_button->add_pressed_callback([](){ open_model_packs_modal(); });
++        model_packs_button->set_white_space(WhiteSpace::Nowrap);
++        model_packs_button->set_display(Display::None);
++
++        configure_button = context.create_element<Button>(right_buttons, "Configure", recompui::ButtonStyle::Secondary);
+         configure_button->add_pressed_callback([this](){ configure_button_pressed(); });
+     }
+ }
+@@ -103,6 +113,7 @@ void ModDetailsPanel::set_mod_details(const recomp::mods::ModDetails& details, c
+     enable_toggle->set_checked(toggle_checked);
+     enable_toggle->set_enabled(toggle_enabled);
+     configure_button->set_enabled(configure_enabled);
++    model_packs_button->set_display(details.mod_id == model_packs_mod_id ? Display::Flex : Display::None);
+     enable_label->set_display(toggle_label_visible ? Display::Block : Display::None);
+ 
+     if (toggle_label_visible && (deprecation_status != recomp::mods::DeprecationStatus::Unknown)) {
+diff --git a/recompui/src/composites/ui_mod_details_panel.h b/recompui/src/composites/ui_mod_details_panel.h
+index 2617283..d6ba622 100644
+--- a/recompui/src/composites/ui_mod_details_panel.h
++++ b/recompui/src/composites/ui_mod_details_panel.h
+@@ -39,6 +39,7 @@ private:
+     Toggle *enable_toggle = nullptr;
+     Label *enable_label = nullptr;
+     Button *configure_button = nullptr;
++    Button *model_packs_button = nullptr; // [wcw model import] only for the aki_modelimport mod
+     std::function<void(bool)> mod_toggled_callback = nullptr;
+     std::function<void()> mod_configure_pressed_callback = nullptr;
+ 
+diff --git a/recompui/src/composites/ui_mod_menu.cpp b/recompui/src/composites/ui_mod_menu.cpp
+index 02455fd..7f14ca7 100644
+--- a/recompui/src/composites/ui_mod_menu.cpp
++++ b/recompui/src/composites/ui_mod_menu.cpp
+@@ -7,6 +7,9 @@
+ #include "elements/ui_modal.h"
+ #include "elements/ui_button.h"
+ #include "config/ui_config_page_options_menu.h"
++#include "ui_conversions_modal.h"
++#include "ui_model_packs_modal.h"
++#include "config/mod_tabs.h"
+ 
+ #include "librecomp/mods.hpp"
+ 
+@@ -284,9 +287,54 @@ void ModMenu::refresh_mods(bool scan_mods) {
+         recomp::mods::scan_mods();
+     }
+     mod_details = recomp::mods::get_all_mod_details(game_mod_id);
++    rebuild_mod_kinds();
+     create_mod_list();
+ }
+ 
++// mod_kinds is parallel to mod_details: rebuild it whenever mod_details is re-read (a scan, or a reorder that moves
++// entries), or the Add-ons and Texture packs tabs show the wrong mods.
++void ModMenu::rebuild_mod_kinds() {
++    const auto kinds = recomp::mods::get_mod_kinds();
++    mod_kinds.clear();
++    for (const recomp::mods::ModDetails &details : mod_details) {
++        const auto it = kinds.find(details.mod_id);
++        mod_kinds.push_back(it != kinds.end() ? it->second : recomp::mods::ModKindInfo{});
++    }
++}
++
++void ModMenu::set_tab(int tab) {
++    current_tab = tab;
++    for (size_t i = 0; i < tab_buttons.size(); i++) {
++        tab_buttons[i]->apply_button_style(int(i) == tab ? recompui::ButtonStyle::Primary : recompui::ButtonStyle::Tertiary);
++    }
++    apply_tab_filter();
++}
++
++void ModMenu::apply_tab_filter() {
++    namespace tabs = recompui::config::mod_tabs;
++    const tabs::Tab tab = (current_tab == 1) ? tabs::Tab::Addons : (current_tab == 2) ? tabs::Tab::TexturePacks : tabs::Tab::All;
++    std::vector<bool> visible(mod_entry_buttons.size(), true);
++    for (size_t i = 0; i < mod_entry_buttons.size() && i < mod_kinds.size(); i++) {
++        visible[i] = tabs::shows(tab, mod_kinds[i].code, mod_kinds[i].rom_patch);
++        mod_entry_buttons[i]->set_display(visible[i] ? Display::Block : Display::None);
++        if (i < mod_entry_spacers.size()) {
++            mod_entry_spacers[i]->set_display(visible[i] ? Display::Block : Display::None);
++        }
++    }
++    const int first = tabs::first_visible(visible);
++    if (first >= 0 && (active_mod_index < 0 || size_t(active_mod_index) >= visible.size() || !visible[active_mod_index])) {
++        mod_selected(uint32_t(first));
++    }
++    // A tab with nothing on it shows the empty message instead of the last mod's details.
++    const bool any = first >= 0;
++    body_container->set_display(any ? Display::Flex : Display::None);
++    body_empty_container->set_display(any ? Display::None : Display::Flex);
++    if (body_empty_label) {
++        body_empty_label->set_text(current_tab == 0 ? "You have no mods. Go get some!" :
++            current_tab == 1 ? "No add-ons installed." : "No texture packs installed.");
++    }
++}
++
+ void ModMenu::open_mods_folder() {
+     std::filesystem::path mods_directory = recomp::mods::get_mods_directory();
+ #if defined(WIN32)
+@@ -351,6 +399,9 @@ void ModMenu::mod_selected(uint32_t mod_index) {
+ 
+ void ModMenu::mod_dragged(uint32_t mod_index, EventDrag drag) {
+     constexpr float spacer_height = modEntryHeight + modEntryPadding * 2.0f;
++    if (current_tab != 0) {
++        return;   // [wcw] reordering only on All, where every mod is listed
++    }
+ 
+     switch (drag.phase) {
+     case DragPhase::Start: {
+@@ -442,6 +493,7 @@ void ModMenu::mod_dragged(uint32_t mod_index, EventDrag drag) {
+         // Re-order the mods and update all the details on the menu.
+         recomp::mods::set_mod_index(game_mod_id, mod_details[mod_index].mod_id, mod_drag_target_index);
+         mod_details = recomp::mods::get_all_mod_details(game_mod_id);
++        rebuild_mod_kinds();
+         for (size_t i = 0; i < mod_entry_buttons.size(); i++) {
+             mod_entry_buttons[i]->set_mod_details(mod_details[i]);
+             mod_entry_buttons[i]->set_mod_thumbnail(generate_thumbnail_src_for_mod(mod_details[i].mod_id));
+@@ -630,6 +682,7 @@ void ModMenu::create_mod_list() {
+     if (mods_available) {
+         mod_selected(0);
+     }
++    apply_tab_filter();
+ }
+ 
+ void ModMenu::process_event(const Event &e) {
+@@ -674,6 +727,27 @@ ModMenu::ModMenu(ResourceId rid, Element *parent) : Element(rid, parent) {
+     set_height(100.0f, Unit::Percent);
+     
+     {
++        // [wcw] aki-roadmap#154: kind tabs. All / Add-ons / Texture packs filter the list; Model packs and
++        // Conversions open their dialogs.
++        tab_container = context.create_element<Container>(this, FlexDirection::Row, JustifyContent::FlexStart);
++        tab_container->set_as_navigation_container(NavigationType::Horizontal);
++        tab_container->set_width(100.0f, Unit::Percent);
++        tab_container->set_padding(12.0f);
++        tab_container->set_gap(12.0f);
++        tab_container->set_background_color(theme::color::BGShadow);
++        {
++            const char *labels[] = { "All", "Add-ons", "Textures" };
++            for (int i = 0; i < 3; i++) {
++                Button *b = context.create_element<Button>(tab_container, labels[i], i == 0 ? recompui::ButtonStyle::Primary : recompui::ButtonStyle::Tertiary);
++                b->add_pressed_callback([this, i](){ set_tab(i); });
++                tab_buttons.push_back(b);
++            }
++            Button *packs = context.create_element<Button>(tab_container, "Model packs", recompui::ButtonStyle::Tertiary);
++            packs->add_pressed_callback([](){ open_model_packs_modal(); });
++            Button *conversions = context.create_element<Button>(tab_container, "Conversions", recompui::ButtonStyle::Tertiary);
++            conversions->add_pressed_callback([](){ open_conversions_modal(); });
++        } // tab_container
++
+         body_container = context.create_element<Container>(this, FlexDirection::Row, JustifyContent::FlexStart);
+         body_container->set_as_navigation_container(NavigationType::Horizontal);
+         body_container->set_flex(1.0f, 1.0f, 100.0f);
+@@ -703,7 +777,7 @@ ModMenu::ModMenu(ResourceId rid, Element *parent) : Element(rid, parent) {
+         body_empty_container->set_display(Display::None);
+         {
+             context.create_element<Element>(body_empty_container);
+-            context.create_element<Label>(body_empty_container, "You have no mods. Go get some!", LabelStyle::Large);
++            body_empty_label = context.create_element<Label>(body_empty_container, "You have no mods. Go get some!", LabelStyle::Large);
+             context.create_element<Element>(body_empty_container);
+         } // body_empty_container
+ 
+@@ -723,6 +797,8 @@ ModMenu::ModMenu(ResourceId rid, Element *parent) : Element(rid, parent) {
+             install_mods_button = context.create_element<Button>(footer_container, "Install Mods", recompui::ButtonStyle::Primary);
+             install_mods_button->add_pressed_callback([this](){ open_install_dialog(); });
+ 
++            // [wcw] Conversions moved to the kind tabs (aki-roadmap#154).
++
+             Element* footer_spacer = context.create_element<Element>(footer_container);
+             footer_spacer->set_flex(1.0f, 0.0f);
+ 
+diff --git a/recompui/src/composites/ui_mod_menu.h b/recompui/src/composites/ui_mod_menu.h
+index 294c371..6705269 100644
+--- a/recompui/src/composites/ui_mod_menu.h
++++ b/recompui/src/composites/ui_mod_menu.h
+@@ -83,6 +83,7 @@ protected:
+     std::string_view get_type_name() override { return "ModMenu"; }
+ private:
+     void refresh_mods(bool scan_mods);
++    void rebuild_mod_kinds();
+     void open_mods_folder();
+     void open_install_dialog();
+     void mod_toggled(bool enabled);
+@@ -95,6 +96,9 @@ private:
+     void mod_number_option_changed(const std::string &id, double value);
+     void mod_hd_textures_enabled_changed(uint32_t value);
+     void create_mod_list();
++    // [wcw] aki-roadmap#154: the kind tabs (config/mod_tabs.h). 0 All, 1 Add-ons, 2 Texture packs.
++    void set_tab(int tab);
++    void apply_tab_filter();
+     void process_event(const Event &e) override;
+ 
+     Container *body_container = nullptr;
+@@ -102,6 +106,7 @@ private:
+     ScrollContainer *list_scroll_container = nullptr;
+     ModDetailsPanel *mod_details_panel = nullptr;
+     Container *body_empty_container = nullptr;
++    Label *body_empty_label = nullptr;
+     Container *footer_container = nullptr;
+     Button *install_mods_button = nullptr;
+     IconButton *refresh_button = nullptr;
+@@ -115,6 +120,10 @@ private:
+     float mod_drag_view_coordinates[2] = {};
+     uint32_t mod_drag_target_index = 0;
+     std::vector<recomp::mods::ModDetails> mod_details{};
++    std::vector<recomp::mods::ModKindInfo> mod_kinds{};   // parallel to mod_details
++    int current_tab = 0;
++    Container *tab_container = nullptr;
++    std::vector<Button *> tab_buttons;
+     std::unordered_set<std::string> loaded_thumbnails;
+     std::string game_mod_id;
+     bool mods_dirty = false;
+diff --git a/recompui/src/composites/ui_model_packs_modal.cpp b/recompui/src/composites/ui_model_packs_modal.cpp
+new file mode 100644
+index 0000000..908bda4
+--- /dev/null
++++ b/recompui/src/composites/ui_model_packs_modal.cpp
+@@ -0,0 +1,299 @@
++#include "ui_model_packs_modal.h"
++
++#include <algorithm>
++#include <filesystem>
++#include <fstream>
++#include <iterator>
++#include <system_error>
++
++#include "librecomp/mods.hpp"
++#include "recompui/recompui.h"
++#include "elements/ui_modal.h"
++#include "elements/ui_label.h"
++#include "elements/ui_image.h"
++#include "elements/ui_container.h"
++#include "config/ui_config_option.h"
++#include "config/model_pack_menu.h"
++
++namespace recompui {
++    namespace menu = config::model_pack_menu;
++
++    static Modal *packs_modal = nullptr;
++    // What had focus before the dialog opened (the Model packs button), to give it back on close.
++    static Element *return_focus = nullptr;
++    // Preview textures queued for the rows shown now, released when the dialog refills or closes.
++    static std::vector<std::string> previews;
++    static unsigned preview_generation = 0;   // in the texture names: the image cache never replaces a name
++    // The rows shown now. A choice updates them in place: rebuilding the list from a button's own callback would
++    // destroy that button while it runs.
++    // In an anonymous namespace: another dialog's RowWidgets in recompui is a different type, and two types of one
++    // name break the one-definition rule (the linker kept one std::vector<RowWidgets>::push_back for both, so the
++    // Conversions dialog crashed on open). tests/check_file_local_types.cmake guards against it.
++    namespace {
++        struct RowWidgets {
++            std::string id;
++            Button *choice[menu::slot_count + 1] = {};
++            Label *note = nullptr;
++        };
++    }
++    static std::vector<RowWidgets> row_widgets;
++    static std::vector<menu::Pack> shown_packs;
++
++    static std::filesystem::path models_directory() {
++        return recomp::mods::get_mods_directory() / "models";
++    }
++
++    static std::string read_text(const std::filesystem::path &path) {
++        std::ifstream file(path, std::ios::binary);
++        return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
++    }
++
++    static bool write_text(const std::filesystem::path &path, const std::string &text) {
++        std::error_code ec;
++        std::filesystem::create_directories(path.parent_path(), ec);
++        const std::filesystem::path tmp = path.string() + ".new";
++        {
++            std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
++            if (!file) {
++                return false;
++            }
++            file << text;
++            file.close();   // the buffered data is written here: check it before replacing the file
++            if (file.fail()) {
++                std::filesystem::remove(tmp, ec);
++                return false;
++            }
++        }
++        std::filesystem::rename(tmp, path, ec);   // replaces it (the mod reads it only at a match start)
++        return !ec;
++    }
++
++    // The packs on disk: <mods>/models/<id>.akimodel folders with a valid id, with their pack.json fields.
++    static std::vector<menu::Pack> list_packs() {
++        std::vector<menu::Pack> packs;
++        std::error_code ec;
++        const std::string ext = ".akimodel";
++        for (const auto &entry : std::filesystem::directory_iterator(models_directory(), ec)) {
++            std::error_code dir_ec;
++            if (!entry.is_directory(dir_ec)) {
++                continue;
++            }
++            const std::wstring wide = entry.path().filename().wstring();
++            if (std::any_of(wide.begin(), wide.end(), [](wchar_t c) { return c < 0x20 || c > 0x7E; })) {
++                continue;   // not a pack id (ASCII only), and converting it could throw
++            }
++            const std::string name(wide.begin(), wide.end());
++            if (name.size() <= ext.size() || name.compare(name.size() - ext.size(), ext.size(), ext) != 0) {
++                continue;
++            }
++            const std::string id = name.substr(0, name.size() - ext.size());
++            if (!menu::valid_pack_id(id)) {
++                continue;
++            }
++            packs.push_back(menu::parse_pack_json(id, read_text(entry.path() / "pack.json")));
++        }
++        return packs;
++    }
++
++    static void release_previews() {
++        for (const std::string &src : previews) {
++            recompui::release_image(src);
++        }
++        previews.clear();
++    }
++
++    static void close_model_packs_modal() {
++        if (packs_modal != nullptr && packs_modal->is_open_now()) {
++            packs_modal->close();
++        }
++    }
++
++    // Shows text's assignments on the rows: the current choice highlighted, the note.
++    static void show_rows(const std::string &text) {
++        const std::vector<menu::Row> rows = menu::rows(shown_packs, text);
++        for (RowWidgets &w : row_widgets) {
++            for (const menu::Row &row : rows) {
++                if (row.pack.id != w.id) {
++                    continue;
++                }
++                for (int slot = 0; slot <= menu::slot_count; slot++) {
++                    w.choice[slot]->apply_button_style(row.slot == slot ? ButtonStyle::Primary : ButtonStyle::Tertiary);
++                }
++                w.note->set_text(row.note);
++                w.note->set_display(row.note.empty() ? Display::None : Display::Block);
++            }
++        }
++    }
++
++    static void choose(const std::string &pack_id, int slot) {
++        const std::filesystem::path path = models_directory() / "models.txt";
++        const std::string text = menu::assign(read_text(path), pack_id, slot);
++        if (!write_text(path, text)) {
++            recompui::open_info_prompt("Model packs", "Couldn't write models.txt in the mods\\models folder (check its permissions).",
++                "OK", {}, recompui::ButtonStyle::Primary);
++            return;
++        }
++        show_rows(text);
++    }
++
++    // Fills the dialog for the packs on disk now. Must be called with the modal's context open; returns the element
++    // to focus (the first row's current choice).
++    static Element *fill_modal(ContextId context) {
++        release_previews();
++        preview_generation++;
++        row_widgets.clear();
++
++        Element *header_left = packs_modal->get_header()->get_left();
++        header_left->clear_children();
++        header_left->set_padding(16.0f);
++        header_left->set_padding_left(20.0f);
++        context.create_element<Label>(header_left, "Model packs", theme::Typography::Header3);
++
++        Element *header_right = packs_modal->get_header()->get_right();
++        header_right->clear_children();
++        header_right->set_padding(16.0f);
++        Button *close_button = context.create_element<Button>(header_right, "Close", ButtonStyle::Secondary, ButtonSize::Medium);
++        close_button->add_pressed_callback(close_model_packs_modal);
++
++        Element *body = packs_modal->get_body();
++        body->clear_children();
++
++        Element *column = context.create_element<Element>(body, 0, "div", false);
++        column->set_display(Display::Flex);
++        column->set_flex_direction(FlexDirection::Column);
++        column->set_width(100.0f, Unit::Percent);
++        column->set_padding(20.0f);
++        column->set_padding_top(4.0f);
++        column->set_gap(16.0f);
++        column->set_as_navigation_container(NavigationType::Vertical);
++        // Opaque: the Prompt modal's overlay colour lets the Mods page behind show through a dense list.
++        column->set_background_color(theme::color::Background2);
++
++        shown_packs = list_packs();
++        if (shown_packs.empty()) {
++            context.create_element<Label>(column, "No model packs yet", theme::Typography::LabelMD);
++            Label *hint = context.create_element<Label>(column,
++                "Put a pack folder (<name>.akimodel, made with AkiTools aki-model.py) in the mods\\models folder.",
++                theme::Typography::Body);
++            hint->set_color(theme::color::TextDim);
++            return close_button;
++        }
++
++        Label *hint = context.create_element<Label>(column,
++            "Pick the wrestler slot each pack replaces. Changes apply at the start of the next match. A Slot N pack set in "
++            "the mod's Configure options takes priority over this list.", theme::Typography::Body);
++        hint->set_color(theme::color::TextDim);
++
++        const std::vector<menu::Row> rows = menu::rows(shown_packs, read_text(models_directory() / "models.txt"));
++
++        Element *list = context.create_element<Element>(column, 0, "div", false);
++        list->set_display(Display::Flex);
++        list->set_flex_direction(FlexDirection::Column);
++        list->set_width(100.0f, Unit::Percent);
++        list->set_max_height(560.0f);
++        list->set_overflow_y(Overflow::Auto);
++        list->set_gap(12.0f);
++        list->set_padding(4.0f);
++        list->set_as_navigation_container(NavigationType::Vertical);
++
++        Element *first = nullptr;
++        for (const menu::Row &row : rows) {
++            RowWidgets widgets;
++            widgets.id = row.pack.id;
++
++            Container *line = context.create_element<Container>(list, FlexDirection::Row, JustifyContent::FlexStart);
++            line->set_align_items(AlignItems::Center);
++            line->set_gap(16.0f);
++            line->set_flex_shrink(0.0f);
++            line->set_as_navigation_container(NavigationType::Horizontal);
++
++            // The pack's preview.png, as a texture of its own (released on refill / close).
++            Image *image = context.create_element<Image>(line, "");
++            image->set_width(96.0f);
++            image->set_height(96.0f);
++            image->set_min_width(96.0f);
++            image->set_background_color(theme::color::BGOverlay);
++            const std::string png = read_text(models_directory() / (row.pack.id + ".akimodel") / "preview.png");
++            if (!png.empty()) {
++                const std::string src = "?/models/" + row.pack.id + "/preview/" + std::to_string(preview_generation);
++                recompui::queue_image_from_bytes_file(src, std::vector<char>(png.begin(), png.end()));
++                previews.push_back(src);
++                image->set_src(src);
++            }
++
++            Container *text_column = context.create_element<Container>(line, FlexDirection::Column, JustifyContent::Center);
++            text_column->set_flex_grow(1.0f);
++            text_column->set_gap(4.0f);
++            context.create_element<Label>(text_column, row.pack.name, theme::Typography::LabelMD);
++            std::string detail = row.pack.id + ".akimodel";
++            if (!row.pack.author.empty()) {
++                detail += " - " + row.pack.author;
++            }
++            Label *detail_label = context.create_element<Label>(text_column, detail, theme::Typography::LabelSM);
++            detail_label->set_color(theme::color::TextDim);
++            widgets.note = context.create_element<Label>(text_column, row.note, theme::Typography::LabelSM);
++            widgets.note->set_color(theme::color::Primary);
++            widgets.note->set_display(row.note.empty() ? Display::None : Display::Block);
++
++            Container *choices = context.create_element<Container>(line, FlexDirection::Row, JustifyContent::FlexEnd);
++            choices->set_gap(8.0f);
++            choices->set_as_navigation_container(NavigationType::Horizontal);
++            for (int slot = 0; slot <= menu::slot_count; slot++) {
++                const bool current = (row.slot == slot);
++                Button *b = context.create_element<Button>(choices, slot == 0 ? std::string("Off") : ("Slot " + std::to_string(slot)),
++                    current ? ButtonStyle::Primary : ButtonStyle::Tertiary, ButtonSize::Small);
++                b->set_white_space(WhiteSpace::Nowrap);
++                b->set_flex_shrink(0.0f);
++                const std::string id = row.pack.id;
++                b->add_pressed_callback([id, slot]() { choose(id, slot); });
++                widgets.choice[slot] = b;
++                if (first == nullptr && current) {
++                    first = b;
++                }
++            }
++            row_widgets.push_back(widgets);
++        }
++        return first != nullptr ? first : close_button;
++    }
++
++    void open_model_packs_modal() {
++        ContextId prev_context = try_close_current_context();
++        return_focus = nullptr;
++        if (prev_context != ContextId::null()) {
++            // get_focused_element needs its context open.
++            prev_context.open();
++            return_focus = prev_context.get_focused_element();
++            prev_context.close();
++        }
++
++        const bool created = (packs_modal == nullptr);
++        if (created) {
++            packs_modal = Modal::create_modal(ModalType::Prompt);
++            packs_modal->set_on_close_callback([]() {
++                release_previews();
++                row_widgets.clear();
++                if (return_focus != nullptr) {
++                    return_focus->focus();
++                    return_focus = nullptr;
++                }
++            });
++        }
++
++        ContextId modal_context = packs_modal->modal_root_context;
++        modal_context.open();
++        if (created) {
++            // Renders the menu action hints, so it needs the modal's context open.
++            packs_modal->set_menu_action_callback(MenuAction::Back, close_model_packs_modal, "Back");
++        }
++        Element *focus = fill_modal(modal_context);
++        modal_context.close();
++
++        if (prev_context != ContextId::null()) {
++            prev_context.open();
++        }
++        packs_modal->open();
++        if (focus != nullptr) {
++            focus->focus();
++        }
++    }
++}
+diff --git a/recompui/src/composites/ui_model_packs_modal.h b/recompui/src/composites/ui_model_packs_modal.h
+new file mode 100644
+index 0000000..cd92514
+--- /dev/null
++++ b/recompui/src/composites/ui_model_packs_modal.h
+@@ -0,0 +1,12 @@
++#pragma once
++
++namespace recompui {
++    // [wcw model import] Mods > aki_modelimport > Model packs (aki-roadmap#130): a dialog listing the model packs in
++    // <mods>/models (preview, name, author) with Off / Slot 1-4 for each; a choice rewrites <mods>/models/models.txt,
++    // which the mod reads again at the start of every match. Rules: config/model_pack_menu.h. Only reachable from the
++    // aki_modelimport mod's details panel, so it does nothing in a game without that mod.
++    void open_model_packs_modal();
++
++    // The mod id whose details panel offers the dialog.
++    constexpr const char *model_packs_mod_id = "aki_modelimport";
++}
+diff --git a/recompui/src/composites/ui_prompt.cpp b/recompui/src/composites/ui_prompt.cpp
+index 56a0b70..0b40aeb 100644
+--- a/recompui/src/composites/ui_prompt.cpp
++++ b/recompui/src/composites/ui_prompt.cpp
+@@ -1,3 +1,4 @@
++#include <atomic>
+ #include <mutex>
+ 
+ #include "recompui.h"
+@@ -16,19 +17,45 @@ struct {
+     recompui::Button* cancel_button;
+     std::function<void()> confirm_action;
+     std::function<void()> cancel_action;
++    // [wcw fix] aki-roadmap#304. Atomics so the SDL thread (is_answerable_prompt_open) and the render thread (PromptBox)
++    // read them without prompt_state.mutex: taking it there ordered the two locks against ui_state_mutex both ways.
++    std::atomic<bool> answerable = false;    // the shown prompt has a button to answer it (not a notification)
++    std::atomic<bool> back_cancels = false;  // Back presses its cancel (or OK) button
++    std::atomic<uint64_t> generation = 0;    // bumped by every open_*: an action that opened another prompt keeps it up
+     std::mutex mutex;
+ } prompt_state;
+ 
++// [wcw fix] True only while a prompt's button action runs because the player answered it (#304), not when the prompt
++// is replaced by another one or closed by code (show_prompt / close_prompt run the old cancel action then, possibly on
++// another thread).
++static thread_local bool prompt_answered_by_player = false;
++
++bool recompui::is_prompt_answered_by_player() {
++    return prompt_answered_by_player;
++}
++
++// [wcw fix] Runs a button's action, then hides the prompt unless the action opened another prompt (#304: the quit
++// prompt's Cancel closes the config menu, and a config tab with unapplied changes answers that with its Apply/Discard
++// prompt, which was hidden at once).
++static void run_prompt_action(std::function<void()> action) {
++    const uint64_t generation = prompt_state.generation.load();
++    if (action) {
++        prompt_answered_by_player = true;
++        action();
++        prompt_answered_by_player = false;
++    }
++    if (prompt_state.generation.load() == generation) {
++        recompui::hide_context(prompt_state.ui_context);
++    }
++}
++
+ void run_confirm_callback() {
+     std::function<void()> confirm_action;
+     {
+         std::lock_guard lock{ prompt_state.mutex };
+         confirm_action = std::move(prompt_state.confirm_action);
+     }
+-    if (confirm_action) {
+-        confirm_action();
+-    }
+-    recompui::hide_context(prompt_state.ui_context);
++    run_prompt_action(std::move(confirm_action));
+ }
+ 
+ void run_cancel_callback() {
+@@ -37,15 +64,36 @@ void run_cancel_callback() {
+         std::lock_guard lock{ prompt_state.mutex };
+         cancel_action = std::move(prompt_state.cancel_action);
+     }
+-    if (cancel_action) {
+-        cancel_action();
+-    }
+-    recompui::hide_context(prompt_state.ui_context);
++    run_prompt_action(std::move(cancel_action));
+ 
+     // TODO nav: focus on return_element_id
+     // or just remove it as the usage of the prompt can change now
+ }
+ 
++// [wcw fix] The prompt box: Back (B on a pad) presses the cancel button of the quit prompt and the OK of an info prompt,
++// as it closes the game's other modals (aki-roadmap#304). Not on other choice prompts, where Cancel can mean Discard.
++// Before, only A on Cancel closed a prompt: a player holding View for a second (the launcher's Return To Launcher
++// gesture) got "Are you sure you want to quit?", pressed B as everywhere else, and nothing happened.
++namespace {
++    class PromptBox : public recompui::Element {
++    public:
++        PromptBox(recompui::ResourceId rid, recompui::Element* parent)
++            : Element(rid, parent, recompui::Events(recompui::EventType::MenuAction), "div", false) {}
++    protected:
++        void process_event(const recompui::Event& e) override {
++            if (e.type != recompui::EventType::MenuAction) {
++                return;
++            }
++            if (std::get<recompui::EventMenuAction>(e.variant).action != recompui::MenuAction::Back) {
++                return;
++            }
++            if (prompt_state.back_cancels.load()) {
++                run_cancel_callback();
++            }
++        }
++    };
++}
++
+ void recompui::init_prompt_context() {
+     ContextId context = create_context();
+ 
+@@ -78,7 +126,7 @@ void recompui::init_prompt_context() {
+     prompt_content_wrapper->set_align_items(AlignItems::Center);
+     prompt_content_wrapper->set_justify_content(JustifyContent::Center);
+ 
+-    Element* prompt_content = context.create_element<Element>(prompt_content_wrapper);
++    Element* prompt_content = context.create_element<PromptBox>(prompt_content_wrapper);
+     prompt_content->set_display(Display::Flex);
+     prompt_content->set_position(Position::Relative);
+     prompt_content->set_flex(1.0f, 1.0f);
+@@ -151,7 +199,8 @@ void recompui::open_choice_prompt(
+     std::function<void()> cancel_action,
+     ButtonStyle confirm_variant,
+     ButtonStyle cancel_variant,
+-    bool focus_on_cancel
++    bool focus_on_cancel,
++    bool back_cancels
+ ) {
+     std::lock_guard lock{ prompt_state.mutex };
+ 
+@@ -170,6 +219,9 @@ void recompui::open_choice_prompt(
+     prompt_state.cancel_button->set_text(cancel_label_text);
+     prompt_state.confirm_action = confirm_action;
+     prompt_state.cancel_action = cancel_action;
++    prompt_state.generation++;
++    prompt_state.answerable = true;
++    prompt_state.back_cancels = back_cancels;
+     prompt_state.confirm_button->apply_button_style(confirm_variant);
+     prompt_state.cancel_button->apply_button_style(cancel_variant);
+ 
+@@ -205,6 +257,9 @@ void recompui::open_info_prompt(
+     prompt_state.cancel_button->set_text(okay_label_text);
+     prompt_state.confirm_action = {};
+     prompt_state.cancel_action = okay_action;
++    prompt_state.generation++;
++    prompt_state.answerable = true;
++    prompt_state.back_cancels = true;
+ 
+     prompt_state.cancel_button->apply_button_style(okay_variant);
+ 
+@@ -236,6 +291,9 @@ void recompui::open_notification(
+     prompt_state.cancel_button->set_display(Display::None);
+     prompt_state.confirm_action = {};
+     prompt_state.cancel_action = {};
++    prompt_state.generation++;
++    prompt_state.answerable = false;
++    prompt_state.back_cancels = false;
+ 
+     prompt_state.ui_context.close();
+ 
+@@ -263,3 +321,7 @@ bool recompui::is_prompt_open() {
+ 
+ 	return recompui::is_context_shown(prompt_state.ui_context);
+ }
++
++bool recompui::is_answerable_prompt_open() {
++    return prompt_state.answerable.load() && recompui::is_context_shown(prompt_state.ui_context);
++}
 diff --git a/recompui/src/composites/ui_save_backups_modal.cpp b/recompui/src/composites/ui_save_backups_modal.cpp
 new file mode 100644
 index 0000000..5b95284
@@ -691,6 +2407,184 @@ index 0000000..b4a4ad4
 +    // config/save_backup_menu.h; backups: librecomp save_backups.hpp.
 +    void open_save_backups_modal();
 +}
+diff --git a/recompui/src/config/conversion_menu.cpp b/recompui/src/config/conversion_menu.cpp
+new file mode 100644
+index 0000000..da72efc
+--- /dev/null
++++ b/recompui/src/config/conversion_menu.cpp
+@@ -0,0 +1,83 @@
++#include "conversion_menu.h"
++
++namespace recompui::config::conversion_menu {
++    std::string components_summary(const Entry &entry) {
++        std::string out;
++        auto add = [&out](bool has, const char *name) {
++            if (!has) {
++                return;
++            }
++            if (!out.empty()) {
++                out += ", ";
++            }
++            out += name;
++        };
++        add(entry.patch, "ROM patch");
++        add(entry.codes, "codes");
++        add(entry.saves, "saves");
++        add(entry.textures, "textures");
++        add(entry.rt, "ray tracing");
++        return out;
++    }
++
++    static std::string display_name(const std::vector<Entry> &entries, const std::string &id) {
++        if (id.empty()) {
++            return "the normal game";
++        }
++        for (const Entry &entry : entries) {
++            if (entry.id == id) {
++                return entry.name.empty() ? id : entry.name;
++            }
++        }
++        return id;
++    }
++
++    std::vector<Row> rows(const std::vector<Entry> &entries, const std::string &chosen_id, const std::string &running_id,
++        bool from_launcher) {
++        std::vector<Row> out;
++        Row off;
++        off.entry.name = "Off";
++        off.chosen = chosen_id.empty();
++        off.running = running_id.empty();
++        out.push_back(off);
++
++        for (const Entry &entry : entries) {
++            Row row;
++            row.entry = entry;
++            row.chosen = !chosen_id.empty() && (entry.id == chosen_id);
++            row.running = !running_id.empty() && (entry.id == running_id);
++            row.selectable = entry.error.empty();
++            out.push_back(row);
++        }
++
++        for (Row &row : out) {
++            if (!row.selectable) {
++                row.note = "Can't be played: " + row.entry.error;
++            }
++            else if (row.running && row.chosen) {
++                // The normal game running as chosen needs no note (the status line says it).
++                row.note = row.entry.id.empty() ? std::string() : std::string("Running now");
++            }
++            else if (row.running) {
++                row.note = from_launcher ? std::string("Running now (picked by AKI Launcher)") :
++                    ("Running now; the next start runs " + display_name(entries, chosen_id));
++            }
++            else if (row.chosen) {
++                row.note = from_launcher ? "For starts without AKI Launcher" : "From the next start";
++            }
++        }
++        return out;
++    }
++
++    std::string status_line(const std::vector<Entry> &entries, const std::string &chosen_id, const std::string &running_id,
++        bool from_launcher) {
++        if (chosen_id == running_id) {
++            return running_id.empty() ? "Playing the normal game." : ("Playing " + display_name(entries, running_id) + ".");
++        }
++        if (from_launcher) {
++            return "AKI Launcher started " + display_name(entries, running_id) + ". Starts without the launcher run " +
++                display_name(entries, chosen_id) + ".";
++        }
++        return "Restart the game to switch to " + display_name(entries, chosen_id) + ".";
++    }
++}
+diff --git a/recompui/src/config/conversion_menu.h b/recompui/src/config/conversion_menu.h
+new file mode 100644
+index 0000000..801e7ab
+--- /dev/null
++++ b/recompui/src/config/conversion_menu.h
+@@ -0,0 +1,39 @@
++#pragma once
++
++#include <string>
++#include <vector>
++
++// [wcw fullconv] The Mods menu's Conversions dialog (aki-roadmap#57): the conversions installed in <config>/conversions
++// and which one the next start runs (conversions/active.txt, read and written by librecomp's conversion picker API).
++// A choice applies from the next start: a conversion is set up when the game starts (its mods, its save folder).
++// AKI Launcher's own choice (AKI_CONVERSION) still wins over this one for the launches it starts. Kept free of UI and
++// librecomp types so it can be unit tested (recompui/tests).
++namespace recompui::config::conversion_menu {
++    struct Entry {
++        std::string id;
++        std::string name;
++        bool patch = false, codes = false, saves = false, textures = false, rt = false;
++        std::string error;   // why its aki.json can't be read ("" = fine); such an entry can't be chosen
++    };
++
++    // "ROM patch, codes, saves, textures, ray tracing" for the components it has, "" for none.
++    std::string components_summary(const Entry &entry);
++
++    struct Row {
++        Entry entry;           // empty id: the "Off" row (no conversion, the normal game)
++        bool chosen = false;   // what conversions/active.txt names (Off when it names none)
++        bool running = false;  // what this session runs (Off when it runs none)
++        bool selectable = true;
++        std::string note;      // shown under the name
++    };
++
++    // The rows: "Off" first, then the entries in the given order. chosen_id / running_id: "" = none. from_launcher: AKI
++    // Launcher picked what runs now (AKI_CONVERSION); its restarts pick it again, so the choice here only applies to
++    // starts without the launcher.
++    std::vector<Row> rows(const std::vector<Entry> &entries, const std::string &chosen_id, const std::string &running_id,
++        bool from_launcher);
++
++    // The line above the list: what changes at the next start, if anything.
++    std::string status_line(const std::vector<Entry> &entries, const std::string &chosen_id, const std::string &running_id,
++        bool from_launcher);
++}
+diff --git a/recompui/src/config/dd_metrics_rules.cpp b/recompui/src/config/dd_metrics_rules.cpp
+new file mode 100644
+index 0000000..48f9ee7
+--- /dev/null
++++ b/recompui/src/config/dd_metrics_rules.cpp
+@@ -0,0 +1,16 @@
++#include "dd_metrics_rules.h"
++
++#include <cstring>
++
++namespace recompui::dd_metrics_rules {
++    const char *env_value_to_set(const char *env_value, bool setting_on) {
++        const bool env_set = (env_value != nullptr) && (env_value[0] != '\0');
++        return (!env_set && setting_on) ? "1" : nullptr;
++    }
++
++    bool metrics_on(const char *env_value, bool setting_on) {
++        const char *set = env_value_to_set(env_value, setting_on);
++        const char *value = (set != nullptr) ? set : env_value;
++        return (value != nullptr) && (value[0] != '\0') && (std::strcmp(value, "0") != 0);
++    }
++}
+diff --git a/recompui/src/config/dd_metrics_rules.h b/recompui/src/config/dd_metrics_rules.h
+new file mode 100644
+index 0000000..9d6b8ba
+--- /dev/null
++++ b/recompui/src/config/dd_metrics_rules.h
+@@ -0,0 +1,16 @@
++#pragma once
++
++// [wcw dd] The Datadog metrics switch (aki-roadmap#148). rt64's aki.game.* metrics and N64ModernRuntime's fatal
++// breadcrumb read the environment variable WCW_DD_METRICS; the General tab's Datadog Metrics setting turns them on
++// for a normal launch by setting it for the process at startup, before rt64 starts. Kept free of the config and the
++// environment so it can be unit tested (recompui/tests).
++namespace recompui::dd_metrics_rules {
++    // The value to give WCW_DD_METRICS, or nullptr to leave it alone. env_value is the variable as the process got it
++    // (nullptr when unset). A set, non-empty variable always wins, "0" included, so a launcher or script can force the
++    // metrics on or off whatever the setting says; otherwise the setting turns them on with "1".
++    const char *env_value_to_set(const char *env_value, bool setting_on);
++
++    // Whether the metrics end up on, by the rule rt64 and the runtime read the variable with: set, not empty, not "0"
++    // (rt64 WcwLogic::envSwitchOn, N64ModernRuntime recomp::dd::switch_on; keep the three the same).
++    bool metrics_on(const char *env_value, bool setting_on);
++}
 diff --git a/recompui/src/config/framerate_rules.cpp b/recompui/src/config/framerate_rules.cpp
 new file mode 100644
 index 0000000..00234ae
@@ -761,10 +2655,10 @@ index 0000000..80cf16b
 +};
 diff --git a/recompui/src/config/graphics_presets.cpp b/recompui/src/config/graphics_presets.cpp
 new file mode 100644
-index 0000000..9ece40b
+index 0000000..484d0cd
 --- /dev/null
 +++ b/recompui/src/config/graphics_presets.cpp
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,98 @@
 +#include "graphics_presets.h"
 +
 +#include <algorithm>
@@ -776,11 +2670,6 @@ index 0000000..9ece40b
 +
 +    static Antialiasing capped_msaa(Antialiasing msaa, const Limits &limits) {
 +        return std::min(msaa, limits.max_msaa);
-+    }
-+
-+    // Twice the smooth rate needs a display that fast (a 119.88 Hz display reports 119).
-+    static bool display_allows_smooth2x(const Limits &limits) {
-+        return (limits.display_rate == 0) || (limits.display_rate + 2 >= limits.smooth_rate * 2);
 +    }
 +
 +    std::optional<Settings> settings_for(Preset preset, const Limits &limits) {
@@ -806,8 +2695,9 @@ index 0000000..9ece40b
 +            break;
 +        case Preset::Max:
 +            settings.aspect_ratio = AspectRatio::Expand;
-+            settings.framerate = !smooth ? RefreshRate::Original :
-+                (display_allows_smooth2x(limits) ? RefreshRate::Display : RefreshRate::Manual);
++            // The smooth rate, never twice it (aki-roadmap#165): ray tracing at Ultra and 120 fps falls to ~7 frames
++            // a second, so Max on a 120 Hz+ display was a slideshow. 120 fps stays in the Framerate menu.
++            settings.framerate = smooth ? RefreshRate::Manual : RefreshRate::Original;
 +            settings.msaa = Antialiasing::MSAA4X;
 +            settings.rt = RayTracingOption::On;
 +            settings.rt_quality = RayTracingQuality::Ultra;
@@ -869,10 +2759,10 @@ index 0000000..9ece40b
 +};
 diff --git a/recompui/src/config/graphics_presets.h b/recompui/src/config/graphics_presets.h
 new file mode 100644
-index 0000000..77778ab
+index 0000000..2ed846e
 --- /dev/null
 +++ b/recompui/src/config/graphics_presets.h
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,106 @@
 +#pragma once
 +
 +#include <cstdint>
@@ -958,7 +2848,8 @@ index 0000000..77778ab
 +    struct Limits {
 +        // The game's smooth rate (programconfig::get_frame_interpolation); 0 = the framerate is locked to Original.
 +        uint32_t smooth_rate = 0;
-+        // The display's refresh rate in Hz; 0 = not known yet (taken as fast enough).
++        // The display's refresh rate in Hz; 0 = not known yet. No preset uses it since Max stopped picking 120 fps
++        // (aki-roadmap#165); kept for presets that might again.
 +        uint32_t display_rate = 0;
 +        // The highest MSAA level the GPU offers.
 +        ultramodern::renderer::Antialiasing max_msaa = ultramodern::renderer::Antialiasing::MSAA4X;
@@ -1029,6 +2920,370 @@ index 0000000..f3b6c66
 +    // Whether an MSAA level can be picked on a device whose highest supported level is device_max.
 +    bool msaa_level_supported(ultramodern::renderer::Antialiasing level, ultramodern::renderer::Antialiasing device_max);
 +};
+diff --git a/recompui/src/config/mod_tabs.cpp b/recompui/src/config/mod_tabs.cpp
+new file mode 100644
+index 0000000..25f2905
+--- /dev/null
++++ b/recompui/src/config/mod_tabs.cpp
+@@ -0,0 +1,41 @@
++#include "mod_tabs.h"
++
++namespace recompui::config::mod_tabs {
++    bool shows(Tab tab, bool code, bool rom_patch) {
++        switch (tab) {
++            case Tab::All: return true;
++            case Tab::Addons: return code || rom_patch;
++            case Tab::TexturePacks: return !code && !rom_patch;
++        }
++        return true;
++    }
++
++    int first_visible(const std::vector<bool> &visible) {
++        for (size_t i = 0; i < visible.size(); i++) {
++            if (visible[i]) {
++                return int(i);
++            }
++        }
++        return -1;
++    }
++
++    bool summarize(const std::vector<Outcome> &outcomes, std::string &text) {
++        text.clear();
++        bool failed = false;
++        for (const Outcome &o : outcomes) {
++            const bool bad = (o.outcome == "refused") || (o.outcome == "failed");
++            failed |= bad;
++            if (!text.empty()) {
++                text += '\n';
++            }
++            text += (bad ? "Not installed: " : "") + (o.message.empty() ? o.name : o.message);
++            if (bad && !o.name.empty() && o.message.find(o.name) == std::string::npos) {
++                text += " (" + o.name + ")";
++            }
++            for (const std::string &k : o.kept) {
++                text += "\n  your edited copy was kept: " + k;
++            }
++        }
++        return failed;
++    }
++}
+diff --git a/recompui/src/config/mod_tabs.h b/recompui/src/config/mod_tabs.h
+new file mode 100644
+index 0000000..88b4d7d
+--- /dev/null
++++ b/recompui/src/config/mod_tabs.h
+@@ -0,0 +1,28 @@
++#pragma once
++
++#include <string>
++#include <vector>
++
++// [wcw] The Mods menu's kind tabs and its package Install (aki-roadmap#154 step 5). All lists every opened mod in mod
++// order (and is the only tab that can reorder them); Add-ons lists those that carry code or a ROM patch; Texture
++// packs lists the data packs. Model packs and Conversions open their own dialogs. Kept free of UI and librecomp types
++// so it can be unit tested (recompui/tests).
++namespace recompui::config::mod_tabs {
++    enum class Tab { All, Addons, TexturePacks };
++
++    // Whether a mod with these contents is listed on that tab.
++    bool shows(Tab tab, bool code, bool rom_patch);
++    // The first index whose flag is set, or -1.
++    int first_visible(const std::vector<bool> &visible);
++
++    // One installed or refused package, for the summary shown after Install.
++    struct Outcome {
++        std::string name;       // display name, or the file name when the package couldn't be read
++        std::string outcome;    // librecomp's outcome_name: installed, upgraded, ..., refused, failed
++        std::string message;    // librecomp's one line for the player
++        std::vector<std::string> kept;   // edited files kept aside
++    };
++    // "Installed: A 1.0.0 ...\nNot installed: B (why)\n..." with the kept copies listed; true when anything failed
++    // (the summary is then shown as an error).
++    bool summarize(const std::vector<Outcome> &outcomes, std::string &text);
++}
+diff --git a/recompui/src/config/model_pack_menu.cpp b/recompui/src/config/model_pack_menu.cpp
+new file mode 100644
+index 0000000..ef1fbf1
+--- /dev/null
++++ b/recompui/src/config/model_pack_menu.cpp
+@@ -0,0 +1,222 @@
++#include "model_pack_menu.h"
++
++#include <algorithm>
++
++#include "json/json.hpp"
++
++namespace recompui::config::model_pack_menu {
++    bool valid_pack_id(std::string_view id) {
++        if (id.empty() || id.size() > 31 || id == "off") {   // "off" starts the mod's off lines
++            return false;
++        }
++        for (char c : id) {
++            if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    // models.txt as lines (without their line ends), a UTF-8 BOM dropped. "\r\n", "\n" and "\r" all end a line, as
++    // in the mod's reader.
++    static std::vector<std::string> split_lines(const std::string &text) {
++        std::vector<std::string> lines;
++        size_t start = (text.compare(0, 3, "\xEF\xBB\xBF") == 0) ? 3 : 0;
++        std::string cur;
++        for (size_t i = start; i < text.size(); i++) {
++            const char c = text[i];
++            if (c == '\n' || c == '\r') {
++                lines.push_back(cur);
++                cur.clear();
++                if (c == '\r' && i + 1 < text.size() && text[i + 1] == '\n') {
++                    i++;
++                }
++            }
++            else {
++                cur.push_back(c);
++            }
++        }
++        if (!cur.empty()) {
++            lines.push_back(cur);
++        }
++        return lines;
++    }
++
++    // A line's words up to a '#' comment, split on spaces and tabs (the mod's reader).
++    static std::vector<std::string> words(const std::string &line) {
++        std::vector<std::string> out;
++        std::string cur;
++        for (char c : line) {
++            if (c == '#') {
++                break;
++            }
++            if (c == ' ' || c == '\t') {
++                if (!cur.empty()) {
++                    out.push_back(cur);
++                    cur.clear();
++                }
++            }
++            else {
++                cur.push_back(c);
++            }
++        }
++        if (!cur.empty()) {
++            out.push_back(cur);
++        }
++        return out;
++    }
++
++    // A number as the mod's parse_int reads it: decimal, or hex after 0x; -1 when it isn't one (or is out of range).
++    static long parse_number(const std::string &s) {
++        size_t i = 0;
++        bool neg = false;
++        if (i < s.size() && s[i] == '-') {
++            neg = true;
++            i++;
++        }
++        int base = 10;
++        if (i + 1 < s.size() && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X')) {
++            base = 16;
++            i += 2;
++        }
++        if (i >= s.size()) {
++            return -1;
++        }
++        long v = 0;
++        for (; i < s.size(); i++) {
++            const char c = s[i];
++            int d = (c >= '0' && c <= '9') ? c - '0' : (base == 16 && c >= 'a' && c <= 'f') ? c - 'a' + 10
++                  : (base == 16 && c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
++            if (d < 0 || d >= base || v > 0xFFFFFF) {
++                return -1;
++            }
++            v = v * base + d;
++        }
++        return neg ? -v : v;
++    }
++
++    // "<pack> slot N" with N 1-4 (as the mod reads N): N, else 0.
++    static int slot_of_line(const std::vector<std::string> &w, std::string *pack = nullptr) {
++        if (w.size() != 3 || w[1] != "slot" || !valid_pack_id(w[0])) {
++            return 0;
++        }
++        const long n = parse_number(w[2]);
++        if (n < 1 || n > slot_count) {
++            return 0;
++        }
++        if (pack != nullptr) {
++            *pack = w[0];
++        }
++        return int(n);
++    }
++
++    static bool is_off_line(const std::vector<std::string> &w, std::string_view pack_id) {
++        return w.size() == 2 && w[0] == "off" && w[1] == pack_id;
++    }
++
++    static bool pack_is_off(const std::vector<std::string> &lines, std::string_view pack_id) {
++        for (const std::string &line : lines) {
++            if (is_off_line(words(line), pack_id)) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    // The mod's pack_for_slot for slot lines: the first line for the slot decides; if its pack is off, the slot is
++    // empty (the mod doesn't look further).
++    static std::string slot_pack_of(const std::vector<std::string> &lines, int slot) {
++        for (const std::string &line : lines) {
++            std::string pack;
++            if (slot_of_line(words(line), &pack) == slot) {
++                return pack_is_off(lines, pack) ? std::string() : pack;
++            }
++        }
++        return "";
++    }
++
++    std::string slot_pack(const std::string &text, int slot) {
++        return slot_pack_of(split_lines(text), slot);
++    }
++
++    int pack_slot(const std::string &text, std::string_view pack_id) {
++        const std::vector<std::string> lines = split_lines(text);
++        for (int slot = 1; slot <= slot_count; slot++) {
++            if (slot_pack_of(lines, slot) == pack_id) {
++                return slot;
++            }
++        }
++        return 0;
++    }
++
++    std::string assign(const std::string &text, std::string_view pack_id, int slot) {
++        const std::string line_for_pack = std::string(pack_id) + " slot " + std::to_string(slot) + "\n";
++        std::string out;
++        bool placed = (slot == 0);
++        for (const std::string &line : split_lines(text)) {
++            const std::vector<std::string> w = words(line);
++            std::string pack;
++            const int line_slot = slot_of_line(w, &pack);
++            const bool slot_line = line_slot != 0 && (pack == pack_id || (slot != 0 && line_slot == slot));
++            if (slot_line && !placed) {
++                out += line_for_pack;   // where the line it replaces was
++                placed = true;
++            }
++            if (!slot_line && !(slot != 0 && is_off_line(w, pack_id))) {
++                out += line;
++                out += "\n";
++            }
++        }
++        if (!placed) {
++            out += line_for_pack;
++        }
++        return out;
++    }
++
++    Pack parse_pack_json(std::string_view id, const std::string &pack_json) {
++        Pack pack;
++        pack.id = std::string(id);
++        pack.name = pack.id;
++        const nlohmann::json j = nlohmann::json::parse(pack_json, nullptr, false);
++        if (!j.is_object()) {
++            return pack;
++        }
++        auto text = [&j](const char *key) -> std::string {
++            auto it = j.find(key);
++            return (it != j.end() && it->is_string()) ? it->get<std::string>() : std::string();
++        };
++        if (!text("name").empty()) {
++            pack.name = text("name");
++        }
++        pack.author = text("author");
++        pack.game = text("game");
++        return pack;
++    }
++
++    std::vector<Row> rows(const std::vector<Pack> &packs, const std::string &text) {
++        const std::vector<std::string> lines = split_lines(text);
++        std::vector<Row> out;
++        for (const Pack &pack : packs) {
++            Row row;
++            row.pack = pack;
++            row.slot = pack_slot(text, pack.id);
++            if (pack_is_off(lines, pack.id)) {
++                row.note = "Off in models.txt";
++            }
++            else {
++                for (const std::string &line : lines) {
++                    const std::vector<std::string> w = words(line);
++                    if (w.size() >= 3 && w[0] == pack.id && w[1] == "wrestler") {
++                        row.note = "Also replaces wrestlers by id (models.txt)";
++                        break;
++                    }
++                }
++            }
++            out.push_back(row);
++        }
++        std::stable_sort(out.begin(), out.end(), [](const Row &a, const Row &b) {
++            return (a.pack.name != b.pack.name) ? (a.pack.name < b.pack.name) : (a.pack.id < b.pack.id);
++        });
++        return out;
++    }
++}
+diff --git a/recompui/src/config/model_pack_menu.h b/recompui/src/config/model_pack_menu.h
+new file mode 100644
+index 0000000..d8f7b80
+--- /dev/null
++++ b/recompui/src/config/model_pack_menu.h
+@@ -0,0 +1,49 @@
++#pragma once
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++// [wcw model import] The Mods menu's Model packs dialog (aki-roadmap#130): the packs in <mods>/models and which wrestler
++// slot each one replaces, read from and written to <mods>/models/models.txt (the aki_modelimport mod's assignments
++// file; its rules: AkiMods mods/modelimport/README.md). Kept free of UI and file I/O so it can be unit tested
++// (recompui/tests).
++//
++// The dialog only manages "<pack> slot N" lines: picking a slot for a pack drops every other line that gives that slot
++// to a pack or this pack to a slot, and an "off <pack>" line for it; picking Off drops the pack's slot lines. Comments,
++// wrestler / costume lines and everything else stay as they are.
++namespace recompui::config::model_pack_menu {
++    constexpr int slot_count = 4;
++
++    // A pack id as the mod accepts it: a-z 0-9 _ -, 1 to 31 characters.
++    bool valid_pack_id(std::string_view id);
++
++    // The slot (1-4) a models.txt gives the pack with a "slot" line (the first such line), or 0. A pack turned off
++    // ("off <pack>") has none.
++    int pack_slot(const std::string &text, std::string_view pack_id);
++
++    // The pack a models.txt's "slot" lines give a slot (1-4) - the first line for it whose pack isn't turned off - or "".
++    std::string slot_pack(const std::string &text, int slot);
++
++    // models.txt with the pack on slot (1-4), or on none (slot 0). Lines end in "\n"; a UTF-8 BOM is dropped.
++    std::string assign(const std::string &text, std::string_view pack_id, int slot);
++
++    struct Pack {
++        std::string id;
++        std::string name;    // pack.json "name", else the id
++        std::string author;  // pack.json "author", else ""
++        std::string game;    // pack.json "game", else ""
++    };
++
++    // A pack's display fields from its pack.json text (empty or invalid JSON: the id only).
++    Pack parse_pack_json(std::string_view id, const std::string &pack_json);
++
++    struct Row {
++        Pack pack;
++        int slot = 0;          // pack_slot
++        std::string note;      // "Off in models.txt" / "Also replaces wrestlers by id" / ""
++    };
++
++    // One row per pack, sorted by name (then id).
++    std::vector<Row> rows(const std::vector<Pack> &packs, const std::string &text);
++}
 diff --git a/recompui/src/config/save_backup_menu.cpp b/recompui/src/config/save_backup_menu.cpp
 new file mode 100644
 index 0000000..589e5d5
@@ -1160,7 +3415,7 @@ index 0000000..9ac0413
 +    std::string confirm_text(const Entry &entry, const Timestamp &now);
 +}
 diff --git a/recompui/src/config/ui_config.cpp b/recompui/src/config/ui_config.cpp
-index 6c84c05..ee15d76 100644
+index 6c84c05..3b295c0 100644
 --- a/recompui/src/config/ui_config.cpp
 +++ b/recompui/src/config/ui_config.cpp
 @@ -15,6 +15,8 @@ struct PendingTab {
@@ -1198,6 +3453,16 @@ index 6c84c05..ee15d76 100644
      void config::finalize() {
          if (loaded_configs) {
              throw std::runtime_error("Configurations have already been loaded.");
+@@ -118,6 +130,9 @@ namespace recompui {
+ 
+         recompinput::profiles::load_controls_config(recomp::get_config_path() / (config::controls::id + ".json"));
+ 
++        // [wcw dd] Before rt64 starts, which reads WCW_DD_METRICS once (aki-roadmap#148).
++        config::general::apply_dd_metrics_env();
++
+         loaded_configs = true;
+     }
+ 
 diff --git a/recompui/src/config/ui_config_option.cpp b/recompui/src/config/ui_config_option.cpp
 index 86428c9..d95b2b6 100644
 --- a/recompui/src/config/ui_config_option.cpp
@@ -1405,23 +3670,102 @@ index 49e05db..42cd274 100644
          );
          virtual ~ConfigPageOptionsMenu() = default;
      };
+diff --git a/recompui/src/config/ui_config_tab_controls.cpp b/recompui/src/config/ui_config_tab_controls.cpp
+index fa39c46..4bf29e0 100644
+--- a/recompui/src/config/ui_config_tab_controls.cpp
++++ b/recompui/src/config/ui_config_tab_controls.cpp
+@@ -1,6 +1,7 @@
+ #include "recompui/config.h"
+ #include "recompinput/players.h"
+ #include "recompinput/profiles.h"
++#include "recompinput/input_binding.h"
+ #include "elements/ui_element.h"
+ #include "ui_config_page_controls.h"
+ #include "librecomp/game.hpp"
+@@ -22,4 +23,15 @@ void config::create_controls_tab(const std::string &name) {
+     );
+ }
+ 
++// [wcw fix] Saves the controls as soon as they change (aki-roadmap#303), not only when the Controls tab closes:
++// quitting from the menu or closing the window with the tab open used to lose every change.
++void config::save_controls_if_changed() {
++    const std::filesystem::path config_path = recomp::get_config_path();
++    if (config_path.empty()) {
++        return;
++    }
++    recompinput::profiles::save_controls_config_if_changed(config_path / (config::controls::id + ".json"),
++        recompinput::binding::is_binding());
++}
++
+ } // namespace recompui
 diff --git a/recompui/src/config/ui_config_tab_general.cpp b/recompui/src/config/ui_config_tab_general.cpp
-index 296ce0e..e825de5 100644
+index 296ce0e..b1caca0 100644
 --- a/recompui/src/config/ui_config_tab_general.cpp
 +++ b/recompui/src/config/ui_config_tab_general.cpp
-@@ -1,6 +1,8 @@
+@@ -1,6 +1,12 @@
  #include "librecomp/config.hpp"
  #include "recompui/config.h"
 +#include "recompui/recompui.h"
  #include "util/steam_deck.h"
 +#include "composites/ui_save_backups_modal.h"
++#include "dd_metrics_rules.h"
++
++#include <cstdio>
++#include <cstdlib>
  
  namespace recompui {
  
-@@ -139,6 +141,15 @@ namespace config {
+@@ -75,6 +81,33 @@ namespace config {
+         return get_general_config_bool_value(general::options::debug_mode);
+     }
+ 
++    bool general::get_dd_metrics_enabled() {
++        return get_general_config_bool_value(general::options::dd_metrics);
++    }
++
++    void general::apply_dd_metrics_env() {
++        if (!created_general_config || !get_general_config().has_option(general::options::dd_metrics)) {
++            return;
++        }
++
++        const char *env = std::getenv("WCW_DD_METRICS");
++        const bool setting_on = get_dd_metrics_enabled();
++        const char *value = dd_metrics_rules::env_value_to_set(env, setting_on);
++        if (value == nullptr) {
++            if (setting_on) {
++                fprintf(stderr, "[wcw dd] Datadog Metrics setting on, but WCW_DD_METRICS=%s overrides it\n", env);
++            }
++            return;
++        }
++
++#if defined(_WIN32)
++        _putenv_s("WCW_DD_METRICS", value);
++#else
++        setenv("WCW_DD_METRICS", value, 1);
++#endif
++        fprintf(stderr, "[wcw dd] Datadog Metrics setting on: WCW_DD_METRICS=%s for this session\n", value);
++    }
++
+     recomp::config::Config &create_general_tab(const GeneralTabOptions& options, const std::string &name) {
+         created_general_config = true;
+         recomp::config::Config &config = recompui::config::create_config_tab(name, general::id, false);
+@@ -139,6 +172,28 @@ namespace config {
              BackgroundInputMode::On
          );
  
++        // [wcw dd] Developer option (aki-roadmap#148): read once at startup (config::finalize sets WCW_DD_METRICS).
++        config.add_bool_option(
++            general::options::dd_metrics,
++            "Datadog Metrics",
++            "Developer option. Sends performance numbers, and a last message if the game stops on a fatal error, "
++            "to a Datadog Agent running on this PC (127.0.0.1), which forwards them to its Datadog account. "
++            "With no Agent running, nothing is sent anywhere."
++            "<br/>"
++            "<b>Takes effect the next time the game starts.</b> The WCW_DD_METRICS environment variable, when set, "
++            "overrides this setting.",
++            false
++        );
++
 +        // [wcw saves] Restore a backup (aki-roadmap#50): a button that opens the backup list, not a setting.
 +        add_config_tab_action(general::id, ConfigTabAction{
 +            .name = "Restore Save Backup",
@@ -1435,7 +3779,7 @@ index 296ce0e..e825de5 100644
      }
  } // namespace config
 diff --git a/recompui/src/config/ui_config_tab_graphics.cpp b/recompui/src/config/ui_config_tab_graphics.cpp
-index 4fdf81f..0b67119 100644
+index 4fdf81f..8fdcef1 100644
 --- a/recompui/src/config/ui_config_tab_graphics.cpp
 +++ b/recompui/src/config/ui_config_tab_graphics.cpp
 @@ -1,7 +1,22 @@
@@ -1688,7 +4032,7 @@ index 4fdf81f..0b67119 100644
 +        }
 +
 +        // [wcw] Graphics presets (graphics_presets.h). The display's refresh rate and the GPU's MSAA levels arrive once
-+        // the renderer runs; until then Max assumes a fast enough display and MSAA 4x.
++        // the renderer runs; until then the presets assume MSAA 4x (no preset depends on the display rate now, #165).
 +        static std::atomic<uint32_t> preset_display_rate = 0;
 +        static std::atomic<ultramodern::renderer::Antialiasing> preset_max_msaa = ultramodern::renderer::Antialiasing::MSAA4X;
 +        // Set while the tab itself changes the preset or its options, so those changes aren't taken as the player's.
@@ -2020,7 +4364,7 @@ index 4fdf81f..0b67119 100644
 +                "<br />"
 +                "<recomp-color primary>Enhanced RT</recomp-color>: Enhanced plus ray tracing (Balanced)."
 +                "<br />"
-+                "<recomp-color primary>Max</recomp-color>: Ultra ray tracing, HDR, 120 fps on a fast display."
++                "<recomp-color primary>Max</recomp-color>: Ultra ray tracing, HDR, smooth motion."
 +                "<br />"
 +                "<recomp-color primary>Custom</recomp-color>: your own mix (shown when no preset matches)."
 +                "<br />"
@@ -2064,7 +4408,7 @@ index 4fdf81f..0b67119 100644
                      graphics::options::ds_option,
                      graphics::options::res_option,
                      ultramodern::renderer::Resolution::Auto
-@@ -283,12 +765,46 @@ namespace recompui {
+@@ -283,12 +765,48 @@ namespace recompui {
                  });
              }
  
@@ -2077,7 +4421,9 @@ index 4fdf81f..0b67119 100644
 +                "<br />"
 +                "<br />"
 +                "<recomp-color warning>Note:</recomp-color> <recomp-color primary>2x</recomp-color> renders four times the pixels "
-+                "and is demanding at high window sizes: about 4K internally for a 1080p window. Ray tracing still traces at the window's size.",
++                "and is demanding at high window sizes: about 4K internally for a 1080p window. Ray tracing still traces at the window's size. "
++                "At 120 fps every in-between frame is rendered at that size too: with a 4K window, expect well under 120 fps and "
++                "several GB of video memory.",
 +                supersampling_options,
 +                SupersamplingOption::Off
 +            );
@@ -2112,7 +4458,7 @@ index 4fdf81f..0b67119 100644
              );
  
              config.add_enum_option(
-@@ -299,12 +815,16 @@ namespace recompui {
+@@ -299,12 +817,16 @@ namespace recompui {
                  wm_default()
              );
  
@@ -2133,7 +4479,7 @@ index 4fdf81f..0b67119 100644
              );
  
              config.add_number_option(
-@@ -314,12 +834,28 @@ namespace recompui {
+@@ -314,12 +836,28 @@ namespace recompui {
                  20.0, 240.0, 1.0, 0, false, 60.0
              );
              {
@@ -2168,7 +4514,7 @@ index 4fdf81f..0b67119 100644
              }
  
              config.add_enum_option(
-@@ -330,7 +866,7 @@ namespace recompui {
+@@ -330,7 +868,7 @@ namespace recompui {
                  "<br />"
                  "<recomp-color primary>Note: This option won't be available if your GPU does not support programmable MSAA sample positions, as it is currently required to avoid rendering glitches.</recomp-color>",
                  antialiasing_options,
@@ -2177,7 +4523,7 @@ index 4fdf81f..0b67119 100644
              );
  
              config.add_enum_option(
-@@ -359,6 +895,177 @@ namespace recompui {
+@@ -359,6 +897,177 @@ namespace recompui {
                  true
              );
  
@@ -2515,10 +4861,10 @@ index 4a4033b..6c4c6ff 100644
  
      class Radio : public Container {
 diff --git a/recompui/src/renderer/rt64_render_context.cpp b/recompui/src/renderer/rt64_render_context.cpp
-index a7954c7..dba60fa 100644
+index a7954c7..5a2b5bb 100644
 --- a/recompui/src/renderer/rt64_render_context.cpp
 +++ b/recompui/src/renderer/rt64_render_context.cpp
-@@ -2,13 +2,22 @@
+@@ -2,13 +2,23 @@
  #include <cstring>
  #include <variant>
  #include <algorithm>
@@ -2533,6 +4879,7 @@ index a7954c7..dba60fa 100644
 +#include "common/rt64_wcw_perf.h"
 +#include "render/rt64_hdr_output.h"
  #include "rt64_render_hooks.h"
++#include "wcw_texnames.h"
  #include "overloaded.h"
  
  #include "ultramodern/ultramodern.hpp"
@@ -2541,7 +4888,7 @@ index a7954c7..dba60fa 100644
  
  #include "renderer.h"
  #include "recompui/recompui.h"
-@@ -143,7 +152,8 @@ void set_application_user_config(RT64::Application* application, const ultramode
+@@ -143,7 +153,8 @@ void set_application_user_config(RT64::Application* application, const ultramode
          default:
          case ultramodern::renderer::Resolution::Auto:
              application->userConfig.resolution = RT64::UserConfiguration::Resolution::WindowIntegerScale;
@@ -2551,7 +4898,7 @@ index a7954c7..dba60fa 100644
              break;
          case ultramodern::renderer::Resolution::Original:
              application->userConfig.resolution = RT64::UserConfiguration::Resolution::Manual;
-@@ -221,6 +231,11 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
+@@ -221,6 +232,11 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
      static unsigned char dummy_rom_header[0x40];
      recompui::set_render_hooks();
  
@@ -2563,17 +4910,20 @@ index a7954c7..dba60fa 100644
      // Set up the RT64 application core fields.
      RT64::Application::Core appCore{};
  #if defined(_WIN32)
-@@ -270,6 +285,9 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
+@@ -270,6 +286,12 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
      RT64::ApplicationConfiguration appConfig;
      appConfig.useConfigurationFile = false;
  
 +    // [wcw hdr] The swap chain's format depends on the saved HDR setting.
 +    recompui::config::graphics::apply_hdr_settings();
 +
++    // [wcw] Texture pack names from other renderers: rt64 only knows the interface (aki-roadmap#93).
++    RT64::setTextureNameProvider(&wcw_texnames::provider());
++
      // Create the RT64 application.
      app = std::make_unique<RT64::Application>(appCore, appConfig);
  
-@@ -299,6 +317,8 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
+@@ -299,6 +321,8 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
              app->userConfig.graphicsAPI = RT64::UserConfiguration::GraphicsAPI::Automatic;
              break;
      }
@@ -2582,7 +4932,7 @@ index a7954c7..dba60fa 100644
  
      // Set up the RT64 application.
      uint32_t thread_id = 0;
-@@ -331,6 +351,7 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
+@@ -331,6 +355,7 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
      }
  
      recompui::config::graphics::update_msaa_supported(sample_positions_supported);
@@ -2590,7 +4940,7 @@ index a7954c7..dba60fa 100644
  
      high_precision_fb_enabled = app->shaderLibrary->usesHDR;
  }
-@@ -356,6 +377,46 @@ void renderer::RT64Context::send_dummy_workload(uint32_t fb_address) {
+@@ -356,6 +381,46 @@ void renderer::RT64Context::send_dummy_workload(uint32_t fb_address) {
  }
  
  void renderer::RT64Context::update_screen() {
@@ -2637,7 +4987,7 @@ index a7954c7..dba60fa 100644
      check_refresh_rate_changes();
      app->updateScreen();
  }
-@@ -405,12 +466,9 @@ float renderer::RT64Context::get_resolution_scale() const {
+@@ -405,12 +470,9 @@ float renderer::RT64Context::get_resolution_scale() const {
      constexpr int ReferenceHeight = 240;
      switch (app->userConfig.resolution) {
          case RT64::UserConfiguration::Resolution::WindowIntegerScale:
@@ -2895,6 +5245,272 @@ index 5fb8b5e..b8174bb 100644
          const std::u8string &get_program_id() {
              if (program_id.empty()) {
                  throw std::runtime_error("Program ID has not been set. Run recompui::programconfig::set_program_id(...) first.");
+diff --git a/recompui/tests/check_file_local_types.cmake b/recompui/tests/check_file_local_types.cmake
+new file mode 100644
+index 0000000..a47ec8f
+--- /dev/null
++++ b/recompui/tests/check_file_local_types.cmake
+@@ -0,0 +1,38 @@
++# [wcw] One-definition-rule guard for recompui's .cpp files (cmake -DSOURCE_DIR=<recompui/src> -P this file).
++#
++# A struct or class written straight inside a named namespace (four spaces in, the recompui style) has external
++# linkage even when the file only uses it locally. If two files each define their own type of the same name that way,
++# the program breaks the one-definition rule without any compiler or linker error: the linker keeps one copy of each
++# template member (std::vector<T>::push_back and so on) and both files run it. That crashed the Conversions dialog
++# in 0.3.0/0.3.1: it ran the Model packs dialog's push_back for its own, smaller RowWidgets (WWFNoMercyRecomp#24,
++# WWFWrestleMania2000Recomp#10).
++#
++# File-local types go in an anonymous namespace (eight spaces in, so this check skips them). This fails the build
++# when two .cpp files define a type of the same name at namespace level. It reads struct, class, union and enum
++# definitions (templates too) written four spaces in with the { on the same line; other layouts aren't seen.
++if (NOT SOURCE_DIR)
++    message(FATAL_ERROR "check_file_local_types: SOURCE_DIR is not set")
++endif()
++
++set(type_regex "^    (template *<[^>]*> *)?(struct|class|union|enum class|enum struct|enum) ([A-Za-z_][A-Za-z0-9_]*)")
++file(GLOB_RECURSE sources "${SOURCE_DIR}/*.cpp")
++foreach (source IN LISTS sources)
++    file(STRINGS "${source}" lines REGEX "${type_regex}[^;]*{")
++    foreach (line IN LISTS lines)
++        string(REGEX REPLACE "${type_regex}.*" "\\3" name "${line}")
++        file(RELATIVE_PATH relative "${SOURCE_DIR}" "${source}")
++        if (DEFINED "seen_${name}" AND NOT "${seen_${name}}" STREQUAL "${relative}")
++            list(APPEND clashes "${name}: ${seen_${name}} and ${relative}")
++        else()
++            set("seen_${name}" "${relative}")
++        endif()
++    endforeach()
++endforeach()
++
++if (clashes)
++    list(JOIN clashes "\n  " clash_text)
++    message(FATAL_ERROR "check_file_local_types: these types are defined at namespace level in more than one .cpp file "
++        "(a one-definition-rule break; put file-local types in an anonymous namespace). The check takes a definition "
++        "written four spaces in as namespace level:\n  ${clash_text}")
++endif()
++message(STATUS "check_file_local_types: no namespace-level type defined in two recompui .cpp files")
+diff --git a/recompui/tests/controls_rules_tests.cpp b/recompui/tests/controls_rules_tests.cpp
+new file mode 100644
+index 0000000..3115582
+--- /dev/null
++++ b/recompui/tests/controls_rules_tests.cpp
+@@ -0,0 +1,83 @@
++// [wcw fix] Unit tests for the controls save/load rules (recompinput/src/controls_rules, aki-roadmap#303). Built and
++// run as part of every recompui build (RECOMPUI_WCW_TESTS); a failure fails the build.
++
++#include "recompinput/controls_rules.h"
++
++#include "wcw_test.h"
++
++using namespace recompinput::controls_rules;
++
++TEST_CASE("controls: a GUID hash is never 0 and is rebuilt the same from the saved fields") {
++    // Regression for #303: a GUID read back from controls.json kept hash 0, so every saved pad shared one map entry.
++    const uint64_t pad360 = controller_guid_hash("", 1118, 654, 0, 6554);
++    const uint64_t padOne = controller_guid_hash("", 1118, 767, 0, 36243);
++    CHECK(pad360 != 0);
++    CHECK(padOne != 0);
++    CHECK(pad360 != padOne);
++    CHECK(controller_guid_hash("", 1118, 654, 0, 6554) == pad360);
++    CHECK(controller_guid_hash("", 0, 0, 0, 0) != 0);
++}
++
++TEST_CASE("controls: each field changes the hash") {
++    const uint64_t base = controller_guid_hash("", 1, 2, 3, 4);
++    CHECK(controller_guid_hash("", 9, 2, 3, 4) != base);
++    CHECK(controller_guid_hash("", 1, 9, 3, 4) != base);
++    CHECK(controller_guid_hash("", 1, 2, 9, 4) != base);
++    CHECK(controller_guid_hash("", 1, 2, 3, 9) != base);
++    // Fields don't swap into each other.
++    CHECK(controller_guid_hash("", 2, 1, 3, 4) != base);
++}
++
++TEST_CASE("controls: a saved pad keeps the link to its own profile") {
++    const std::string a = "SERIAL__VID_1118_PID_654_VERSION_0_CRC16_6554";
++    CHECK(saved_controller_profile_key(a, a, true, false, true) == a);
++}
++
++TEST_CASE("controls: a pre-#303 cross link goes back to the pad's own profile") {
++    // The owner's files: pad 654 saved as linked to pad 767's profile.
++    const std::string a = "SERIAL__VID_1118_PID_654_VERSION_0_CRC16_6554";
++    const std::string b = "SERIAL__VID_1118_PID_767_VERSION_0_CRC16_36243";
++    CHECK(saved_controller_profile_key(a, b, true, false, true) == a);
++    // Without its own profile the entry is skipped; the pad gets its profile when it is plugged in.
++    CHECK(saved_controller_profile_key(a, b, true, false, false).empty());
++    // The single-player controller profile is not a pad's profile either.
++    CHECK(saved_controller_profile_key(a, "controller_sp", true, false, true) == a);
++}
++
++TEST_CASE("controls: custom profiles keep their link, missing profiles don't") {
++    const std::string a = "SERIAL__VID_1118_PID_654_VERSION_0_CRC16_6554";
++    CHECK(saved_controller_profile_key(a, "my_layout", true, true, true) == "my_layout");
++    CHECK(saved_controller_profile_key(a, "my_layout", false, true, true) == a);
++    CHECK(saved_controller_profile_key(a, a, false, false, false).empty());
++}
++
++TEST_CASE("controls: changes are saved right away, but not mid-bind") {
++    CHECK(!controls_need_save(0, 0, false));
++    CHECK(controls_need_save(1, 0, false));
++    CHECK(!controls_need_save(1, 0, true));   // waiting for the new input: save when the bind finishes
++    CHECK(!controls_need_save(7, 7, true));
++    CHECK(controls_need_save(3, 7, false));   // any difference counts, not only "newer"
++}
++
++TEST_CASE("controls: a GUID read from controls.json gets its hash back") {
++    // Regression for #303: from_json left the hash at 0, so saved pads collapsed onto one controllers entry.
++    const nlohmann::json saved = { {"serial", ""}, {"vendor", 1118}, {"product", 654}, {"version", 0}, {"crc16", 6554} };
++    const recompinput::ControllerGUID guid = saved.get<recompinput::ControllerGUID>();
++    CHECK(guid.hash != 0);
++    CHECK(guid.hash == controller_guid_hash("", 1118, 654, 0, 6554));
++    nlohmann::json other = saved;
++    other["product"] = 767;
++    other["crc16"] = 36243;
++    CHECK(other.get<recompinput::ControllerGUID>().hash != guid.hash);
++}
++
++TEST_CASE("controls: two pads of one model with different serials get different hashes") {
++    // Review of #303: the serial is in the profile key, so it must be in the hash too, or the second pad's link
++    // overwrote the first's on load.
++    const uint64_t a = controller_guid_hash("a4:53:85:00:00:01", 1356, 2508, 0x8111, 4660);
++    const uint64_t b = controller_guid_hash("a4:53:85:00:00:02", 1356, 2508, 0x8111, 4660);
++    CHECK(a != b);
++    CHECK(controller_guid_hash("", 1356, 2508, 0x8111, 4660) != a);
++    nlohmann::json saved = { {"serial", "a4:53:85:00:00:02"}, {"vendor", 1356}, {"product", 2508}, {"version", 0x8111}, {"crc16", 4660} };
++    CHECK(saved.get<recompinput::ControllerGUID>().hash == b);
++}
+diff --git a/recompui/tests/conversion_menu_tests.cpp b/recompui/tests/conversion_menu_tests.cpp
+new file mode 100644
+index 0000000..bed97d7
+--- /dev/null
++++ b/recompui/tests/conversion_menu_tests.cpp
+@@ -0,0 +1,87 @@
++// [wcw fullconv] Unit tests for the Conversions dialog's rows and status line (src/config/conversion_menu). Built and
++// run as part of every recompui build (RECOMPUI_WCW_TESTS); a failure fails the build.
++
++#include "conversion_menu.h"
++
++#include "wcw_test.h"
++
++using namespace recompui::config::conversion_menu;
++
++namespace {
++    std::vector<Entry> installed() {
++        Entry aew;
++        aew.id = "aew64";
++        aew.name = "AEW 64";
++        aew.codes = aew.saves = aew.textures = true;
++        Entry revse;
++        revse.id = "revse";
++        revse.name = "Starrcade Edition 2.0";
++        revse.patch = true;
++        Entry broken;
++        broken.id = "broken";
++        broken.name = "broken";
++        broken.error = "aki.json: missing \"components\"";
++        return { aew, revse, broken };
++    }
++}
++
++TEST_CASE("conversions: components read as a short list") {
++    const std::vector<Entry> e = installed();
++    CHECK(components_summary(e[0]) == "codes, saves, textures");
++    CHECK(components_summary(e[1]) == "ROM patch");
++    Entry all;
++    all.patch = all.codes = all.saves = all.textures = all.rt = true;
++    CHECK(components_summary(all) == "ROM patch, codes, saves, textures, ray tracing");
++    CHECK(components_summary(Entry{}).empty());
++}
++
++TEST_CASE("conversions: Off comes first and is chosen and running when nothing is") {
++    const std::vector<Row> r = rows(installed(), "", "", false);
++    CHECK(r.size() == 4);
++    CHECK(r[0].entry.id.empty());
++    CHECK(r[0].entry.name == "Off");
++    CHECK(r[0].chosen);
++    CHECK(r[0].running);
++    CHECK(r[0].note.empty());
++    CHECK(!r[1].chosen && !r[1].running);
++    CHECK(status_line(installed(), "", "", false) == "Playing the normal game.");
++}
++
++TEST_CASE("conversions: a choice for the next start says so until the game restarts (#57)") {
++    const std::vector<Row> r = rows(installed(), "aew64", "", false);
++    CHECK(!r[0].chosen);
++    CHECK(r[0].running);
++    CHECK(r[0].note == "Running now; the next start runs AEW 64");
++    CHECK(r[1].chosen);
++    CHECK(r[1].note == "From the next start");
++    CHECK(status_line(installed(), "aew64", "", false) == "Restart the game to switch to AEW 64.");
++    // After the restart the same choice is running.
++    const std::vector<Row> after = rows(installed(), "aew64", "aew64", false);
++    CHECK(after[1].running && after[1].chosen);
++    CHECK(after[1].note == "Running now");
++    CHECK(status_line(installed(), "aew64", "aew64", false) == "Playing AEW 64.");
++    // And back to Off.
++    CHECK(status_line(installed(), "", "aew64", false) == "Restart the game to switch to the normal game.");
++}
++
++TEST_CASE("conversions: an unreadable conversion is listed but can't be chosen") {
++    const std::vector<Row> r = rows(installed(), "", "", false);
++    CHECK(!r[3].selectable);
++    CHECK(r[3].note == "Can't be played: aki.json: missing \"components\"");
++    CHECK(r[1].selectable && r[2].selectable && r[0].selectable);
++}
++
++TEST_CASE("conversions: a launcher run doesn't promise a restart switches (the launcher picks again) (#57 review)") {
++    // AKI Launcher started revse; the Mods menu's choice (for starts without the launcher) is aew64.
++    const std::vector<Row> r = rows(installed(), "aew64", "revse", true);
++    CHECK(r[2].running && !r[2].chosen);
++    CHECK(r[2].note == "Running now (picked by AKI Launcher)");
++    CHECK(r[1].chosen && r[1].note == "For starts without AKI Launcher");
++    CHECK(status_line(installed(), "aew64", "revse", true) ==
++        "AKI Launcher started Starrcade Edition 2.0. Starts without the launcher run AEW 64.");
++    CHECK(status_line(installed(), "", "revse", true) ==
++        "AKI Launcher started Starrcade Edition 2.0. Starts without the launcher run the normal game.");
++    // The launcher's pick and the choice agree: nothing to explain.
++    CHECK(status_line(installed(), "revse", "revse", true) == "Playing Starrcade Edition 2.0.");
++    CHECK(rows(installed(), "revse", "revse", true)[2].note == "Running now");
++}
+diff --git a/recompui/tests/dd_metrics_rules_tests.cpp b/recompui/tests/dd_metrics_rules_tests.cpp
+new file mode 100644
+index 0000000..79885e2
+--- /dev/null
++++ b/recompui/tests/dd_metrics_rules_tests.cpp
+@@ -0,0 +1,34 @@
++// [wcw dd] Unit tests for the Datadog metrics switch (src/config/dd_metrics_rules, aki-roadmap#148). Built and run as
++// part of every recompui build (RECOMPUI_WCW_TESTS); a failure fails the build.
++
++#include "dd_metrics_rules.h"
++
++#include <cstring>
++
++#include "wcw_test.h"
++
++using namespace recompui::dd_metrics_rules;
++
++TEST_CASE("dd metrics: off by default (no variable, setting off)") {
++    CHECK(env_value_to_set(nullptr, false) == nullptr);
++    CHECK(!metrics_on(nullptr, false));
++}
++
++TEST_CASE("dd metrics: the setting turns them on when the variable isn't set") {
++    CHECK(std::strcmp(env_value_to_set(nullptr, true), "1") == 0);
++    CHECK(metrics_on(nullptr, true));
++    // An empty variable counts as unset (rt64 reads it as off), so the setting still applies.
++    CHECK(std::strcmp(env_value_to_set("", true), "1") == 0);
++    CHECK(metrics_on("", true));
++    CHECK(!metrics_on("", false));
++}
++
++TEST_CASE("dd metrics: a set variable wins over the setting, both ways") {
++    for (bool setting : { false, true }) {
++        CHECK(env_value_to_set("1", setting) == nullptr);
++        CHECK(env_value_to_set("0", setting) == nullptr);
++        CHECK(metrics_on("1", setting));
++        CHECK(metrics_on("yes", setting));
++        CHECK(!metrics_on("0", setting));     // WCW_DD_METRICS=0 forces them off even with the setting on
++    }
++}
 diff --git a/recompui/tests/framerate_rules_tests.cpp b/recompui/tests/framerate_rules_tests.cpp
 new file mode 100644
 index 0000000..4047081
@@ -2996,10 +5612,10 @@ index 0000000..4047081
 +}
 diff --git a/recompui/tests/graphics_presets_tests.cpp b/recompui/tests/graphics_presets_tests.cpp
 new file mode 100644
-index 0000000..51c8851
+index 0000000..26b6b5a
 --- /dev/null
 +++ b/recompui/tests/graphics_presets_tests.cpp
-@@ -0,0 +1,271 @@
+@@ -0,0 +1,276 @@
 +// [wcw] Unit tests for the graphics presets (src/config/graphics_presets). Built and run as part of every recompui
 +// build (RECOMPUI_WCW_TESTS); a failure fails the build.
 +
@@ -3105,10 +5721,10 @@ index 0000000..51c8851
 +    CHECK_EQ(val(Preset::Custom), 4);
 +}
 +
-+TEST_CASE("Max is 120 fps (Smooth2x), MSAA 4x, RT Ultra, HDR Auto") {
++TEST_CASE("Max is 60 fps (Smooth), MSAA 4x, RT Ultra, HDR Auto") {
 +    const Settings s = preset(Preset::Max);
 +    CHECK_EQ(val(s.aspect_ratio), val(AspectRatio::Expand));
-+    CHECK_EQ(val(s.framerate), val(RefreshRate::Display));
++    CHECK_EQ(val(s.framerate), val(RefreshRate::Manual));
 +    CHECK_EQ(val(s.msaa), val(Antialiasing::MSAA4X));
 +    CHECK_EQ(val(s.crt), val(CrtFilterOption::Off));
 +    CHECK_EQ(val(s.rt), val(RayTracingOption::On));
@@ -3117,18 +5733,23 @@ index 0000000..51c8851
 +    CHECK_EQ(val(s.hdr_picture), val(HdrPictureOption::Auto));
 +}
 +
-+TEST_CASE("Max runs 120 only where the display allows it, otherwise the smooth rate") {
++TEST_CASE("Max never pairs RT Ultra with 120 fps, whatever the display (aki-roadmap#165)") {
 +    Limits limits = interpolating();
-+    limits.display_rate = 60;
-+    CHECK_EQ(val(preset(Preset::Max, limits).framerate), val(RefreshRate::Manual));
-+    limits.display_rate = 100;
-+    CHECK_EQ(val(preset(Preset::Max, limits).framerate), val(RefreshRate::Manual));
-+    limits.display_rate = 119; // 119.88 Hz
-+    CHECK_EQ(val(preset(Preset::Max, limits).framerate), val(RefreshRate::Display));
-+    limits.display_rate = 120;
-+    CHECK_EQ(val(preset(Preset::Max, limits).framerate), val(RefreshRate::Display));
-+    limits.display_rate = 0; // not known yet
-+    CHECK_EQ(val(preset(Preset::Max, limits).framerate), val(RefreshRate::Display));
++    for (uint32_t rate : { 0u, 60u, 100u, 119u, 120u, 144u, 165u, 240u }) {
++        limits.display_rate = rate;
++        const Settings s = preset(Preset::Max, limits);
++        CHECK_EQ(val(s.rt_quality), val(RayTracingQuality::Ultra));
++        CHECK_EQ(val(s.framerate), val(RefreshRate::Manual));
++    }
++}
++
++TEST_CASE("Max with 120 fps chosen by hand is Custom (aki-roadmap#165)") {
++    Limits limits = interpolating();
++    limits.display_rate = 165;
++    Settings s = preset(Preset::Max, limits);
++    CHECK_EQ(val(matching_preset(s, limits)), val(Preset::Max));
++    s.framerate = RefreshRate::Display;
++    CHECK_EQ(val(matching_preset(s, limits)), val(Preset::Custom));
 +}
 +
 +TEST_CASE("a game with a locked framerate stays at Original in every preset") {
@@ -3320,6 +5941,253 @@ index 0000000..d617ed0
 +    CHECK(msaa_level_supported(Antialiasing::MSAA2X, Antialiasing::MSAA2X));
 +    CHECK(!msaa_level_supported(Antialiasing::MSAA2X, Antialiasing::None));
 +    CHECK(msaa_level_supported(Antialiasing::None, Antialiasing::None));
++}
+diff --git a/recompui/tests/input_rules_tests.cpp b/recompui/tests/input_rules_tests.cpp
+new file mode 100644
+index 0000000..75539ea
+--- /dev/null
++++ b/recompui/tests/input_rules_tests.cpp
+@@ -0,0 +1,94 @@
++// [wcw fix] Unit tests for the host-to-N64 input rules (recompinput/src/input_rules, aki-roadmap#305). Built and run as
++// part of every recompui build (RECOMPUI_WCW_TESTS); a failure fails the build.
++
++#include "recompinput/input_rules.h"
++
++#include <vector>
++
++#include "wcw_test.h"
++
++using namespace recompinput::input_rules;
++
++// Feeds a run of axis values through the rule, as the game's reads would, and counts the presses it sees.
++static int count_presses(const std::vector<float> &values) {
++    bool down = false;
++    int presses = 0;
++    for (float v : values) {
++        const bool now = analog_as_digital(down, v);
++        if (now && !down) {
++            presses++;
++        }
++        down = now;
++    }
++    return presses;
++}
++
++TEST_CASE("input: a stick press goes down at the press threshold and up below the release threshold") {
++    CHECK(!analog_as_digital(false, 0.0f));
++    CHECK(!analog_as_digital(false, 0.49f));
++    CHECK(analog_as_digital(false, 0.5f));
++    CHECK(analog_as_digital(true, 0.49f));
++    CHECK(analog_as_digital(true, analog_release_threshold));
++    CHECK(!analog_as_digital(true, 0.34f));
++    CHECK(!analog_as_digital(true, 0.0f));
++    CHECK(analog_release_threshold < analog_press_threshold);
++}
++
++TEST_CASE("input: a stick wobbling around the threshold is one press, not several") {
++    // Regression for #305: a push that settles near 0.5 (or wobbles back through it on release) was press, release,
++    // press with the old single threshold.
++    CHECK_EQ(count_presses({ 0.0f, 0.3f, 0.52f, 0.47f, 0.53f, 0.48f, 0.51f, 0.2f, 0.0f }), 1);
++    CHECK_EQ(count_presses({ 0.0f, 1.0f, 1.0f, 0.45f, 0.55f, 0.4f, 0.0f }), 1);
++}
++
++TEST_CASE("input: separate pushes still count") {
++    CHECK_EQ(count_presses({ 0.0f, 1.0f, 0.0f, 1.0f, 0.1f, 0.9f, 0.0f }), 3);
++    // Coming back only to 0.3 is a release, so a second push from there is a second press.
++    CHECK_EQ(count_presses({ 0.0f, 0.8f, 0.3f, 0.8f, 0.0f }), 2);
++}
++
++// --- Player slots for connected pads (aki-roadmap#304) ---
++
++static SlotView pad_slot() { return SlotView{ true, false, 0 }; }
++static SlotView left_slot(uint64_t by) { return SlotView{ false, false, by }; }
++static SlotView keyboard_slot() { return SlotView{ false, true, 0 }; }
++
++TEST_CASE("slots: a new pad joins as the next player while there is room") {
++    CHECK_EQ(slot_for_connected_pad({}, 4, 11), slot_append);
++    CHECK_EQ(slot_for_connected_pad({ pad_slot() }, 4, 11), slot_append);
++    CHECK_EQ(slot_for_connected_pad({ pad_slot(), pad_slot(), pad_slot(), pad_slot() }, 4, 11), slot_none);
++    CHECK_EQ(slot_for_connected_pad({ pad_slot() }, 1, 11), slot_none);
++}
++
++TEST_CASE("slots: two pads that drop out together come back to their own players") {
++    // Regression for #304: player 2's pad reconnected first and took player 1 (ch0 carried pad 2's presses).
++    const std::vector<SlotView> both_left = { left_slot(11), left_slot(22) };
++    CHECK_EQ(slot_for_connected_pad(both_left, 4, 22), 1);
++    CHECK_EQ(slot_for_connected_pad({ left_slot(11), pad_slot() }, 4, 11), 0);
++    CHECK_EQ(slot_for_connected_pad(both_left, 4, 11), 0);
++}
++
++TEST_CASE("slots: a pad that left takes its slot back over an earlier empty one") {
++    CHECK_EQ(slot_for_connected_pad({ pad_slot(), left_slot(11), left_slot(33) }, 4, 33), 2);
++}
++
++TEST_CASE("slots: a different pad takes the first empty slot, so a player who swaps pads keeps their player") {
++    // One player, pad unplugged, another pad picked up: it must drive player 1, not join as player 2.
++    CHECK_EQ(slot_for_connected_pad({ left_slot(11) }, 4, 99), 0);
++    CHECK_EQ(slot_for_connected_pad({ pad_slot(), left_slot(11), left_slot(22) }, 4, 99), 1);
++}
++
++TEST_CASE("slots: two identical pads (same key) fall back to the first empty slot") {
++    CHECK_EQ(slot_for_connected_pad({ left_slot(11), left_slot(11) }, 4, 11), 0);
++}
++
++TEST_CASE("slots: an unknown pad (key 0) never matches a slot left by an unknown pad") {
++    CHECK_EQ(slot_for_connected_pad({ pad_slot(), left_slot(0), left_slot(0) }, 4, 0), 1);
++    CHECK_EQ(slot_for_connected_pad({ left_slot(55), left_slot(0) }, 4, 0), 0);
++}
++
++TEST_CASE("slots: a keyboard player's slot is never given to a pad") {
++    CHECK_EQ(slot_for_connected_pad({ keyboard_slot() }, 4, 11), slot_append);
++    CHECK_EQ(slot_for_connected_pad({ keyboard_slot(), left_slot(11) }, 4, 11), 1);
++    CHECK_EQ(slot_for_connected_pad({ keyboard_slot() }, 1, 11), slot_none);
++}
+diff --git a/recompui/tests/mod_tabs_tests.cpp b/recompui/tests/mod_tabs_tests.cpp
+new file mode 100644
+index 0000000..d3ba9c8
+--- /dev/null
++++ b/recompui/tests/mod_tabs_tests.cpp
+@@ -0,0 +1,37 @@
++//
++// recompui
++//
++
++// [wcw] Unit tests for the Mods menu's kind tabs and package Install summary (aki-roadmap#154 step 5).
++
++#include "mod_tabs.h"
++
++#include "wcw_test.h"
++
++using namespace recompui::config::mod_tabs;
++
++TEST_CASE("mod_tabs: which tab lists which mod") {
++    CHECK(shows(Tab::All, true, false) && shows(Tab::All, false, false) && shows(Tab::All, false, true));
++    CHECK(shows(Tab::Addons, true, false));
++    CHECK(shows(Tab::Addons, false, true));      // a ROM-patch mod is an add-on, not a data pack
++    CHECK(!shows(Tab::Addons, false, false));
++    CHECK(shows(Tab::TexturePacks, false, false));
++    CHECK(!shows(Tab::TexturePacks, true, false));
++    CHECK(!shows(Tab::TexturePacks, false, true));
++}
++
++TEST_CASE("mod_tabs: first visible entry") {
++    CHECK(first_visible({}) == -1);
++    CHECK(first_visible({ false, false }) == -1);
++    CHECK(first_visible({ false, true, true }) == 1);
++}
++
++TEST_CASE("mod_tabs: install summary") {
++    std::string text;
++    CHECK(!summarize({ { "Cam", "installed", "installed Cam 1.0.0 (addon)", {} } }, text));
++    CHECK(text == "installed Cam 1.0.0 (addon)");
++    CHECK(summarize({ { "Cam", "upgraded", "updated Cam 1.0.0 -> 1.1.0", { "kept/mods/cam.nrm.edited-20261029" } },
++                      { "pack.zip", "refused", "it's for another game (vpw2)", {} } }, text));
++    CHECK(text == "updated Cam 1.0.0 -> 1.1.0\n  your edited copy was kept: kept/mods/cam.nrm.edited-20261029\n"
++                  "Not installed: it's for another game (vpw2) (pack.zip)");
++}
+diff --git a/recompui/tests/model_pack_menu_tests.cpp b/recompui/tests/model_pack_menu_tests.cpp
+new file mode 100644
+index 0000000..ba998ec
+--- /dev/null
++++ b/recompui/tests/model_pack_menu_tests.cpp
+@@ -0,0 +1,98 @@
++// [wcw model import] Unit tests for the Model packs dialog's models.txt handling (src/config/model_pack_menu). Built
++// and run as part of every recompui build (RECOMPUI_WCW_TESTS); a failure fails the build.
++
++#include "model_pack_menu.h"
++
++#include "wcw_test.h"
++
++using namespace recompui::config::model_pack_menu;
++
++TEST_CASE("pack ids are what the mod accepts") {
++    CHECK(valid_pack_id("snake"));
++    CHECK(valid_pack_id("banjo_190-hd"));
++    CHECK(!valid_pack_id(""));
++    CHECK(!valid_pack_id("Snake"));
++    CHECK(!valid_pack_id("a b"));
++    CHECK(!valid_pack_id("../x"));
++    CHECK(!valid_pack_id(std::string(32, 'a')));
++    CHECK(!valid_pack_id("off"));   // the mod's off keyword
++    CHECK(valid_pack_id(std::string(31, 'a')));
++}
++
++TEST_CASE("slots read like the mod reads them") {
++    const std::string text = "# test\nsnake   slot 1   # Snake\r\nbanjo slot 2\nbanjo slot 3\ncesium wrestler 0x0302\n";
++    CHECK_EQ(pack_slot(text, "snake"), 1);
++    CHECK_EQ(pack_slot(text, "banjo"), 2);   // the first line for it
++    CHECK_EQ(pack_slot(text, "cesium"), 0);  // wrestler lines aren't slots
++    CHECK(slot_pack(text, 1) == "snake");
++    CHECK(slot_pack(text, 3) == "banjo");
++    CHECK(slot_pack(text, 4) == "");
++    CHECK_EQ(pack_slot(text + "off banjo\n", "banjo"), 0);   // turned off
++    CHECK(slot_pack(text + "off banjo\n", 2) == "");
++    CHECK_EQ(pack_slot("snake slot 5\nsnake slot 0\nsnake slot\n", "snake"), 0);   // not slots 1-4
++    CHECK_EQ(pack_slot("snake slot 01\n", "snake"), 1);   // numbers as the mod reads them
++    CHECK_EQ(pack_slot("snake slot 0x2\n", "snake"), 2);
++}
++
++TEST_CASE("a slot's first line decides, even when its pack is off (the mod doesn't look further)") {
++    const std::string text = "a slot 1\nb slot 1\noff a\n";
++    CHECK(slot_pack(text, 1) == "");
++    CHECK_EQ(pack_slot(text, "b"), 0);
++    CHECK_EQ(pack_slot("a slot 1\nb slot 1\n", "b"), 0);   // slot 1 is a's
++    CHECK_EQ(pack_slot("a slot 1\na slot 2\n", "a"), 1);
++}
++
++TEST_CASE("assigning a slot moves the pack and takes the slot from the other pack") {
++    const std::string text = "# keep me\nsnake slot 1\nbanjo slot 2\ncesium wrestler 0x0302 costume 0\n";
++    const std::string moved = assign(text, "snake", 2);
++    CHECK(moved == "# keep me\nsnake slot 2\ncesium wrestler 0x0302 costume 0\n");   // where the old line was
++    CHECK_EQ(pack_slot(moved, "snake"), 2);
++    CHECK_EQ(pack_slot(moved, "banjo"), 0);
++    CHECK(slot_pack(moved, 1) == "");
++}
++
++TEST_CASE("off clears only the pack's slot lines") {
++    const std::string text = "snake slot 1\nsnake wrestler 0x0302\nbanjo slot 2\n";
++    CHECK(assign(text, "snake", 0) == "snake wrestler 0x0302\nbanjo slot 2\n");
++    CHECK(assign("", "snake", 0) == "");
++}
++
++TEST_CASE("a pack turned off with an off line comes back on when given a slot") {
++    const std::string text = "snake slot 1\noff snake\n";
++    const std::string on = assign(text, "snake", 3);
++    CHECK(on == "snake slot 3\n");
++    CHECK_EQ(pack_slot(on, "snake"), 3);
++    CHECK(assign(text, "snake", 0) == "off snake\n");   // Off leaves the off line
++}
++
++TEST_CASE("an empty or new file, a BOM, CR line ends and a missing last line end") {
++    CHECK(assign("", "snake", 1) == "snake slot 1\n");
++    CHECK(assign("\xEF\xBB\xBFsnake slot 1", "banjo", 2) == "snake slot 1\nbanjo slot 2\n");
++    CHECK(assign("a slot 1\rb slot 2\r", "c", 1) == "c slot 1\nb slot 2\n");
++    CHECK(assign("snake slot 01\nx wrestler 3\n", "banjo", 1) == "banjo slot 1\nx wrestler 3\n");   // 01 is slot 1
++}
++
++TEST_CASE("pack.json fields, with the id as the fallback name") {
++    const Pack p = parse_pack_json("snake", R"({"schema": 1, "name": "Solid Snake", "author": "someone", "game": "nomercy"})");
++    CHECK(p.id == "snake");
++    CHECK(p.name == "Solid Snake");
++    CHECK(p.author == "someone");
++    CHECK(p.game == "nomercy");
++    CHECK(parse_pack_json("banjo", "").name == "banjo");
++    CHECK(parse_pack_json("banjo", "{not json").name == "banjo");
++    CHECK(parse_pack_json("banjo", R"({"name": 5})").name == "banjo");
++}
++
++TEST_CASE("rows sort by name and say when models.txt does more than the dialog shows") {
++    const std::vector<Pack> packs = { { "zed", "Zed", "", "" }, { "banjo", "Banjo", "", "" }, { "snake", "Solid Snake", "", "" } };
++    const std::string text = "snake slot 1\nbanjo wrestler 0x0003\noff zed\n";
++    const std::vector<Row> r = rows(packs, text);
++    CHECK_EQ(r.size(), size_t(3));
++    CHECK(r[0].pack.id == "banjo");
++    CHECK(r[1].pack.id == "snake");
++    CHECK(r[2].pack.id == "zed");
++    CHECK_EQ(r[1].slot, 1);
++    CHECK(r[0].note == "Also replaces wrestlers by id (models.txt)");
++    CHECK(r[1].note == "");
++    CHECK(r[2].note == "Off in models.txt");
 +}
 diff --git a/recompui/tests/radio_rules_tests.cpp b/recompui/tests/radio_rules_tests.cpp
 new file mode 100644

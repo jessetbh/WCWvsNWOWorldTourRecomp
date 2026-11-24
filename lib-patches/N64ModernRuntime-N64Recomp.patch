@@ -1,8 +1,348 @@
+diff --git a/LiveRecomp/live_generator.cpp b/LiveRecomp/live_generator.cpp
+index 61e1ff5..d5fcae5 100644
+--- a/LiveRecomp/live_generator.cpp
++++ b/LiveRecomp/live_generator.cpp
+@@ -1,4 +1,5 @@
+ #include <cassert>
++#include <cstdio>
+ #include <fstream>
+ #include <unordered_map>
+ #include <cmath>
+@@ -7,6 +8,7 @@
+ #include "fmt/ostream.h"
+ 
+ #include "recompiler/live_recompiler.h"
++#include "recompiler/constant_ra.h"
+ #include "recomp.h"
+ 
+ #include "sljitLir.h"
+@@ -49,6 +51,8 @@ struct SwitchErrorJump {
+     uint32_t instr_vram;
+     uint32_t jtbl_vram;
+     sljit_jump* jump;
++    // [wcw fullconv] The function the switch is in (a whole batch's error jumps are emitted in finish()).
++    std::string function_name;
+ };
+ 
+ struct N64Recomp::LiveGeneratorContext {
+@@ -87,6 +91,7 @@ N64Recomp::LiveGenerator::~LiveGenerator() {
+ N64Recomp::LiveGeneratorOutput N64Recomp::LiveGenerator::finish() {
+     LiveGeneratorOutput ret{};
+     if (errored) {
++        fprintf(stderr, "[live recompiler] not generated: an instruction couldn't be emitted (see the function named above)\n");
+         ret.good = false;
+         return ret;
+     }
+@@ -99,6 +104,8 @@ N64Recomp::LiveGeneratorOutput N64Recomp::LiveGenerator::finish() {
+ 
+         // Generation isn't valid if the target function wasn't recompiled.
+         if (target_func_label == nullptr) {
++            fprintf(stderr, "[live recompiler] not generated: a call targets function #%zu of this batch, which wasn't recompiled\n",
++                call.target_func_index);
+             return { };
+         }
+ 
+@@ -107,11 +114,19 @@ N64Recomp::LiveGeneratorOutput N64Recomp::LiveGenerator::finish() {
+ 
+     // Generate the switch error jump targets and assign the jump labels.
+     if (!context->switch_error_jumps.empty()) {
+-        // Allocate the function name and place it in the literals.
+-        char* func_name = new char[context->function_name.size() + 1];
+-        memcpy(func_name, context->function_name.c_str(), context->function_name.size());
+-        func_name[context->function_name.size()] = '\x00';
+-        ret.string_literals.emplace_back(func_name);
++        // Allocate each function name once and place it in the literals.
++        // [wcw fullconv] Per jump: context->function_name is the batch's last function by now, so every
++        // switch error named that one (aki-roadmap#123).
++        std::unordered_map<std::string, char*> func_names{};
++        auto func_name_of = [&](const std::string& name) {
++            auto [it, added] = func_names.emplace(name, nullptr);
++            if (added) {
++                it->second = new char[name.size() + 1];
++                memcpy(it->second, name.c_str(), name.size() + 1);
++                ret.string_literals.emplace_back(it->second);
++            }
++            return it->second;
++        };
+ 
+         std::vector<sljit_jump*> switch_error_return_jumps{};
+         switch_error_return_jumps.resize(context->switch_error_jumps.size());
+@@ -124,7 +139,7 @@ N64Recomp::LiveGeneratorOutput N64Recomp::LiveGenerator::finish() {
+             sljit_set_label(cur_error_jump.jump, sljit_emit_label(compiler));
+ 
+             // Load the arguments (function name, vram, jump table address)
+-            sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R0, 0, SLJIT_IMM, sljit_sw(func_name));
++            sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R0, 0, SLJIT_IMM, sljit_sw(func_name_of(cur_error_jump.function_name)));
+             sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R1, 0, SLJIT_IMM, sljit_sw(cur_error_jump.instr_vram));
+             sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R2, 0, SLJIT_IMM, sljit_sw(cur_error_jump.jtbl_vram));
+             
+@@ -149,6 +164,10 @@ N64Recomp::LiveGeneratorOutput N64Recomp::LiveGenerator::finish() {
+     // Generate the code.
+     ret.code = sljit_generate_code(compiler, 0, NULL);
+     ret.code_size = sljit_get_generated_code_size(compiler);
++    if (ret.code == nullptr) {
++        fprintf(stderr, "[live recompiler] not generated: sljit_generate_code failed (error %d)\n", sljit_get_compiler_error(compiler));
++        ret.good = false;
++    }
+     ret.functions.resize(context->func_labels.size());
+ 
+     // Get the function addresses.
+@@ -1303,11 +1322,22 @@ void N64Recomp::LiveGenerator::process_store_op(const StoreOp& op, const Instruc
+     }
+ }
+ 
++// [wcw fullconv] A tail call returns from this function itself (SLJIT_CALL_RETURN), unless its return is hooked.
++int N64Recomp::LiveGenerator::call_type() const {
++    if (tail_call && inputs.return_func_hooks.find(cur_func_index) == inputs.return_func_hooks.end()) {
++        return SLJIT_CALL | SLJIT_CALL_RETURN;
++    }
++    return SLJIT_CALL;
++}
++
+ void N64Recomp::LiveGenerator::emit_function_start(const std::string& function_name, size_t func_index) const {
+     context->function_name = function_name;
++    cur_func_index = func_index;
++    tail_call = false;
+     context->func_labels[func_index] = sljit_emit_label(compiler);
+     // sljit_emit_op0(compiler, SLJIT_BREAKPOINT);
+-    sljit_emit_enter(compiler, 0, SLJIT_ARGS2V(P, P), 4 | SLJIT_ENTER_FLOAT(1), 5 | SLJIT_ENTER_FLOAT(0), 0);
++    // [wcw fullconv] one local word: sp saved around calls (emit_save_sp)
++    sljit_emit_enter(compiler, 0, SLJIT_ARGS2V(P, P), 4 | SLJIT_ENTER_FLOAT(1), 5 | SLJIT_ENTER_FLOAT(0), sizeof(sljit_sw));
+     sljit_emit_op2(compiler, SLJIT_SUB, Registers::rdram, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
+     
+     // Check if this function's entry is hooked and emit the hook call if so.
+@@ -1325,6 +1355,10 @@ void N64Recomp::LiveGenerator::emit_function_start(const std::string& function_n
+ void N64Recomp::LiveGenerator::emit_function_end() const {
+     // Check that all jumps have been paired to a label.
+     if (!context->pending_jumps.empty()) {
++        // [wcw fullconv] say which labels were jumped to but never placed
++        for (const auto& [label, jumps] : context->pending_jumps) {
++            fprintf(stderr, "[live recompiler] jump to label %s, which the function never placed\n", label.c_str());
++        }
+         assert(false);
+         errored = true;
+     }
+@@ -1338,7 +1372,17 @@ void N64Recomp::LiveGenerator::emit_function_end() const {
+         for (size_t case_index = 0; case_index < cur_labels.size(); case_index++) {
+             // Find the label.
+             auto find_it = context->labels.find(cur_labels[case_index]);
++            // [wcw fullconv] A case outside the function (see Context::external_code_ranges): emit a
++            // stub after the function body that tail-calls the target through the lookup.
++            if (find_it == context->labels.end() && (cur_labels[case_index].starts_with("L_") || cur_labels[case_index].starts_with("X_"))) {
++                uint32_t target = (uint32_t)std::stoul(cur_labels[case_index].substr(2), nullptr, 16);
++                sljit_label* stub = sljit_emit_label(compiler);
++                emit_function_call_lookup(target);
++                sljit_emit_return_void(compiler);
++                find_it = context->labels.emplace(cur_labels[case_index], stub).first;
++            }
+             if (find_it == context->labels.end()) {
++                fprintf(stderr, "[live recompiler] switch %zu: case label %s not found\n", switch_index, cur_labels[case_index].c_str());
+                 // Label not found, invalid switch.
+                 // Track this in a variable instead of returning immediately so that the pending labels are still cleared.
+                 invalid_switch = true;
+@@ -1365,6 +1409,113 @@ void N64Recomp::LiveGenerator::emit_function_end() const {
+     }
+ }
+ 
++void N64Recomp::LiveGenerator::emit_save_sp() const {
++    sljit_emit_op1(compiler, SLJIT_MOV, Registers::arithmetic_temp1, 0, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(29));
++    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), 0, Registers::arithmetic_temp1, 0);
++}
++
++// [wcw fullconv] Tokens standing for a copy of ra in hack code: 0x7F000000 | slot (a TLB address no game here maps),
++// the slot holding the host frame of the function that made the copy.
++static constexpr uint32_t ra_token_base = 0x7F000000;
++static thread_local void* ra_token_frames[4096];
++static thread_local uint32_t ra_token_next = 0;
++
++static int32_t make_ra_token(void* frame) {
++    uint32_t slot = ra_token_next++ & 4095;
++    ra_token_frames[slot] = frame;
++    return int32_t(ra_token_base | slot);
++}
++
++// A jump to a token: unwind to the frame that made it (none when it's this one) and return.
++static int32_t check_ra_token(uint32_t value, void* frame, recomp_context* ctx) {
++    if ((value & 0xFFFFF000) != ra_token_base) {
++        return 0;
++    }
++    void* target = ra_token_frames[value & 4095];
++    ctx->unwind_frame = target == frame ? nullptr : target;
++    return 1;
++}
++
++// [wcw fullconv] A constant return address a hack built in $ra (constant_ra.h), per game thread.
++static thread_local N64Recomp::ConstantRa constant_ra_state{};
++
++// value: the constant the instructions build (a branch landing on the addiu with another $ra notes nothing)
++static void note_constant_ra_at(recomp_context* ctx, void* frame, uint32_t value) {
++    if (uint32_t(ctx->r31) == value) {
++        N64Recomp::note_constant_ra(constant_ra_state, value, reinterpret_cast<uintptr_t>(frame));
++    }
++}
++
++// The function a jr $ra to the noted constant jumps to, or null for a plain return (no note, another frame, $ra
++// changed, or nothing there: find_function doesn't end the game on an address it can't resolve).
++static recomp_func_t* take_constant_ra_at(recomp_context* ctx, void* frame, recomp_func_t* (*find_function)(int32_t)) {
++    if (!N64Recomp::take_constant_ra(constant_ra_state, uint32_t(ctx->r31), reinterpret_cast<uintptr_t>(frame))) {
++        return nullptr;
++    }
++    recomp_func_t* func = find_function != nullptr ? find_function(int32_t(ctx->r31)) : nullptr;
++    if (func == nullptr) {
++        fprintf(stderr, "[live recompiler] jr $ra to constant 0x%08X: nothing there, returning instead\n", uint32_t(ctx->r31));
++    }
++    return func;
++}
++
++void N64Recomp::LiveGenerator::emit_note_constant_ra(uint32_t value) const {
++    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R0, 0, Registers::ctx, 0);
++    sljit_get_local_base(compiler, SLJIT_R1, 0, 0);
++    sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R2, 0, SLJIT_IMM, int32_t(value));
++    sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS3V(P, P, 32), SLJIT_IMM, sljit_sw(note_constant_ra_at));
++}
++
++void N64Recomp::LiveGenerator::emit_tail_call_if_constant_ra(const Context& context, size_t func_index) const {
++    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R0, 0, Registers::ctx, 0);
++    sljit_get_local_base(compiler, SLJIT_R1, 0, 0);
++    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R2, 0, SLJIT_IMM, sljit_sw(inputs.find_function));
++    sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS3(P, P, P, P), SLJIT_IMM, sljit_sw(take_constant_ra_at));
++    sljit_jump* plain = sljit_emit_cmp(compiler, SLJIT_EQUAL, SLJIT_RETURN_REG, 0, SLJIT_IMM, 0);
++    // jr $ra to the constant: the N64 jumps there (a tail call), then this function is done
++    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R3, 0, SLJIT_RETURN_REG, 0);
++    sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R0, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
++    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
++    set_tail_call(true);
++    sljit_emit_icall(compiler, call_type(), SLJIT_ARGS2V(P, P), SLJIT_R3, 0);
++    set_tail_call(false);
++    emit_return(context, func_index);
++    sljit_set_label(plain, sljit_emit_label(compiler));
++}
++
++void N64Recomp::LiveGenerator::emit_return_if_sp_changed(const Context& context, size_t func_index) const {
++    sljit_emit_op1(compiler, SLJIT_MOV, Registers::arithmetic_temp1, 0, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(29));
++    sljit_jump* same = sljit_emit_cmp(compiler, SLJIT_EQUAL, Registers::arithmetic_temp1, 0, SLJIT_MEM1(SLJIT_SP), 0);
++    emit_return(context, func_index);
++    sljit_set_label(same, sljit_emit_label(compiler));
++    // a non-local return through a ra token is under way: return; the frame it names stops it
++    sljit_emit_op1(compiler, SLJIT_MOV_P, Registers::arithmetic_temp1, 0, SLJIT_MEM1(Registers::ctx), offsetof(recomp_context, unwind_frame));
++    sljit_jump* none = sljit_emit_cmp(compiler, SLJIT_EQUAL, Registers::arithmetic_temp1, 0, SLJIT_IMM, 0);
++    sljit_get_local_base(compiler, Registers::arithmetic_temp2, 0, 0);
++    sljit_jump* other = sljit_emit_cmp(compiler, SLJIT_NOT_EQUAL, Registers::arithmetic_temp1, 0, Registers::arithmetic_temp2, 0);
++    sljit_emit_op1(compiler, SLJIT_MOV_P, SLJIT_MEM1(Registers::ctx), offsetof(recomp_context, unwind_frame), SLJIT_IMM, 0);
++    sljit_set_label(other, sljit_emit_label(compiler));
++    emit_return(context, func_index);
++    sljit_set_label(none, sljit_emit_label(compiler));
++}
++
++void N64Recomp::LiveGenerator::emit_ra_token(int reg) const {
++    sljit_get_local_base(compiler, SLJIT_R0, 0, 0);
++    sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS1(32, P), SLJIT_IMM, sljit_sw(make_ra_token));
++    sljit_emit_op1(compiler, SLJIT_MOV_S32, SLJIT_R1, 0, SLJIT_RETURN_REG, 0);
++    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(reg), SLJIT_R1, 0);
++}
++
++void N64Recomp::LiveGenerator::emit_return_if_ra_token(int reg, const Context& context, size_t func_index) const {
++    sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(reg));
++    sljit_get_local_base(compiler, SLJIT_R1, 0, 0);
++    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R2, 0, Registers::ctx, 0);
++    sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS3(32, 32, P, P), SLJIT_IMM, sljit_sw(check_ra_token));
++    sljit_jump* plain = sljit_emit_cmp(compiler, SLJIT_EQUAL, SLJIT_RETURN_REG, 0, SLJIT_IMM, 0);
++    emit_return(context, func_index);
++    sljit_set_label(plain, sljit_emit_label(compiler));
++}
++
+ void N64Recomp::LiveGenerator::emit_function_call_lookup(uint32_t addr) const {
+     // Load the address immediate into the first argument. 
+     sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, int32_t(addr));
+@@ -1380,7 +1531,7 @@ void N64Recomp::LiveGenerator::emit_function_call_lookup(uint32_t addr) const {
+     sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
+ 
+     // Call the function.
+-    sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS2V(P, P), SLJIT_R3, 0);
++    sljit_emit_icall(compiler, call_type(), SLJIT_ARGS2V(P, P), SLJIT_R3, 0);
+ }
+ 
+ void N64Recomp::LiveGenerator::emit_function_call_by_register(int reg) const {
+@@ -1398,7 +1549,7 @@ void N64Recomp::LiveGenerator::emit_function_call_by_register(int reg) const {
+     sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
+ 
+     // Call the function.
+-    sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS2V(P, P), SLJIT_R3, 0);
++    sljit_emit_icall(compiler, call_type(), SLJIT_ARGS2V(P, P), SLJIT_R3, 0);
+ }
+ 
+ void N64Recomp::LiveGenerator::emit_function_call_reference_symbol(const Context&, uint16_t section_index, size_t symbol_index, uint32_t target_section_offset) const {
+@@ -1432,7 +1583,7 @@ void N64Recomp::LiveGenerator::emit_function_call(const Context&, size_t functio
+     sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R0, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
+     sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
+     // Call the function and save the jump to set its label later on.
+-    sljit_jump* call_jump = sljit_emit_call(compiler, SLJIT_CALL, SLJIT_ARGS2V(P, P));
++    sljit_jump* call_jump = sljit_emit_call(compiler, call_type(), SLJIT_ARGS2V(P, P));
+     context->inner_calls.emplace_back(InnerCall{ .target_func_index = function_index, .jump = call_jump });
+ }
+ 
+@@ -1590,8 +1741,15 @@ void N64Recomp::LiveGenerator::emit_switch(const Context& recompiler_context, co
+     // Populate the switch's labels.
+     std::vector<std::string> cur_labels{};
+     cur_labels.resize(jtbl.entries.size());
++    // [wcw fullconv] A case outside the function is named X_ so it always gets the lookup stub in
++    // emit_function_end: an L_ label of the same address (a branch out of the function) may have been placed
++    // at the function's start, and the case would re-enter the function (aki-roadmap#123).
++    const Function& func = recompiler_context.functions[cur_func_index];
++    const uint32_t func_end = func.vram + (uint32_t)(func.words.size() * sizeof(func.words[0]));
+     for (size_t i = 0; i < cur_labels.size(); i++) {
+-        cur_labels[i] = fmt::format("L_{:08X}", jtbl.entries[i]);
++        const bool outside = recompiler_context.tail_call_unknown_jumps_by_lookup &&
++            (jtbl.entries[i] < func.vram || jtbl.entries[i] >= func_end);
++        cur_labels[i] = fmt::format("{}_{:08X}", outside ? "X" : "L", jtbl.entries[i]);
+     }
+     context->switch_jump_labels.emplace_back(std::move(cur_labels));
+ 
+@@ -1633,7 +1791,8 @@ void N64Recomp::LiveGenerator::emit_switch(const Context& recompiler_context, co
+     
+     // Bounds check the addend. If it's greater than or equal to the jump table size (entries * sizeof(u32)) then jump to the switch error.
+     sljit_jump* switch_error_jump = sljit_emit_cmp(compiler, SLJIT_GREATER_EQUAL, Registers::arithmetic_temp1, 0, SLJIT_IMM, jtbl.entries.size() * sizeof(uint32_t));
+-    context->switch_error_jumps.emplace_back(SwitchErrorJump{.instr_vram = jtbl.jr_vram, .jtbl_vram = jtbl.vram, .jump = switch_error_jump});
++    context->switch_error_jumps.emplace_back(SwitchErrorJump{.instr_vram = jtbl.jr_vram, .jtbl_vram = jtbl.vram, .jump = switch_error_jump,
++        .function_name = context->function_name});
+ 
+     // Multiply the jump table addend by 2 to get the addend for the real jump table. (4 bytes per entry to 8 bytes per entry).
+     sljit_emit_op2(compiler, SLJIT_ADD, Registers::arithmetic_temp1, 0, Registers::arithmetic_temp1, 0, Registers::arithmetic_temp1, 0);
+@@ -1691,6 +1850,20 @@ void N64Recomp::LiveGenerator::emit_check_nan(int fpr, bool is_double) const {
+     // Nothing to do here.
+ }
+ 
++// [wcw fullconv] COP0 Random: a cheap pseudo-random value in the register's range (0-31).
++static int64_t live_cop0_random_read() {
++    static uint32_t state = 0x2545F491u;
++    state = state * 1664525u + 1013904223u;
++    return (int64_t)(int32_t)((state >> 16) & 31);
++}
++
++void N64Recomp::LiveGenerator::emit_cop0_random_read(int reg) const {
++    if (reg != 0) {
++        sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS0(W), SLJIT_IMM, sljit_sw(live_cop0_random_read));
++        sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(reg), SLJIT_RETURN_REG, 0);
++    }
++}
++
+ void N64Recomp::LiveGenerator::emit_cop0_status_read(int reg) const {
+     // Skip the read if the target is the zero register.
+     if (reg != 0) {
 diff --git a/include/recomp.h b/include/recomp.h
-index 73f3e73..85578a2 100644
+index 73f3e73..959b0e4 100644
 --- a/include/recomp.h
 +++ b/include/recomp.h
-@@ -468,6 +468,12 @@ void recomp_syscall_handler(uint8_t* rdram, recomp_context* ctx, int32_t instruc
+@@ -424,6 +424,8 @@ typedef struct {
+     uint32_t* f_odd;
+     uint32_t status_reg;
+     uint8_t mips3_float_mode;
++    // [wcw fullconv] live-recompiled hack code: the host frame a non-local return through a copy of ra unwinds to
++    void* unwind_frame;
+ } recomp_context;
+ 
+ // Checks if the target is an even float register or that mips3 float mode is enabled
+@@ -468,6 +470,12 @@ void recomp_syscall_handler(uint8_t* rdram, recomp_context* ctx, int32_t instruc
  
  void pause_self(uint8_t *rdram);
  
@@ -15,3 +355,813 @@ index 73f3e73..85578a2 100644
  #ifdef __cplusplus
  }
  #endif
+diff --git a/include/recompiler/constant_ra.h b/include/recompiler/constant_ra.h
+new file mode 100644
+index 0000000..5f683ee
+--- /dev/null
++++ b/include/recompiler/constant_ra.h
+@@ -0,0 +1,77 @@
++#ifndef __RECOMP_CONSTANT_RA_H__
++#define __RECOMP_CONSTANT_RA_H__
++
++#include <cstdint>
++
++namespace N64Recomp {
++    // [wcw fullconv] A hack's "fake return address": `lui $ra, %hi(T)` + `addiu/ori $ra, $ra, %lo(T)`, then a `jr $ra`
++    // that on the N64 jumps to T (the middle of a stock function, whose own epilogue then returns). The live
++    // recompiler compiles every `jr $ra` as a host return, which instead went back into the function that jumped to
++    // the hook, and that function then returned without its epilogue: its frame stayed on the stack and the caller got
++    // garbage callee-saved registers (No Mercy Plus V3, Jericho's entrance: payload 0x804715EC sets ra = 0x8010F8FC
++    // and its jr ra at 0x80471634 returns into ovl_b 0x8010F794; the main loop's s2 came back 0 and the game crashed).
++    //
++    // The compiled code notes T when it builds it (constant_ra_pair at compile time, note_constant_ra at run time,
++    // only when $ra really holds T then), with the host frame of the function that built it. A `jr $ra` in that same
++    // frame takes the note (take_constant_ra): with $ra still T it is a jump to T (a tail call through the lookup),
++    // otherwise a plain return; either way the note is gone. Tail calls keep the frame (the live generator compiles
++    // them as SLJIT_CALL_RETURN, and every compiled function has the same frame size), so the hack's `j` from the
++    // function that built T to the one that does the jr ra still matches. Calls (jal) don't write $ra here, so a
++    // jr ra in a function called from there (a deeper frame) still sees T: it is a real return and leaves the note
++    // alone. A jr ra in a shallower frame means the frame that built T has returned without its jr ra: the note is
++    // dropped, so it can't redirect a later, unrelated return.
++
++    // prev, cur: two consecutive instruction words (host order). True, with the value, when prev is `lui $ra, hi`
++    // and cur is `addiu $ra, $ra, lo` or `ori $ra, $ra, lo` building a KSEG0 code address.
++    inline bool constant_ra_pair(uint32_t prev, uint32_t cur, uint32_t& value) {
++        constexpr uint32_t ra = 31;
++        if ((prev >> 26) != 0x0F || ((prev >> 16) & 31) != ra || ((prev >> 21) & 31) != 0) {
++            return false;
++        }
++        const uint32_t op = cur >> 26, rs = (cur >> 21) & 31, rt = (cur >> 16) & 31, imm = cur & 0xFFFF;
++        if (rs != ra || rt != ra) {
++            return false;
++        }
++        const uint32_t hi = (prev & 0xFFFF) << 16;
++        uint32_t v;
++        if (op == 0x09) {           // addiu
++            v = hi + (uint32_t)(int32_t)(int16_t)imm;
++        }
++        else if (op == 0x0D) {      // ori
++            v = hi | imm;
++        }
++        else {
++            return false;
++        }
++        if (v < 0x80000000u || v >= 0x80800000u || (v & 3) != 0) {
++            return false;
++        }
++        value = v;
++        return true;
++    }
++
++    struct ConstantRa {
++        uint32_t value = 0;
++        uintptr_t frame = 0;   // host frame (the live function's local base) that built it
++        bool armed = false;
++    };
++
++    inline void note_constant_ra(ConstantRa& s, uint32_t ra, uintptr_t frame) {
++        s.value = ra;
++        s.frame = frame;
++        s.armed = true;
++    }
++
++    // At a `jr $ra` (ra: its low 32 bits; frame: the host frame running it; the stack grows down): true when it
++    // jumps to the noted constant.
++    inline bool take_constant_ra(ConstantRa& s, uint32_t ra, uintptr_t frame) {
++        if (!s.armed || frame < s.frame) {
++            return false;       // nothing noted, or a function called from the noting one returning: a real return
++        }
++        const bool hit = frame == s.frame && s.value == ra;
++        s.armed = false;
++        return hit;
++    }
++}
++
++#endif
+diff --git a/include/recompiler/context.h b/include/recompiler/context.h
+index e7b4431..d986139 100644
+--- a/include/recompiler/context.h
++++ b/include/recompiler/context.h
+@@ -1,6 +1,7 @@
+ #ifndef __RECOMP_PORT__
+ #define __RECOMP_PORT__
+ 
++#include <array>
+ #include <span>
+ #include <string_view>
+ #include <cstdint>
+@@ -235,6 +236,17 @@ namespace N64Recomp {
+         bool skip_validating_reference_symbols = true;
+         // Whether all function calls (excluding reference symbols) should go through lookup.
+         bool use_lookup_for_all_function_calls = false;
++        // [wcw fullconv] Treat a jump out of the function to an unknown address as a tail call
++        // through the function lookup (code a ROM hack added or moved is registered at run time).
++        // Live recompiler only: jump-table cases outside the function become lookup stubs there, which the
++        // C generator doesn't emit.
++        bool tail_call_unknown_jumps_by_lookup = false;
++        // [wcw fullconv] Code ranges outside the context (a hack's added code): jump-table entries
++        // pointing there are kept and become tail calls through the function lookup.
++        std::vector<std::pair<uint32_t, uint32_t>> external_code_ranges;
++        // [wcw fullconv] Where jump tables live in the ROM when it isn't next to the function's own
++        // code (code compiled from a copy): {vram start, vram end, rom of vram start}.
++        std::vector<std::array<uint32_t, 3>> jump_table_data_ranges;
+ 
+         //// Only used by the CLI, TODO move this to a struct in the internal headers.
+         // A mapping of function name to index in the functions vector
+diff --git a/include/recompiler/generator.h b/include/recompiler/generator.h
+index 145bcd0..a95c4a8 100644
+--- a/include/recompiler/generator.h
++++ b/include/recompiler/generator.h
+@@ -27,6 +27,24 @@ namespace N64Recomp {
+ 
+     class Generator {
+     public:
++        // [wcw fullconv] An emit failed (the live generator); lets the recompiler name the instruction.
++        virtual bool has_errored() const { return false; }
++        // [wcw fullconv] Hack code: a callee that pops its caller's frame (a non-local return, Giant Series 64's
++        // decompressor subroutines branch into its epilogue) returned to the caller's caller on the hardware. Around
++        // a call: save sp, and return too when the callee changed it. Only the live generator emits these.
++        virtual void emit_save_sp() const {}
++        virtual void emit_return_if_sp_changed(const Context& context, size_t func_index) const { (void)context; (void)func_index; }
++        // ...and through a copy of ra (VPW64 Deluxe's decompressor: `move t9, ra` on entry, `jr t9` from another
++        // function's code): the copy is a token naming this frame; a jump to a token returns to that frame's caller.
++        virtual void emit_ra_token(int reg) const { (void)reg; }
++        // The calls emitted until set_tail_call(false) are tail calls (the function returns right after): the live
++        // generator makes them real ones, so code looping through jumps between functions doesn't grow the stack.
++        virtual void set_tail_call(bool tail) const { (void)tail; }
++        virtual void emit_return_if_ra_token(int reg, const Context& context, size_t func_index) const { (void)reg; (void)context; (void)func_index; }
++        // [wcw fullconv] A hack built a constant return address in $ra (constant_ra.h): note it for the next jr $ra.
++        virtual void emit_note_constant_ra(uint32_t value) const { (void)value; }
++        // [wcw fullconv] At a jr $ra: when $ra is still the noted constant, tail call it and return (constant_ra.h).
++        virtual void emit_tail_call_if_constant_ra(const Context& context, size_t func_index) const { (void)context; (void)func_index; }
+         virtual void process_binary_op(const BinaryOp& op, const InstructionContext& ctx) const = 0;
+         virtual void process_unary_op(const UnaryOp& op, const InstructionContext& ctx) const = 0;
+         virtual void process_store_op(const StoreOp& op, const InstructionContext& ctx) const = 0;
+@@ -52,6 +70,8 @@ namespace N64Recomp {
+         virtual void emit_check_fr(int fpr) const = 0;
+         virtual void emit_check_nan(int fpr, bool is_double) const = 0;
+         virtual void emit_cop0_status_read(int reg) const = 0;
++        // [wcw fullconv] COP0 Random (ROM hacks use it as a cheap random number).
++        virtual void emit_cop0_random_read(int reg) const = 0;
+         virtual void emit_cop0_status_write(int reg) const = 0;
+         virtual void emit_cop1_cs_read(int reg) const = 0;
+         virtual void emit_cop1_cs_write(int reg) const = 0;
+@@ -89,6 +109,7 @@ namespace N64Recomp {
+         void emit_check_fr(int fpr) const final;
+         void emit_check_nan(int fpr, bool is_double) const final;
+         void emit_cop0_status_read(int reg) const final;
++        void emit_cop0_random_read(int reg) const final;
+         void emit_cop0_status_write(int reg) const final;
+         void emit_cop1_cs_read(int reg) const final;
+         void emit_cop1_cs_write(int reg) const final;
+@@ -98,6 +119,13 @@ namespace N64Recomp {
+         void emit_pause_self() const final;
+         void emit_trigger_event(uint32_t event_index) const final;
+         void emit_comment(const std::string& comment) const final;
++        void emit_save_sp() const final {}
++        void emit_return_if_sp_changed(const Context&, size_t) const final {}
++        void emit_ra_token(int) const final {}
++        void set_tail_call(bool) const final {}
++        void emit_return_if_ra_token(int, const Context&, size_t) const final {}
++        void emit_note_constant_ra(uint32_t) const final {}
++        void emit_tail_call_if_constant_ra(const Context&, size_t) const final {}
+     private:
+         void get_operand_string(Operand operand, UnaryOpType operation, const InstructionContext& context, std::string& operand_string) const;
+         void get_binary_expr_string(BinaryOpType type, const BinaryOperands& operands, const InstructionContext& ctx, const std::string& output, std::string& expr_string) const;
+diff --git a/include/recompiler/jump_table_bound.h b/include/recompiler/jump_table_bound.h
+new file mode 100644
+index 0000000..09ff44c
+--- /dev/null
++++ b/include/recompiler/jump_table_bound.h
+@@ -0,0 +1,70 @@
++#ifndef __RECOMPILER_JUMP_TABLE_BOUND_H__
++#define __RECOMPILER_JUMP_TABLE_BOUND_H__
++
++#include <cstddef>
++#include <cstdint>
++#include <optional>
++
++namespace N64Recomp {
++    // [wcw fullconv] The case count a switch's own bounds check allows: `sltiu rT, rI, N` before the
++    // `sll addend, rI, 2` that scales the index added to the table address. Searched backwards from that addu, a few
++    // instructions at most (the compiler keeps them together); nullopt when the pattern isn't there or a register in it is
++    // written in between.
++    // `rom_words` holds the function as Function::words does: in ROM byte order on a little-endian host, which is why
++    // every word is swapped here (aki-roadmap#206: reading them unswapped never found a bound).
++    inline std::optional<uint32_t> find_jump_table_bound(const uint32_t* rom_words, size_t word_count, size_t addu_index, uint32_t addend_reg) {
++        constexpr uint32_t max_back = 16;
++        if (addu_index >= word_count) {
++            return std::nullopt;
++        }
++        auto word_at = [rom_words](size_t index) {
++            const uint32_t w = rom_words[index];
++            return (w >> 24) | ((w >> 8) & 0xFF00) | ((w << 8) & 0xFF0000) | (w << 24);
++        };
++        auto op = [](uint32_t w) { return w >> 26; };
++        auto rs = [](uint32_t w) { return (w >> 21) & 31; };
++        auto rt = [](uint32_t w) { return (w >> 16) & 31; };
++        auto rd = [](uint32_t w) { return (w >> 11) & 31; };
++        auto sa = [](uint32_t w) { return (w >> 6) & 31; };
++        auto funct = [](uint32_t w) { return w & 0x3F; };
++        // the GPR an instruction writes, if any (enough to see a register reused between the guard and the addu)
++        auto written = [&](uint32_t w) -> uint32_t {
++            const uint32_t o = op(w);
++            if (o == 0) {
++                const uint32_t f = funct(w);
++                return (f == 0x08 || f == 0x0C || f == 0x0D || f == 0x0F || (f >= 0x18 && f <= 0x1F) || f == 0x11 || f == 0x13) ? 0 : rd(w);
++            }
++            if (o == 0x03) {
++                return 31;
++            }
++            return ((o >= 0x08 && o <= 0x0F) || (o >= 0x18 && o <= 0x1B) || (o >= 0x20 && o <= 0x27) || o == 0x37) ? rt(w) : 0;
++        };
++        for (size_t i = addu_index; i-- > 0 && addu_index - i <= max_back;) {
++            const uint32_t w = word_at(i);
++            if (written(w) != addend_reg) {
++                continue;
++            }
++            if (!(op(w) == 0 && funct(w) == 0 && sa(w) == 2 && rt(w) != 0)) {
++                return std::nullopt;
++            }
++            const uint32_t index_reg = rt(w);
++            for (size_t j = i; j-- > 0 && i - j <= max_back;) {
++                const uint32_t v = word_at(j);
++                if (op(v) == 0x0B && rs(v) == index_reg) {
++                    const uint32_t bound = v & 0xFFFF;
++                    if (bound == 0 || bound > 0x1000) {
++                        return std::nullopt;
++                    }
++                    return bound;
++                }
++                if (written(v) == index_reg) {
++                    return std::nullopt;
++                }
++            }
++            return std::nullopt;
++        }
++        return std::nullopt;
++    }
++}
++
++#endif
+diff --git a/include/recompiler/live_recompiler.h b/include/recompiler/live_recompiler.h
+index d155b83..c99b4e3 100644
+--- a/include/recompiler/live_recompiler.h
++++ b/include/recompiler/live_recompiler.h
+@@ -86,6 +86,8 @@ namespace N64Recomp {
+         // Maps section index in the generated code to original section index. Used by regenerated
+         // code to relocate using the corresponding original section's address.
+         std::vector<size_t> original_section_indices;
++        // [wcw fullconv] get_function without ending the game on an address it can't resolve (null then); optional.
++        recomp_func_t* (*find_function)(int32_t vram) = nullptr;
+     };
+     class LiveGenerator final : public Generator {
+     public:
+@@ -98,6 +100,15 @@ namespace N64Recomp {
+         LiveGenerator& operator=(LiveGenerator&& rhs) = delete;
+ 
+         LiveGeneratorOutput finish();
++        // [wcw fullconv] An emit failed since the generator was created (the caller can name the function).
++        bool has_errored() const override { return errored; }
++        void emit_save_sp() const override;
++        void emit_return_if_sp_changed(const Context& context, size_t func_index) const override;
++        void emit_ra_token(int reg) const override;
++        void set_tail_call(bool tail) const override { tail_call = tail; }
++        void emit_return_if_ra_token(int reg, const Context& context, size_t func_index) const override;
++        void emit_note_constant_ra(uint32_t value) const override;
++        void emit_tail_call_if_constant_ra(const Context& context, size_t func_index) const override;
+         void process_binary_op(const BinaryOp& op, const InstructionContext& ctx) const final;
+         void process_unary_op(const UnaryOp& op, const InstructionContext& ctx) const final;
+         void process_store_op(const StoreOp& op, const InstructionContext& ctx) const final;
+@@ -121,6 +132,7 @@ namespace N64Recomp {
+         void emit_check_fr(int fpr) const final;
+         void emit_check_nan(int fpr, bool is_double) const final;
+         void emit_cop0_status_read(int reg) const final;
++        void emit_cop0_random_read(int reg) const final;
+         void emit_cop0_status_write(int reg) const final;
+         void emit_cop1_cs_read(int reg) const final;
+         void emit_cop1_cs_write(int reg) const final;
+@@ -140,6 +152,10 @@ namespace N64Recomp {
+         LiveGeneratorInputs inputs;
+         mutable std::unique_ptr<LiveGeneratorContext> context;
+         mutable bool errored;
++        // [wcw fullconv] set_tail_call, and the function being emitted (its return hook rules a real tail call out)
++        mutable bool tail_call = false;
++        mutable size_t cur_func_index = 0;
++        int call_type() const;
+     };
+ 
+     void live_recompiler_init();
+diff --git a/include/recompiler/runs_off_end.h b/include/recompiler/runs_off_end.h
+new file mode 100644
+index 0000000..c858c16
+--- /dev/null
++++ b/include/recompiler/runs_off_end.h
+@@ -0,0 +1,28 @@
++#ifndef __RECOMPILER_RUNS_OFF_END_H__
++#define __RECOMPILER_RUNS_OFF_END_H__
++
++#include <cstddef>
++#include <cstdint>
++
++namespace N64Recomp {
++    // [wcw fullconv] Whether a function's last words let control run off its end. `last` is its last instruction word,
++    // `prev` the one before when there is one; `last_word_is_label`: a branch lands on the last word, which runs on
++    // even after a jump (aki-roadmap#76). Those that do continue at the next address through the lookup. A one-word
++    // function counts too: a hack's hook can return just before a stock function start (aki-roadmap#173: House Party
++    // Mixtape's entry 0x8001E340 before func_8001E344 fell off the generated code into whatever came next).
++    inline bool function_runs_off_end(size_t word_count, uint32_t last, uint32_t prev, bool last_word_is_label) {
++        auto ends_flow = [](uint32_t w) {
++            uint32_t op = w >> 26;
++            if (op == 0x02) return true;                                    // j
++            if (op == 0x00 && (w & 0x3F) == 0x08) return true;              // jr
++            if (op == 0x04 && ((w >> 16) & 0x3FF) == 0) return true;        // b (beq zero, zero)
++            return false;
++        };
++        if (word_count == 0 || ends_flow(last) || last == 0x42000018) {     // not eret either
++            return false;
++        }
++        return word_count == 1 || last_word_is_label || !ends_flow(prev);
++    }
++}
++
++#endif
+diff --git a/src/analysis.cpp b/src/analysis.cpp
+index 9eaaa30..d5d7dc5 100644
+--- a/src/analysis.cpp
++++ b/src/analysis.cpp
+@@ -5,6 +5,7 @@
+ #include "fmt/format.h"
+ 
+ #include "recompiler/context.h"
++#include "recompiler/jump_table_bound.h"
+ #include "analysis.h"
+ 
+ extern "C" const char* RabbitizerRegister_getNameGpr(uint8_t regValue);
+@@ -264,6 +265,15 @@ bool analyze_instruction(const rabbitizer::InstructionCpu& instr, const N64Recom
+     return true;
+ }
+ 
++// [wcw fullconv] The bound of a switch, for Function and JumpTable; see recompiler/jump_table_bound.h.
++static std::optional<uint32_t> jump_table_bound_of(const N64Recomp::Function& func, const N64Recomp::JumpTable& jtbl) {
++    if (jtbl.addu_vram < func.vram) {
++        return std::nullopt;
++    }
++    const size_t addu_index = (jtbl.addu_vram - func.vram) / sizeof(uint32_t);
++    return N64Recomp::find_jump_table_bound(func.words.data(), func.words.size(), addu_index, jtbl.addend_reg);
++}
++
+ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Recomp::Function& func,
+     const std::vector<rabbitizer::InstructionCpu>& instructions, N64Recomp::FunctionStats& stats) {
+     const Section* section = &context.sections[func.section_index];
+@@ -315,13 +325,37 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
+         }
+ 
+         // TODO this assumes that the jump table is in the same section as the function itself
+-        cur_jtbl.rom = cur_jtbl.vram + func.rom - func.vram;
++        // [wcw fullconv] ...unless Context::jump_table_data_ranges says where it is.
++        auto jtbl_rom_of = [&context, &func](uint32_t addr) -> uint32_t {
++            for (const auto& range : context.jump_table_data_ranges) {
++                if (addr >= range[0] && addr < range[1]) {
++                    return range[2] + (addr - range[0]);
++                }
++            }
++            return addr + func.rom - func.vram;
++        };
++        cur_jtbl.rom = jtbl_rom_of(cur_jtbl.vram);
+         cur_jtbl.section_index = func.section_index;
+ 
++        // [wcw fullconv] With unknown jumps as lookup tail calls, a table whose bounds check is known holds at least
++        // that many cases, wherever they point: a hack can redirect a case into another function's body
++        // (VPW64 Deluxe, aki-roadmap#123: a case into the middle of another function of the overlay). Ending the
++        // table at such a case cut off the cases after it, and the game reaching one aborted with a switch error.
++        // Entries the scan below accepts anyway still extend the table past the bound, as before, so a guard matched
++        // wrongly never makes a table smaller.
++        std::optional<uint32_t> bound{};
++        if (context.tail_call_unknown_jumps_by_lookup) {
++            bound = jump_table_bound_of(func, cur_jtbl);
++        }
++
+         while (vram < end_address) {
+             // Retrieve the current entry of the jump table
+             // TODO same as above
+-            uint32_t rom_addr = vram + func.rom - func.vram;
++            uint32_t rom_addr = jtbl_rom_of(vram);
++            // [wcw fullconv] Stop at the end of the ROM instead of reading past it.
++            if ((size_t)rom_addr + sizeof(uint32_t) > context.rom.size()) {
++                break;
++            }
+             uint32_t jtbl_word = byteswap(*reinterpret_cast<const uint32_t*>(&context.rom[rom_addr]));
+ 
+             if (cur_jtbl.got_offset.has_value() && got_ram_addr.has_value()) {
+@@ -332,8 +366,28 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
+ 
+             // Check if the entry is a valid address in the current function
+             if (jtbl_word < func.vram || jtbl_word >= func.vram + func.words.size() * sizeof(func.words[0])) {
++                // [wcw fullconv] ...or in code a hack added (a case redirected there).
++                bool external = false;
++                for (const auto& [ext_start, ext_end] : context.external_code_ranges) {
++                    if (jtbl_word >= ext_start && jtbl_word < ext_end) {
++                        external = true;
++                        break;
++                    }
++                }
++                // ...or, when unknown jumps are lookup tail calls, in a section whose data the table
++                // was read from (hack code dispatching through an overlay's own switch table).
++                if (!external && context.tail_call_unknown_jumps_by_lookup) {
++                    for (const auto& range : context.jump_table_data_ranges) {
++                        if (jtbl_word >= range[0] && jtbl_word < range[1]) {
++                            external = true;
++                            break;
++                        }
++                    }
++                }
+                 // If it's not then this is the end of the jump table
+-                break;
++                if (!external && (!bound.has_value() || cur_jtbl.entries.size() >= bound.value())) {
++                    break;
++                }
+             }
+             cur_jtbl.entries.push_back(jtbl_word);
+             vram += 4;
+@@ -347,5 +401,16 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
+         //fmt::print("Jtbl at 0x{:08X} (rom 0x{:08X}) with {} entries used by instr at 0x{:08X}\n", cur_jtbl.vram, cur_jtbl.rom, cur_jtbl.entries.size(), cur_jtbl.jr_vram);
+     }
+ 
++    // [wcw fullconv] A table whose cases all lie outside the function (hack code dispatching through an
++    // overlay's own switch table) is no switch of this function: with unknown jumps as lookup tail calls,
++    // leave the load alone and let the jr be an indirect tail call through the lookup.
++    if (context.tail_call_unknown_jumps_by_lookup) {
++        uint32_t func_end = func.vram + (uint32_t)(func.words.size() * sizeof(func.words[0]));
++        std::erase_if(stats.jump_tables, [&](const JumpTable& jtbl) {
++            return std::all_of(jtbl.entries.begin(), jtbl.entries.end(),
++                [&](uint32_t e) { return e < func.vram || e >= func_end; });
++        });
++    }
++
+     return true;
+ }
+diff --git a/src/cgenerator.cpp b/src/cgenerator.cpp
+index 94f85c5..6e58c5e 100644
+--- a/src/cgenerator.cpp
++++ b/src/cgenerator.cpp
+@@ -493,6 +493,13 @@ void N64Recomp::CGenerator::emit_check_nan(int fpr, bool is_double) const {
+     fmt::print(output_file, "NAN_CHECK(ctx->f{}.{}); ", fpr, is_double ? "d" : "fl");
+ }
+ 
++// [wcw fullconv] Random counts down between Wired and 31 on hardware; any value in range will do.
++void N64Recomp::CGenerator::emit_cop0_random_read(int reg) const {
++    if (reg != 0) {
++        fmt::print(output_file, "{} = (gpr)(int32_t)(((uint32_t)rand()) & 31);\n", gpr_to_string(reg));
++    }
++}
++
+ void N64Recomp::CGenerator::emit_cop0_status_read(int reg) const {
+     fmt::print(output_file, "{} = cop0_status_read(ctx);\n", gpr_to_string(reg));
+ }
+diff --git a/src/recompilation.cpp b/src/recompilation.cpp
+index c228433..f046a74 100644
+--- a/src/recompilation.cpp
++++ b/src/recompilation.cpp
+@@ -8,6 +8,8 @@
+ #include "fmt/format.h"
+ #include "fmt/ostream.h"
+ 
++#include "recompiler/runs_off_end.h"
++#include "recompiler/constant_ra.h"
+ #include "recompiler/context.h"
+ #include "analysis.h"
+ #include "recompiler/operations.h"
+@@ -144,6 +146,58 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+         generator.emit_comment(fmt::format("0x{:08X}: {}", instr_vram, instr.disassemble(0)));
+     }
+ 
++    // [wcw fullconv] Hack code: a shift-immediate whose rs field isn't zero is no R4300 instruction (data the hack keeps
++    // inside a function, e.g. a byte table); the live generator can't emit some of them (64-bit shifts), so the mod
++    // would fail to load. The hardware would raise a reserved-instruction exception: trap there instead.
++    if (context.tail_call_unknown_jumps_by_lookup) {
++        uint32_t raw = instr.getRaw();
++        uint32_t funct = raw & 0x3F;
++        bool shift_imm = (raw >> 26) == 0 && (funct == 0x00 || funct == 0x02 || funct == 0x03 || funct == 0x38 ||
++                                              funct == 0x3A || funct == 0x3B || funct == 0x3C || funct == 0x3E || funct == 0x3F);
++        // A linking jump or branch in the function's last word has its delay slot outside the function and a return
++        // label that would never be placed: table data (VPW64 Deluxe 0x80030E2C, a bgezal). A plain branch there is
++        // real code where a stock function split falls in its delay slot (ECW BTBW 0x8011BC3C, func_8011BC40 starts
++        // in the slot): compiled as before.
++        const uint32_t raw_op = raw >> 26, raw_rt = (raw >> 16) & 31;
++        const bool links = raw_op == 3 || (raw_op == 0 && funct == 0x09) || (raw_op == 1 && raw_rt >= 0x10 && raw_rt <= 0x13);
++        bool slotless = instr_index + 1 >= instructions.size() && links;
++        // A jump or branch whose delay slot holds another one is undefined on MIPS and never compiled: also table data
++        // (VPW64 Deluxe 0x80030CEC, `j` over a table's halfword pairs)
++        if (!slotless && (instr.isBranch() || instr.isJump()) && instr_index + 1 < instructions.size()) {
++            const auto& slot = instructions[instr_index + 1];
++            slotless = slot.isBranch() || slot.isJump();
++        }
++        if (slotless) {
++            fmt::print("[Info] Jump/branch in the last word (no delay slot) at 0x{:08X} in {}: trap\n", instr_vram, func.name);
++            print_indent();
++            generator.emit_do_break(instr_vram);
++            return true;
++        }
++        // A copy of ra (`move rd, ra`): calls here don't write ra, so the copy becomes a token for this frame that a
++        // later `jr rd` returns through (VPW64 Deluxe's decompressor). Not in a call's delay slot, where ra is the call's.
++        const uint32_t rs_f = (raw >> 21) & 31, rt_f = (raw >> 16) & 31, rd_f = (raw >> 11) & 31;
++        const bool ra_copy = (raw >> 26) == 0 && (funct == 0x20 || funct == 0x21 || funct == 0x25 || funct == 0x2C || funct == 0x2D) &&
++            ((rs_f == 31 && rt_f == 0) || (rs_f == 0 && rt_f == 31)) && rd_f != 0 && rd_f != 31 && (raw & 0x7C0) == 0;
++        const bool in_call_slot = instr_index > 0 && (instructions[instr_index - 1].getUniqueId() == InstrId::cpu_jal ||
++                                                      instructions[instr_index - 1].getUniqueId() == InstrId::cpu_jalr);
++        if (ra_copy && !in_call_slot) {
++            print_indent();
++            generator.emit_ra_token((int)rd_f);
++            return true;
++        }
++        if (shift_imm && ((raw >> 21) & 31) != 0) {
++            fmt::print("[Info] Not an instruction (shift with rs set) at 0x{:08X} in {}: trap\n", instr_vram, func.name);
++            print_indent();
++            generator.emit_do_break(instr_vram);
++            // in a jal's delay slot the call returns to after_N: place it as the normal path does
++            if (emit_link_branch) {
++                print_indent();
++                generator.emit_label(fmt::format("after_{}", link_branch_index));
++            }
++            return true;
++        }
++    }
++
+     // Replace loads for jump table entries into addiu. This leaves the jump table entry's address in the output register
+     // instead of the entry's value, which can then be used to determine the offset from the start of the jump table.
+     if (jtbl_lw_instructions.contains(instr_vram)) {
+@@ -254,12 +308,18 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+             return false;
+         }
+         print_indent();
++        if (context.tail_call_unknown_jumps_by_lookup) {
++            generator.emit_save_sp();
++        }
+         generator.emit_function_call_by_register(reg);
++        if (context.tail_call_unknown_jumps_by_lookup) {
++            generator.emit_return_if_sp_changed(context, func_index);
++        }
+         print_link_branch();
+         return true;
+     };
+ 
+-    auto print_func_call_by_address = [&generator, reloc_target_section_offset, has_reloc, reloc_section, reloc_reference_symbol, reloc_type, &context, &func, &static_funcs_out, &needs_link_branch, &print_indent, &process_delay_slot, &print_link_branch]
++    auto print_func_call_by_address = [&generator, reloc_target_section_offset, has_reloc, reloc_section, reloc_reference_symbol, reloc_type, &context, &func, &static_funcs_out, &needs_link_branch, &print_indent, &process_delay_slot, &print_link_branch, func_index]
+         (uint32_t target_func_vram, bool tail_call = false, bool indent = false)
+     {
+         bool call_by_lookup = false;
+@@ -339,6 +399,11 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+                 return false;
+             }
+             print_indent();
++            const bool check_sp = !tail_call && context.tail_call_unknown_jumps_by_lookup;
++            if (check_sp) {
++                generator.emit_save_sp();
++            }
++            generator.set_tail_call(tail_call);
+             if (reloc_reference_symbol != (size_t)-1) {
+                 generator.emit_function_call_reference_symbol(context, reloc_section, reloc_reference_symbol, reloc_target_section_offset);
+             }
+@@ -351,6 +416,10 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+             else {
+                 generator.emit_function_call(context, matched_func_index);
+             }
++            generator.set_tail_call(false);
++            if (check_sp) {
++                generator.emit_return_if_sp_changed(context, func_index);
++            }
+             print_link_branch();
+         }
+         return true;
+@@ -361,7 +430,9 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+         if (branch_target < func.vram || branch_target >= func_vram_end) {
+             // If the branch target is the start of some known function, this can be handled as a tail call.
+             // FIXME: how to deal with static functions?
+-            if (context.functions_by_vram.find(branch_target) != context.functions_by_vram.end()) {
++            // [wcw fullconv] ...or any address, when unknown jumps are lookup tail calls.
++            if (context.functions_by_vram.find(branch_target) != context.functions_by_vram.end() ||
++                context.tail_call_unknown_jumps_by_lookup) {
+                 fmt::print("Tail call in {} to 0x{:08X}\n", func.name, branch_target);
+                 if (!print_func_call_by_address(branch_target, true, true)) {
+                     return false;
+@@ -423,7 +494,19 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+                 print_indent();
+                 generator.emit_cop0_status_read(rt);
+                 break;
++            case Cop0Reg::COP0_Random:
++                print_indent();
++                generator.emit_cop0_random_read(rt);
++                break;
+             default:
++                // [wcw fullconv] hack mode: code a game never runs outside its exception handler / TLB setup (a
++                // stock function the static build stubs, reached by an extra entry): trap there instead of failing
++                if (context.tail_call_unknown_jumps_by_lookup) {
++                    fmt::print("[Info] Unhandled cop0 register in mfc0 ({}) at 0x{:08X} in {}: trap\n", (int)reg, instr_vram, func.name);
++                    print_indent();
++                    generator.emit_do_break(instr_vram);
++                    break;
++                }
+                 fmt::print(stderr, "Unhandled cop0 register in mfc0: {}\n", (int)reg);
+                 return false;
+             }
+@@ -438,6 +521,14 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+                 generator.emit_cop0_status_write(rt);
+                 break;
+             default:
++                // [wcw fullconv] hack mode: code a game never runs outside its exception handler / TLB setup (a
++                // stock function the static build stubs, reached by an extra entry): trap there instead of failing
++                if (context.tail_call_unknown_jumps_by_lookup) {
++                    fmt::print("[Info] Unhandled cop0 register in mtc0 ({}) at 0x{:08X} in {}: trap\n", (int)reg, instr_vram, func.name);
++                    print_indent();
++                    generator.emit_do_break(instr_vram);
++                    break;
++                }
+                 fmt::print(stderr, "Unhandled cop0 register in mtc0: {}\n", (int)reg);
+                 return false;
+             }
+@@ -518,6 +609,14 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+                 print_indent();
+                 generator.emit_return(context, func_index);
+             }
++            // [wcw fullconv] Unknown target: tail call through the lookup when allowed.
++            else if (context.tail_call_unknown_jumps_by_lookup) {
++                if (!print_func_call_by_address(branch_target, true)) {
++                    return false;
++                }
++                print_indent();
++                generator.emit_return(context, func_index);
++            }
+             else {
+                 fmt::print(stderr, "Unhandled branch in {} at 0x{:08X} to 0x{:08X}\n", func.name, instr_vram, branch_target);
+                 return false;
+@@ -526,7 +625,20 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+         break;
+     case InstrId::cpu_jr:
+         if (rs == (int)rabbitizer::Registers::Cpu::GprO32::GPR_O32_ra) {
+-            print_return_with_delay_slot();
++            if (context.tail_call_unknown_jumps_by_lookup) {
++                // [wcw fullconv] a jr $ra to a constant the code built goes there (constant_ra.h)
++                if (!process_delay_slot(false)) {
++                    return false;
++                }
++                print_indent();
++                generator.emit_tail_call_if_constant_ra(context, func_index);
++                print_indent();
++                generator.emit_return(context, func_index);
++                print_link_branch();
++            }
++            else {
++                print_return_with_delay_slot();
++            }
+         } else {
+             auto jtbl_find_result = std::find_if(stats.jump_tables.begin(), stats.jump_tables.end(),
+                 [instr_vram](const N64Recomp::JumpTable& jtbl) {
+@@ -554,6 +666,20 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+             }
+ 
+             fmt::print("[Info] Indirect tail call in {}\n", func.name);
++            if (context.tail_call_unknown_jumps_by_lookup) {
++                // hack code may return through a copy of ra (a token): check before the lookup
++                if (!process_delay_slot(false)) {
++                    return false;
++                }
++                print_indent();
++                generator.emit_return_if_ra_token(rs, context, func_index);
++                generator.set_tail_call(true);
++                generator.emit_function_call_by_register(rs);
++                generator.set_tail_call(false);
++                print_indent();
++                generator.emit_return(context, func_index);
++                break;
++            }
+             print_func_call_by_register(rs);
+             print_indent();
+             generator.emit_return(context, func_index);
+@@ -684,6 +810,16 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+ 
+         generator.process_binary_op(op, instruction_context);
+         handled = true;
++
++        // [wcw fullconv] `lui $ra` + `addiu/ori $ra, $ra`: a constant return address the next jr $ra jumps to
++        // (constant_ra.h; No Mercy Plus V3's payload 0x804715EC).
++        uint32_t constant_ra = 0;
++        if (context.tail_call_unknown_jumps_by_lookup && instr_index > 0 &&
++            N64Recomp::constant_ra_pair(instructions[instr_index - 1].getRaw(), instr.getRaw(), constant_ra)) {
++            fmt::print("[Info] Constant return address 0x{:08X} built at 0x{:08X} in {}\n", constant_ra, instr_vram, func.name);
++            print_indent();
++            generator.emit_note_constant_ra(constant_ra);
++        }
+     }
+ 
+     auto find_unary_it = unary_ops.find(instr_id);
+@@ -746,8 +882,24 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+     }
+ 
+     if (!handled) {
+-        fmt::print(stderr, "Unhandled instruction: {}\n", instr.getOpcodeName());
+-        return false;
++        // [wcw fullconv] In hack code (regenerated or relinked), an instruction the R4300 doesn't have is
++        // data or dead code; the hardware would raise a reserved-instruction exception: trap there instead
++        // of rejecting the whole mod.
++        // Cache maintenance (libultra's osInvalICache/osWritebackDCache loops, which static builds stub) has no
++        // effect here: nothing to emit (Revenge Starrcade 2.0 reaches osInvalICache through an extra entry).
++        if (context.tail_call_unknown_jumps_by_lookup && instr_id == InstrId::cpu_cache) {
++            handled = true;
++        }
++        else if (context.tail_call_unknown_jumps_by_lookup) {
++            fmt::print("[Info] Unhandled instruction {} at 0x{:08X} in {}: trap\n", instr.getOpcodeName(), instr_vram, func.name);
++            print_indent();
++            generator.emit_do_break(instr_vram);
++            handled = true;
++        }
++        else {
++            fmt::print(stderr, "Unhandled instruction: {}\n", instr.getOpcodeName());
++            return false;
++        }
+     }
+ 
+     // TODO is this used?
+@@ -773,6 +925,9 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
+             func.name);
+     }
+ 
++    // [wcw fullconv] Whether a branch or jump table targets the function's last word (see "runs off its end" below).
++    bool last_word_is_label = false;
++
+     // Skip analysis and recompilation of this function is stubbed.
+     if (!func.stubbed) {
+         // Use a set to sort and deduplicate labels
+@@ -812,10 +967,21 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
+         for (const auto& jtbl : stats.jump_tables) {
+             jtbl_lw_instructions.insert(jtbl.lw_vram);
+             for (uint32_t jtbl_entry : jtbl.entries) {
++                // [wcw fullconv] In hack mode a case outside the function gets no label: it must reach the live
++                // generator's lookup stub, and a label below the function would be placed at its first instruction
++                // (aki-roadmap#123: case 10 of func_80123674 into func_801211A0 re-entered func_80123674 instead).
++                if (context.tail_call_unknown_jumps_by_lookup &&
++                    (jtbl_entry < func.vram || jtbl_entry >= func.vram + func.words.size() * sizeof(func.words[0]))) {
++                    continue;
++                }
+                 branch_labels.insert(jtbl_entry);
+             }
+         }
+ 
++        if (!func.words.empty()) {
++            last_word_is_label = branch_labels.contains(func.vram + (uint32_t)((func.words.size() - 1) * sizeof(func.words[0])));
++        }
++
+         // Second pass, emit code for each instruction and emit labels
+         auto cur_label = branch_labels.cbegin();
+         vram = func.vram;
+@@ -833,7 +999,10 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
+                 generator.emit_goto(fmt::format("skip_{}", num_likely_branches));
+             }
+             // If there are any other branch labels to insert and we're at the next one, insert it
+-            if (cur_label != branch_labels.end() && vram >= *cur_label) {
++            // [wcw fullconv] ...all of them: labels below the function (data words in hack code decoding as branches,
++            // tail calls back) are placed here at its start too, and one per instruction delayed every later label
++            // (VPW64 Deluxe's func_80030C5C: its `bne` to the `jr ra` landed four instructions further, in other code)
++            while (cur_label != branch_labels.end() && vram >= *cur_label) {
+                 generator.emit_label(fmt::format("L_{:08X}", *cur_label));
+                 ++cur_label;
+             }
+@@ -849,6 +1018,15 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
+                 output_file.clear();
+                 return false;
+             }
++            // [wcw fullconv] Name the instruction a live generator couldn't emit (its error paths are silent).
++            // (the live path calls through Generator, where has_errored is public; CGenerator inherits privately)
++            if constexpr (requires { generator.has_errored(); }) {
++                if (generator.has_errored()) {
++                    fmt::print(stderr, "[live recompiler] couldn't emit 0x{:08X}: {} (0x{:08X}) in {}\n", vram,
++                        instructions[instr_index].disassemble(0), instructions[instr_index].getRaw(), func.name);
++                    return false;
++                }
++            }
+             // If a link return branch was generated, advance the number of link return branches
+             if (had_link_branch) {
+                 num_link_branches++;
+@@ -866,6 +1044,22 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
+         }
+     }
+ 
++    // [wcw fullconv] A function that can run off its end (a hack wrote one block of code over two
++    // stock functions) continues at the next address: tail-call it through the lookup.
++    if (context.tail_call_unknown_jumps_by_lookup && !func.words.empty()) {
++        uint32_t last = byteswap(func.words[func.words.size() - 1]);
++        uint32_t prev = func.words.size() >= 2 ? byteswap(func.words[func.words.size() - 2]) : 0;
++        // ...also when a branch lands on the last word: the runtime extends a span that ends on a jump or branch by
++        // its delay slot (aki-roadmap#76), and a branch to that word (the next stock function's start) runs on from it
++        // even when the jump before it ends the flow.
++        if (N64Recomp::function_runs_off_end(func.words.size(), last, prev, last_word_is_label)) {
++            uint32_t next_vram = func.vram + (uint32_t)(func.words.size() * sizeof(func.words[0]));
++            fmt::print("[Info] {} runs off its end: tail call to 0x{:08X}\n", func.name, next_vram);
++            generator.emit_function_call_lookup(next_vram);
++            generator.emit_return(context, func_index);
++        }
++    }
++
+     // Terminate the function
+     generator.emit_function_end();
+     
